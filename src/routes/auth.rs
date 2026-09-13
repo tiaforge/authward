@@ -10,7 +10,7 @@
 //! CVE-2026-33544).
 
 use axum::extract::{Form, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum_extra::extract::cookie::{Cookie, PrivateCookieJar, SameSite};
 use chrono::{Duration as ChronoDuration, Utc};
@@ -483,7 +483,12 @@ pub async fn verify(
         );
     }
 
-    StatusCode::OK.into_response()
+    ok_response(
+        resolved_host,
+        &session.subject,
+        session.email.as_deref(),
+        &session.claims_json,
+    )
 }
 
 /// Resource-scoped bearer-token bypass (Phase 5) for non-browser clients.
@@ -516,12 +521,62 @@ async fn bearer_auth(
     )
     .await
     {
-        Ok(_claims) => StatusCode::OK.into_response(),
+        Ok(claims) => {
+            let subject = claims
+                .get("sub")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let email = claims.get("email").and_then(|v| v.as_str());
+            ok_response(resolved_host, subject, email, &claims)
+        }
         Err(err) => {
             tracing::info!(%err, host = ?resolved_host.host, "bearer token rejected");
             StatusCode::UNAUTHORIZED.into_response()
         }
     }
+}
+
+/// Successful `/verify` response, optionally carrying verified identity
+/// as `X-Auth-User`/`X-Auth-Email`/`X-Auth-Groups` (Phase 7) when the
+/// host has `forward_identity_headers` enabled. Caddy's `copy_headers`
+/// then carries these from this response onto the proxied request to the
+/// backend, **replacing** any same-named header the client sent — the
+/// backend must still be unreachable except through the proxy (see the
+/// plan's trust-boundary decision), since that replacement is Caddy's
+/// job, not something this response can enforce by itself.
+fn ok_response(
+    resolved_host: &crate::config::ResolvedHost,
+    subject: &str,
+    email: Option<&str>,
+    claims_json: &serde_json::Value,
+) -> Response {
+    if !resolved_host.forward_identity_headers {
+        return StatusCode::OK.into_response();
+    }
+
+    let mut headers = HeaderMap::new();
+    if let Ok(value) = HeaderValue::from_str(subject) {
+        headers.insert("x-auth-user", value);
+    }
+    if let Some(email) = email
+        && let Ok(value) = HeaderValue::from_str(email)
+    {
+        headers.insert("x-auth-email", value);
+    }
+    let groups = match claims_json.get(&resolved_host.group_claim_name) {
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>()
+            .join(","),
+        Some(serde_json::Value::String(s)) => s.clone(),
+        _ => String::new(),
+    };
+    if let Ok(value) = HeaderValue::from_str(&groups) {
+        headers.insert("x-auth-groups", value);
+    }
+
+    (StatusCode::OK, headers).into_response()
 }
 
 #[derive(Deserialize)]

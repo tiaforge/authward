@@ -1788,3 +1788,120 @@ async fn revoke_session_rejects_get() {
         .await;
     assert_eq!(resp.status(), reqwest::StatusCode::METHOD_NOT_ALLOWED);
 }
+
+// ---- Phase 7: identity header passthrough --------------------------------
+
+#[tokio::test]
+async fn identity_headers_forwarded_when_enabled() {
+    let (idp_base_url, _count, _tokens) = spawn_mock_idp(Duration::from_secs(3600)).await;
+    let db_dir = tempfile::tempdir().unwrap();
+    let mut cfg = base_config(&db_dir.path().join("sessions.db"));
+    cfg.base_domains.insert(
+        "test.local".to_string(),
+        base_domain_block("test.local", "auth.test.local", &idp_base_url),
+    );
+    let mut app_host = resolved_host("app.test.local", "test.local", &idp_base_url);
+    app_host.forward_identity_headers = true;
+    cfg.hosts.insert("app.test.local".to_string(), app_host);
+    let (app, _state) = spawn_app_with_config(cfg).await;
+    let idp_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    let mut browser = Browser::new();
+    login_as_with_groups(
+        &app,
+        &idp_client,
+        &mut browser,
+        "alice",
+        "admins,users",
+        "https://app.test.local/",
+    )
+    .await;
+
+    let resp = browser.get(&app, "app.test.local", "/verify").await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(resp.headers().get("x-auth-user").unwrap(), "alice");
+    assert_eq!(
+        resp.headers().get("x-auth-email").unwrap(),
+        "alice@example.test"
+    );
+    assert_eq!(resp.headers().get("x-auth-groups").unwrap(), "admins,users");
+}
+
+#[tokio::test]
+async fn identity_headers_absent_when_disabled() {
+    let (idp_base_url, _count, _tokens) = spawn_mock_idp(Duration::from_secs(3600)).await;
+    let db_dir = tempfile::tempdir().unwrap();
+    // spawn_app's default host has forward_identity_headers = false.
+    let (app, _state) = spawn_app(&idp_base_url, &db_dir.path().join("sessions.db")).await;
+    let idp_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    let mut browser = Browser::new();
+    login_as(
+        &app,
+        &idp_client,
+        &mut browser,
+        "alice",
+        "https://app.test.local/",
+    )
+    .await;
+
+    let resp = browser.get(&app, "app.test.local", "/verify").await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert!(resp.headers().get("x-auth-user").is_none());
+}
+
+#[tokio::test]
+async fn spoofed_identity_header_on_the_request_is_ignored() {
+    let (idp_base_url, _count, _tokens) = spawn_mock_idp(Duration::from_secs(3600)).await;
+    let db_dir = tempfile::tempdir().unwrap();
+    let mut cfg = base_config(&db_dir.path().join("sessions.db"));
+    cfg.base_domains.insert(
+        "test.local".to_string(),
+        base_domain_block("test.local", "auth.test.local", &idp_base_url),
+    );
+    let mut app_host = resolved_host("app.test.local", "test.local", &idp_base_url);
+    app_host.forward_identity_headers = true;
+    cfg.hosts.insert("app.test.local".to_string(), app_host);
+    let (app, _state) = spawn_app_with_config(cfg).await;
+    let idp_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    let mut browser = Browser::new();
+    login_as(
+        &app,
+        &idp_client,
+        &mut browser,
+        "alice",
+        "https://app.test.local/",
+    )
+    .await;
+
+    // A client (or a compromised, directly-reachable backend) trying to
+    // smuggle a spoofed identity via the /verify request itself. Our
+    // response must reflect the *real*, verified subject regardless.
+    let resp = reqwest::Client::new()
+        .get(format!("{app}/verify"))
+        .header("host", "app.test.local")
+        .header(
+            "cookie",
+            format!("fa_session={}", browser.cookies["fa_session"]),
+        )
+        .header("x-auth-user", "root")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        resp.headers().get("x-auth-user").unwrap(),
+        "alice",
+        "the response must never echo a client-supplied X-Auth-User"
+    );
+}
