@@ -8,6 +8,7 @@ use sqlx::SqlitePool;
 
 use crate::config::Config;
 use crate::crypto::RefreshTokenCipher;
+use crate::locks::SessionLocks;
 use crate::oidc::DiscoveredClient;
 
 #[derive(Clone)]
@@ -21,6 +22,7 @@ pub struct AppStateInner {
     /// Keyed by base domain name (see `config::BaseDomain::name`).
     pub oidc_clients: HashMap<String, DiscoveredClient>,
     pub http_client: openidconnect::reqwest::Client,
+    pub session_locks: SessionLocks,
 }
 
 impl AppState {

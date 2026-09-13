@@ -3,11 +3,13 @@ pub mod config;
 pub mod crypto;
 pub mod db;
 pub mod host;
+pub mod locks;
 pub mod logging;
 pub mod oidc;
 pub mod redirect;
 pub mod routes;
 pub mod server;
+pub mod session;
 pub mod state;
 pub mod templates;
 
@@ -18,6 +20,7 @@ use openidconnect::RedirectUrl;
 
 use crate::config::Config;
 use crate::crypto::RefreshTokenCipher;
+use crate::locks::SessionLocks;
 use crate::state::{AppState, AppStateInner};
 
 /// Builds the full application state from a resolved config: discovers
@@ -51,5 +54,6 @@ pub async fn build_state(cfg: Config) -> anyhow::Result<AppState> {
         refresh_cipher,
         oidc_clients,
         http_client,
+        session_locks: SessionLocks::new(),
     }))
 }

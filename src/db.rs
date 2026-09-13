@@ -151,3 +151,49 @@ pub async fn delete_session(pool: &SqlitePool, id: &str) -> anyhow::Result<()> {
         .await?;
     Ok(())
 }
+
+/// Updates a session's refresh token and expiry after a successful silent
+/// refresh (Phase 2). `refresh_token` is `None` when the IdP didn't rotate
+/// it and the caller chose to keep serving requests without persisting a
+/// new value (callers should generally pass the existing token back
+/// through here rather than omit it, so this stays a simple overwrite).
+pub async fn update_session_after_refresh(
+    pool: &SqlitePool,
+    id: &str,
+    refresh_token: Option<(Vec<u8>, Vec<u8>)>,
+    expires_at: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    let (nonce, ciphertext) = match refresh_token {
+        Some((n, c)) => (Some(n), Some(c)),
+        None => (None, None),
+    };
+    sqlx::query(
+        "UPDATE sessions \
+         SET refresh_token_nonce = ?, refresh_token_ciphertext = ?, expires_at = ? \
+         WHERE id = ?",
+    )
+    .bind(nonce)
+    .bind(ciphertext)
+    .bind(expires_at.timestamp())
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Session IDs whose access/ID token portion has already expired, as of
+/// `now` — candidates for the reaper (Phase 2). The reaper still has to
+/// re-check each one under its per-session lock before deleting, since a
+/// candidate may be mid-refresh (see `locks::SessionLocks`).
+pub async fn list_expired_session_ids(
+    pool: &SqlitePool,
+    now: DateTime<Utc>,
+) -> anyhow::Result<Vec<String>> {
+    let rows = sqlx::query("SELECT id FROM sessions WHERE expires_at < ?")
+        .bind(now.timestamp())
+        .fetch_all(pool)
+        .await?;
+    rows.iter()
+        .map(|row| row.try_get::<String, _>("id").map_err(Into::into))
+        .collect()
+}

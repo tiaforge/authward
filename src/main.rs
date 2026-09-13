@@ -1,7 +1,11 @@
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use forward_auth::{config, logging, server};
+
+/// How often the expired-session reaper sweeps SQLite (Phase 2/9).
+const REAPER_INTERVAL: Duration = Duration::from_secs(300);
 
 #[derive(Parser)]
 #[command(
@@ -65,6 +69,8 @@ async fn run_server(config_path: &Path) -> anyhow::Result<()> {
 
     let listen_addr = cfg.global.listen_addr;
     let state = forward_auth::build_state(cfg).await?;
+
+    forward_auth::session::spawn_reaper(state.clone(), REAPER_INTERVAL);
 
     let app = server::build_router(state);
     let listener = tokio::net::TcpListener::bind(listen_addr).await?;

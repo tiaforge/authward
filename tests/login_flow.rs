@@ -16,11 +16,13 @@
 //! addressing, not a bug in the service under test.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::extract::{Form, Query, State};
-use axum::response::{IntoResponse, Redirect};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{Duration as ChronoDuration, Utc};
@@ -31,7 +33,7 @@ use openidconnect::core::{
 };
 use openidconnect::{
     AccessToken, Audience, EmptyAdditionalClaims, EmptyExtraTokenFields, EndUserEmail, IdToken,
-    IdTokenClaims, IdTokenFields, IssuerUrl, JsonWebKeySet, Nonce, PrivateSigningKey,
+    IdTokenClaims, IdTokenFields, IssuerUrl, JsonWebKeySet, Nonce, PrivateSigningKey, RefreshToken,
     StandardClaims, SubjectIdentifier,
 };
 use serde::Deserialize;
@@ -59,6 +61,21 @@ struct MockIdp {
     base_url: String,
     hmac_key: Arc<CoreHmacKey>,
     pending: Arc<Mutex<HashMap<String, PendingAuth>>>,
+    /// Refresh tokens issued so far, keyed by token value. The mock
+    /// *rotates* refresh tokens on every use (removing the consumed one
+    /// and issuing a new one) — mirroring the "strict IdP" behavior the
+    /// plan's per-session lock is specifically designed to survive: two
+    /// concurrent refreshes racing to use the same now-single-use token
+    /// would otherwise have one of them fail.
+    refresh_tokens: Arc<Mutex<HashMap<String, PendingAuth>>>,
+    /// Number of refresh_token-grant requests this mock has received —
+    /// used to assert exactly one refresh call reaches the IdP even when
+    /// many concurrent requests observe the same expired session.
+    refresh_grant_count: Arc<AtomicUsize>,
+    access_token_ttl: Duration,
+    /// Artificial delay applied to refresh-token-grant requests only, to
+    /// give tests a window in which a refresh is provably in-flight.
+    refresh_delay: Duration,
 }
 
 #[derive(Deserialize)]
@@ -73,7 +90,9 @@ struct AuthorizeParams {
 
 #[derive(Deserialize)]
 struct TokenParams {
-    code: String,
+    grant_type: String,
+    code: Option<String>,
+    refresh_token: Option<String>,
 }
 
 async fn discovery(State(idp): State<MockIdp>) -> Json<serde_json::Value> {
@@ -119,28 +138,25 @@ async fn authorize(
     Redirect::to(redirect_url.as_str())
 }
 
-async fn token(
-    State(idp): State<MockIdp>,
-    Form(params): Form<TokenParams>,
-) -> Json<CoreTokenResponse> {
-    let pending = idp
-        .pending
-        .lock()
-        .unwrap()
-        .remove(&params.code)
-        .expect("mock IdP received a code it never issued");
-
+fn issue_tokens(
+    idp: &MockIdp,
+    identity: PendingAuth,
+    nonce: Option<String>,
+    refresh_token: String,
+) -> CoreTokenResponse {
     let now = Utc::now();
-    let claims = IdTokenClaims::new(
+    let mut claims = IdTokenClaims::new(
         IssuerUrl::new(idp.base_url.clone()).unwrap(),
         vec![Audience::new(CLIENT_ID.to_string())],
-        now + ChronoDuration::seconds(3600),
+        now + ChronoDuration::from_std(idp.access_token_ttl).unwrap(),
         now,
-        StandardClaims::new(SubjectIdentifier::new(pending.subject))
-            .set_email(Some(EndUserEmail::new(pending.email))),
+        StandardClaims::new(SubjectIdentifier::new(identity.subject.clone()))
+            .set_email(Some(EndUserEmail::new(identity.email.clone()))),
         EmptyAdditionalClaims {},
-    )
-    .set_nonce(Some(Nonce::new(pending.nonce)));
+    );
+    if let Some(nonce) = nonce {
+        claims = claims.set_nonce(Some(Nonce::new(nonce)));
+    }
 
     let id_token = IdToken::<
         EmptyAdditionalClaims,
@@ -156,25 +172,96 @@ async fn token(
     )
     .expect("signing the mock ID token should not fail");
 
+    idp.refresh_tokens
+        .lock()
+        .unwrap()
+        .insert(refresh_token.clone(), identity);
+
     let mut response = CoreTokenResponse::new(
         AccessToken::new("mock-access-token".to_string()),
         CoreTokenType::Bearer,
         IdTokenFields::new(Some(id_token), EmptyExtraTokenFields {}),
     );
-    response.set_expires_in(Some(&Duration::from_secs(3600)));
-    Json(response)
+    response.set_expires_in(Some(&idp.access_token_ttl));
+    response.set_refresh_token(Some(RefreshToken::new(refresh_token)));
+    response
 }
 
-async fn spawn_mock_idp() -> String {
+async fn token(State(idp): State<MockIdp>, Form(params): Form<TokenParams>) -> Response {
+    match params.grant_type.as_str() {
+        "authorization_code" => {
+            let code = params.code.expect("authorization_code grant requires code");
+            let pending = idp
+                .pending
+                .lock()
+                .unwrap()
+                .remove(&code)
+                .expect("mock IdP received a code it never issued");
+            let nonce = pending.nonce.clone();
+            let refresh_token = forward_auth::crypto::random_hex(16);
+            Json(issue_tokens(&idp, pending, Some(nonce), refresh_token)).into_response()
+        }
+        "refresh_token" => {
+            idp.refresh_grant_count.fetch_add(1, Ordering::SeqCst);
+            if !idp.refresh_delay.is_zero() {
+                tokio::time::sleep(idp.refresh_delay).await;
+            }
+            let old_token = params
+                .refresh_token
+                .expect("refresh_token grant requires refresh_token");
+            let Some(identity) = idp.refresh_tokens.lock().unwrap().remove(&old_token) else {
+                // Rotation means a refresh token is single-use; reuse (e.g.
+                // from a racing duplicate request) looks like this.
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": "invalid_grant"})),
+                )
+                    .into_response();
+            };
+            let new_refresh_token = forward_auth::crypto::random_hex(16);
+            Json(issue_tokens(&idp, identity, None, new_refresh_token)).into_response()
+        }
+        other => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "unsupported_grant_type", "grant_type": other})),
+        )
+            .into_response(),
+    }
+}
+
+async fn spawn_mock_idp(
+    access_token_ttl: Duration,
+) -> (
+    String,
+    Arc<AtomicUsize>,
+    Arc<Mutex<HashMap<String, PendingAuth>>>,
+) {
+    spawn_mock_idp_with_refresh_delay(access_token_ttl, Duration::ZERO).await
+}
+
+async fn spawn_mock_idp_with_refresh_delay(
+    access_token_ttl: Duration,
+    refresh_delay: Duration,
+) -> (
+    String,
+    Arc<AtomicUsize>,
+    Arc<Mutex<HashMap<String, PendingAuth>>>,
+) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base_url = format!("http://{}", listener.local_addr().unwrap());
 
+    let refresh_grant_count = Arc::new(AtomicUsize::new(0));
     let idp = MockIdp {
         base_url: base_url.clone(),
         hmac_key: Arc::new(CoreHmacKey::new(CLIENT_SECRET.as_bytes().to_vec())),
         pending: Arc::new(Mutex::new(HashMap::new())),
+        refresh_tokens: Arc::new(Mutex::new(HashMap::new())),
+        refresh_grant_count: refresh_grant_count.clone(),
+        access_token_ttl,
+        refresh_delay,
     };
 
+    let refresh_tokens = idp.refresh_tokens.clone();
     let app = Router::new()
         .route("/.well-known/openid-configuration", get(discovery))
         .route("/jwks", get(jwks))
@@ -186,12 +273,15 @@ async fn spawn_mock_idp() -> String {
         axum::serve(listener, app).await.unwrap();
     });
 
-    base_url
+    (base_url, refresh_grant_count, refresh_tokens)
 }
 
 // ---- App under test ---------------------------------------------------
 
-async fn spawn_app(idp_base_url: &str, db_path: &std::path::Path) -> String {
+async fn spawn_app(
+    idp_base_url: &str,
+    db_path: &std::path::Path,
+) -> (String, forward_auth::state::AppState) {
     let base_domain_name = "test.local".to_string();
     let mut base_domains = HashMap::new();
     base_domains.insert(
@@ -227,7 +317,7 @@ async fn spawn_app(idp_base_url: &str, db_path: &std::path::Path) -> String {
     let state = forward_auth::build_state(cfg)
         .await
         .expect("build_state against mock IdP");
-    let app = forward_auth::server::build_router(state);
+    let app = forward_auth::server::build_router(state.clone());
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -235,7 +325,7 @@ async fn spawn_app(idp_base_url: &str, db_path: &std::path::Path) -> String {
         axum::serve(listener, app).await.unwrap();
     });
 
-    format!("http://{addr}")
+    (format!("http://{addr}"), state)
 }
 
 // ---- Manual "browser": relays cookies by hand (see module docs) -------
@@ -379,9 +469,10 @@ fn urlencode(s: &str) -> String {
 
 #[tokio::test]
 async fn login_then_verify_succeeds() {
-    let idp_base_url = spawn_mock_idp().await;
+    let (idp_base_url, _refresh_grant_count, _refresh_tokens) =
+        spawn_mock_idp(Duration::from_secs(3600)).await;
     let db_dir = tempfile::tempdir().unwrap();
-    let app = spawn_app(&idp_base_url, &db_dir.path().join("sessions.db")).await;
+    let (app, _state) = spawn_app(&idp_base_url, &db_dir.path().join("sessions.db")).await;
     let idp_client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
@@ -403,9 +494,10 @@ async fn login_then_verify_succeeds() {
 
 #[tokio::test]
 async fn verify_without_session_is_unauthorized() {
-    let idp_base_url = spawn_mock_idp().await;
+    let (idp_base_url, _refresh_grant_count, _refresh_tokens) =
+        spawn_mock_idp(Duration::from_secs(3600)).await;
     let db_dir = tempfile::tempdir().unwrap();
-    let app = spawn_app(&idp_base_url, &db_dir.path().join("sessions.db")).await;
+    let (app, _state) = spawn_app(&idp_base_url, &db_dir.path().join("sessions.db")).await;
 
     let mut browser = Browser::new();
     let resp = browser.get(&app, "app.test.local", "/verify").await;
@@ -419,9 +511,10 @@ async fn verify_without_session_is_unauthorized() {
 /// browser's session end up authenticated as the other's identity.
 #[tokio::test]
 async fn concurrent_logins_do_not_cross_contaminate() {
-    let idp_base_url = spawn_mock_idp().await;
+    let (idp_base_url, _refresh_grant_count, _refresh_tokens) =
+        spawn_mock_idp(Duration::from_secs(3600)).await;
     let db_dir = tempfile::tempdir().unwrap();
-    let app = spawn_app(&idp_base_url, &db_dir.path().join("sessions.db")).await;
+    let (app, _state) = spawn_app(&idp_base_url, &db_dir.path().join("sessions.db")).await;
     let idp_client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
@@ -499,5 +592,258 @@ async fn concurrent_logins_do_not_cross_contaminate() {
     assert_eq!(
         bob.get(&app, "app.test.local", "/verify").await.status(),
         reqwest::StatusCode::OK
+    );
+}
+
+// ---- Phase 2: silent refresh -------------------------------------------
+
+async fn raw_verify(app: &str, cookie_header: &str) -> reqwest::StatusCode {
+    reqwest::Client::new()
+        .get(format!("{app}/verify"))
+        .header("host", "app.test.local")
+        .header("cookie", cookie_header)
+        .send()
+        .await
+        .unwrap()
+        .status()
+}
+
+#[tokio::test]
+async fn silent_refresh_extends_an_expired_session() {
+    let ttl = Duration::from_secs(2);
+    let (idp_base_url, refresh_grant_count, _refresh_tokens) = spawn_mock_idp(ttl).await;
+    let db_dir = tempfile::tempdir().unwrap();
+    let (app, _state) = spawn_app(&idp_base_url, &db_dir.path().join("sessions.db")).await;
+    let idp_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    let mut browser = Browser::new();
+    login_as(
+        &app,
+        &idp_client,
+        &mut browser,
+        "alice",
+        "https://app.test.local/dashboard",
+    )
+    .await;
+    let session_cookie_before = browser.cookies["fa_session"].clone();
+
+    assert_eq!(
+        browser
+            .get(&app, "app.test.local", "/verify")
+            .await
+            .status(),
+        reqwest::StatusCode::OK
+    );
+    assert_eq!(
+        refresh_grant_count.load(Ordering::SeqCst),
+        0,
+        "should not have refreshed yet"
+    );
+
+    tokio::time::sleep(ttl + Duration::from_millis(500)).await;
+
+    // The access token has now expired; /verify should silently refresh
+    // using the stored refresh token rather than rejecting the request.
+    let resp = browser.get(&app, "app.test.local", "/verify").await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "expired session should have been silently refreshed"
+    );
+    assert_eq!(refresh_grant_count.load(Ordering::SeqCst), 1);
+
+    // Same session identity throughout — refresh updates the existing
+    // row/cookie rather than minting a new session.
+    assert_eq!(browser.cookies["fa_session"], session_cookie_before);
+}
+
+#[tokio::test]
+async fn refresh_failure_clears_the_session() {
+    let ttl = Duration::from_secs(1);
+    let (idp_base_url, _refresh_grant_count, refresh_tokens) = spawn_mock_idp(ttl).await;
+    let db_dir = tempfile::tempdir().unwrap();
+    let (app, _state) = spawn_app(&idp_base_url, &db_dir.path().join("sessions.db")).await;
+    let idp_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    let mut browser = Browser::new();
+    login_as(
+        &app,
+        &idp_client,
+        &mut browser,
+        "alice",
+        "https://app.test.local/dashboard",
+    )
+    .await;
+
+    tokio::time::sleep(ttl + Duration::from_millis(500)).await;
+    assert_eq!(
+        browser
+            .get(&app, "app.test.local", "/verify")
+            .await
+            .status(),
+        reqwest::StatusCode::OK
+    );
+
+    // Simulate the IdP revoking the (now-rotated) refresh token: wipe the
+    // mock's record of every refresh token it has issued, so the next
+    // refresh attempt gets a genuine invalid_grant rejection, exactly as
+    // a real IdP would return for a revoked/expired refresh token.
+    refresh_tokens.lock().unwrap().clear();
+    tokio::time::sleep(ttl + Duration::from_millis(500)).await;
+
+    let resp = browser.get(&app, "app.test.local", "/verify").await;
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn concurrent_verify_requests_collapse_into_one_refresh() {
+    let ttl = Duration::from_secs(2);
+    let (idp_base_url, refresh_grant_count, _refresh_tokens) = spawn_mock_idp(ttl).await;
+    let db_dir = tempfile::tempdir().unwrap();
+    let (app, _state) = spawn_app(&idp_base_url, &db_dir.path().join("sessions.db")).await;
+    let idp_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    let mut browser = Browser::new();
+    login_as(
+        &app,
+        &idp_client,
+        &mut browser,
+        "alice",
+        "https://app.test.local/dashboard",
+    )
+    .await;
+    let cookie_header = format!("fa_session={}", browser.cookies["fa_session"]);
+
+    tokio::time::sleep(ttl + Duration::from_millis(500)).await;
+
+    // Fire many concurrent requests against the one expiring session. The
+    // per-session lock (Phase 2) should collapse them into exactly one
+    // refresh call to the IdP, even though every one of them observes the
+    // session as expired before any refresh has completed.
+    let handles: Vec<_> = (0..8)
+        .map(|_| {
+            let app = app.clone();
+            let cookie_header = cookie_header.clone();
+            tokio::spawn(async move { raw_verify(&app, &cookie_header).await })
+        })
+        .collect();
+
+    for handle in handles {
+        assert_eq!(handle.await.unwrap(), reqwest::StatusCode::OK);
+    }
+
+    assert_eq!(
+        refresh_grant_count.load(Ordering::SeqCst),
+        1,
+        "concurrent requests against one expiring session should trigger exactly one IdP refresh call"
+    );
+}
+
+// ---- Phase 2: expired-session reaper ------------------------------------
+
+#[tokio::test]
+async fn reaper_deletes_sessions_with_no_refresh_token_survivors() {
+    // Build a session directly (no refresh token), bypassing login, then
+    // confirm the reaper removes it once expired.
+    let ttl = Duration::from_millis(50);
+    let (idp_base_url, _count, _refresh_tokens) = spawn_mock_idp(ttl).await;
+    let db_dir = tempfile::tempdir().unwrap();
+    let (_app, state) = spawn_app(&idp_base_url, &db_dir.path().join("sessions.db")).await;
+
+    forward_auth::db::create_session(
+        &state.db,
+        "reaper-test-session",
+        "test.local",
+        "alice",
+        None,
+        None,
+        Utc::now() - ChronoDuration::seconds(1),
+        None,
+    )
+    .await
+    .unwrap();
+
+    forward_auth::session::reap_expired_sessions(&state).await;
+
+    assert!(
+        forward_auth::db::get_session(&state.db, "reaper-test-session")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn reaper_does_not_delete_a_session_mid_refresh() {
+    let ttl = Duration::from_secs(1);
+    let refresh_delay = Duration::from_millis(1500);
+    let (idp_base_url, refresh_grant_count, _refresh_tokens) =
+        spawn_mock_idp_with_refresh_delay(ttl, refresh_delay).await;
+    let db_dir = tempfile::tempdir().unwrap();
+    let (app, state) = spawn_app(&idp_base_url, &db_dir.path().join("sessions.db")).await;
+    let idp_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    let mut browser = Browser::new();
+    login_as(
+        &app,
+        &idp_client,
+        &mut browser,
+        "alice",
+        "https://app.test.local/dashboard",
+    )
+    .await;
+    let cookie_header = format!("fa_session={}", browser.cookies["fa_session"]);
+
+    tokio::time::sleep(ttl + Duration::from_millis(500)).await;
+
+    // Kick off a /verify that will sit in the mock IdP's artificial delay
+    // while mid-refresh, holding the session's lock the whole time.
+    let app_clone = app.clone();
+    let cookie_header_clone = cookie_header.clone();
+    let verify_task =
+        tokio::spawn(async move { raw_verify(&app_clone, &cookie_header_clone).await });
+
+    // Give the refresh time to start (acquire the lock, reach the IdP)
+    // but not to finish.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // The reaper runs while that refresh is still in flight. It must not
+    // delete the row out from under it: it can only proceed past the
+    // per-session lock once the refresh releases it, at which point the
+    // row's expiry has already been pushed into the future.
+    forward_auth::session::reap_expired_sessions(&state).await;
+
+    assert_eq!(
+        verify_task.await.unwrap(),
+        reqwest::StatusCode::OK,
+        "in-flight refresh should still succeed"
+    );
+    assert_eq!(refresh_grant_count.load(Ordering::SeqCst), 1);
+
+    // If the reaper had deleted the session out from under the in-flight
+    // refresh, this would either 401 (session gone) or trigger a second,
+    // unnecessary refresh (session recreated from scratch isn't possible
+    // here — there'd be nothing to refresh with). Neither happens: the
+    // row survived with its refreshed, still-future expiry intact.
+    assert_eq!(
+        raw_verify(&app, &cookie_header).await,
+        reqwest::StatusCode::OK
+    );
+    assert_eq!(
+        refresh_grant_count.load(Ordering::SeqCst),
+        1,
+        "session should still be fresh from the earlier refresh, needing no second one"
     );
 }

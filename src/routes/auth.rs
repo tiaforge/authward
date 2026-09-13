@@ -287,11 +287,13 @@ pub async fn callback(
     let refresh_token = token_response
         .refresh_token()
         .map(|t| state.refresh_cipher.encrypt(t.secret()));
-    let ttl_seconds = token_response
+    let ttl = token_response
         .expires_in()
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or_else(|| state.config.global.session_ttl_fallback.as_secs() as i64);
-    let expires_at = Utc::now() + ChronoDuration::seconds(ttl_seconds);
+        .unwrap_or(state.config.global.session_ttl_fallback);
+    let expires_at = Utc::now()
+        + ChronoDuration::from_std(ttl).unwrap_or_else(|_| {
+            ChronoDuration::seconds(state.config.global.session_ttl_fallback.as_secs() as i64)
+        });
     let user_agent = headers.get("user-agent").and_then(|v| v.to_str().ok());
 
     if let Err(err) = db::create_session(
@@ -333,12 +335,8 @@ pub async fn verify(State(state): State<AppState>, jar: PrivateCookieJar) -> Sta
         return StatusCode::UNAUTHORIZED;
     };
 
-    match db::get_session(&state.db, cookie.value()).await {
-        Ok(Some(session)) if !session.is_expired() => StatusCode::OK,
-        Ok(_) => StatusCode::UNAUTHORIZED,
-        Err(err) => {
-            tracing::error!(%err, "session lookup failed");
-            StatusCode::UNAUTHORIZED
-        }
+    match crate::session::verify_session(&state, cookie.value()).await {
+        crate::session::VerifyOutcome::Valid => StatusCode::OK,
+        crate::session::VerifyOutcome::Invalid => StatusCode::UNAUTHORIZED,
     }
 }
