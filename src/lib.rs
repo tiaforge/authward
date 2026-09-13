@@ -1,5 +1,6 @@
 pub mod authz;
 pub mod bearer;
+pub mod bypass;
 pub mod cli;
 pub mod config;
 pub mod crypto;
@@ -9,6 +10,7 @@ pub mod jwks_cache;
 pub mod locks;
 pub mod logging;
 pub mod oidc;
+pub mod ratelimit;
 pub mod redirect;
 pub mod routes;
 pub mod server;
@@ -25,6 +27,7 @@ use crate::config::Config;
 use crate::crypto::RefreshTokenCipher;
 use crate::jwks_cache::JwksCache;
 use crate::locks::SessionLocks;
+use crate::ratelimit::{LOGIN_RATE_LIMIT_CAPACITY, LOGIN_RATE_LIMIT_REFILL_PER_SEC, RateLimiter};
 use crate::state::{AppState, AppStateInner};
 
 /// Builds the full application state from a resolved config: discovers
@@ -68,5 +71,9 @@ pub async fn build_state(cfg: Config) -> anyhow::Result<AppState> {
         end_session_endpoints,
         http_client,
         session_locks: SessionLocks::new(),
+        login_rate_limiter: RateLimiter::new(
+            LOGIN_RATE_LIMIT_CAPACITY,
+            LOGIN_RATE_LIMIT_REFILL_PER_SEC,
+        ),
     }))
 }

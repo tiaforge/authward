@@ -2107,3 +2107,178 @@ async fn logout_rejects_get() {
     let resp = browser.get(&app, "auth.test.local", "/logout").await;
     assert_eq!(resp.status(), reqwest::StatusCode::METHOD_NOT_ALLOWED);
 }
+
+// ---- Phase 9: bypass paths, rate limiting, mixed-case hosts --------------
+
+#[tokio::test]
+async fn bypass_path_skips_auth_entirely() {
+    let (idp_base_url, _count, _tokens) = spawn_mock_idp(Duration::from_secs(3600)).await;
+    let db_dir = tempfile::tempdir().unwrap();
+    let mut cfg = base_config(&db_dir.path().join("sessions.db"));
+    cfg.base_domains.insert(
+        "test.local".to_string(),
+        base_domain_block("test.local", "auth.test.local", &idp_base_url),
+    );
+    let mut app_host = resolved_host("app.test.local", "test.local", &idp_base_url);
+    app_host.bypass_paths = vec!["/public/logo.svg".to_string()];
+    cfg.hosts.insert("app.test.local".to_string(), app_host);
+    let (app, _state) = spawn_app_with_config(cfg).await;
+
+    // No session cookie at all — an unbypassed path is denied...
+    let resp = reqwest::Client::new()
+        .get(format!("{app}/verify"))
+        .header("host", "app.test.local")
+        .header("x-forwarded-uri", "/private/secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    // ...but the bypassed path skips auth entirely.
+    let resp = reqwest::Client::new()
+        .get(format!("{app}/verify"))
+        .header("host", "app.test.local")
+        .header("x-forwarded-uri", "/public/logo.svg")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+}
+
+#[tokio::test]
+async fn bypass_path_appended_as_query_string_does_not_bypass_a_protected_route() {
+    let (idp_base_url, _count, _tokens) = spawn_mock_idp(Duration::from_secs(3600)).await;
+    let db_dir = tempfile::tempdir().unwrap();
+    let mut cfg = base_config(&db_dir.path().join("sessions.db"));
+    cfg.base_domains.insert(
+        "test.local".to_string(),
+        base_domain_block("test.local", "auth.test.local", &idp_base_url),
+    );
+    let mut app_host = resolved_host("app.test.local", "test.local", &idp_base_url);
+    app_host.bypass_paths = vec!["/public/logo.svg".to_string()];
+    cfg.hosts.insert("app.test.local".to_string(), app_host);
+    let (app, _state) = spawn_app_with_config(cfg).await;
+
+    let resp = reqwest::Client::new()
+        .get(format!("{app}/verify"))
+        .header("host", "app.test.local")
+        .header("x-forwarded-uri", "/admin/dashboard?x=/public/logo.svg")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "an allowed path appended to an unrelated route's query string must not bypass auth"
+    );
+}
+
+#[tokio::test]
+async fn bypass_path_with_a_fragment_does_not_bypass() {
+    let (idp_base_url, _count, _tokens) = spawn_mock_idp(Duration::from_secs(3600)).await;
+    let db_dir = tempfile::tempdir().unwrap();
+    let mut cfg = base_config(&db_dir.path().join("sessions.db"));
+    cfg.base_domains.insert(
+        "test.local".to_string(),
+        base_domain_block("test.local", "auth.test.local", &idp_base_url),
+    );
+    let mut app_host = resolved_host("app.test.local", "test.local", &idp_base_url);
+    app_host.bypass_paths = vec!["/public/logo.svg".to_string()];
+    cfg.hosts.insert("app.test.local".to_string(), app_host);
+    let (app, _state) = spawn_app_with_config(cfg).await;
+
+    let resp = reqwest::Client::new()
+        .get(format!("{app}/verify"))
+        .header("host", "app.test.local")
+        .header("x-forwarded-uri", "/public/logo.svg#whatever")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn login_is_rate_limited_per_ip_but_not_other_ips() {
+    let (idp_base_url, _count, _tokens) = spawn_mock_idp(Duration::from_secs(3600)).await;
+    let db_dir = tempfile::tempdir().unwrap();
+    let (app, _state) = spawn_app(&idp_base_url, &db_dir.path().join("sessions.db")).await;
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    let mut last_status = reqwest::StatusCode::OK;
+    for _ in 0..25 {
+        last_status = client
+            .get(format!("{app}/login"))
+            .header("host", "auth.test.local")
+            .header("x-forwarded-for", "203.0.113.9")
+            .send()
+            .await
+            .unwrap()
+            .status();
+    }
+    assert_eq!(
+        last_status,
+        reqwest::StatusCode::TOO_MANY_REQUESTS,
+        "should be rate limited after exhausting the burst capacity"
+    );
+
+    let resp = client
+        .get(format!("{app}/login"))
+        .header("host", "auth.test.local")
+        .header("x-forwarded-for", "198.51.100.7")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::SEE_OTHER,
+        "a different source IP must have its own independent budget"
+    );
+}
+
+#[tokio::test]
+async fn mixed_case_and_multi_level_host_headers_resolve_correctly() {
+    let (idp_base_url, _count, _tokens) = spawn_mock_idp(Duration::from_secs(3600)).await;
+    let db_dir = tempfile::tempdir().unwrap();
+    let mut cfg = base_config(&db_dir.path().join("sessions.db"));
+    cfg.base_domains.insert(
+        "test.local".to_string(),
+        base_domain_block("test.local", "auth.test.local", &idp_base_url),
+    );
+    cfg.hosts.insert(
+        "deep.app.test.local".to_string(),
+        resolved_host("deep.app.test.local", "test.local", &idp_base_url),
+    );
+    let (app, _state) = spawn_app_with_config(cfg).await;
+    let idp_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    let mut browser = Browser::new();
+    login_as(
+        &app,
+        &idp_client,
+        &mut browser,
+        "alice",
+        "https://deep.app.test.local/",
+    )
+    .await;
+
+    assert_eq!(
+        browser
+            .get(&app, "Deep.App.Test.Local", "/verify")
+            .await
+            .status(),
+        reqwest::StatusCode::OK
+    );
+    assert_eq!(
+        browser
+            .get(&app, "DEEP.APP.TEST.LOCAL", "/verify")
+            .await
+            .status(),
+        reqwest::StatusCode::OK
+    );
+}

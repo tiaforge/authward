@@ -29,3 +29,56 @@ pub fn cookies_should_be_secure(headers: &HeaderMap) -> bool {
         .map(|v| !v.eq_ignore_ascii_case("http"))
         .unwrap_or(true)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn headers_with(name: &str, value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            name.parse::<axum::http::HeaderName>().unwrap(),
+            value.parse().unwrap(),
+        );
+        headers
+    }
+
+    #[test]
+    fn lowercases_mixed_case_hosts() {
+        assert_eq!(
+            resolve_incoming_host(&headers_with("host", "APP.Example.COM")),
+            Some("app.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn lowercases_multi_level_subdomains() {
+        assert_eq!(
+            resolve_incoming_host(&headers_with("x-forwarded-host", "Deep.App.Example.COM")),
+            Some("deep.app.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn prefers_x_forwarded_host_over_host() {
+        let mut headers = headers_with("host", "wrong.example.com");
+        headers.insert("x-forwarded-host", "right.example.com".parse().unwrap());
+        assert_eq!(
+            resolve_incoming_host(&headers),
+            Some("right.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn strips_a_port() {
+        assert_eq!(
+            resolve_incoming_host(&headers_with("host", "App.Example.com:8443")),
+            Some("app.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn missing_headers_is_none() {
+        assert_eq!(resolve_incoming_host(&HeaderMap::new()), None);
+    }
+}

@@ -68,6 +68,25 @@ fn error_page(status: StatusCode, title: &str, message: &str) -> Response {
     (status, ErrorPage { title, message }).into_response()
 }
 
+/// Per-IP rate limit on `/login`/`/token` and `/callback` (Phase 9).
+/// Returns `Some(response)` when the request should be rejected; `None`
+/// means proceed. Fails open (no limiting) when the client IP can't be
+/// determined — an unavailable `X-Forwarded-For` is treated as
+/// "can't rate-limit this one" rather than a reason to block everyone.
+fn rate_limit_check(state: &AppState, headers: &HeaderMap) -> Option<Response> {
+    let ip = crate::ratelimit::client_ip(headers)?;
+    if state.login_rate_limiter.check(ip) {
+        None
+    } else {
+        tracing::info!(%ip, "rate limit exceeded on login/callback");
+        Some(error_page(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many requests",
+            "Please wait a moment before trying again.",
+        ))
+    }
+}
+
 /// `auth.<base_domain>` requests resolve to a base domain by matching the
 /// incoming `Host`/`X-Forwarded-Host` against each configured base
 /// domain's `auth_subdomain` — this is *not* the per-app host lookup
@@ -153,6 +172,10 @@ async fn start_authorization(
     rd: Option<String>,
     resource: Option<String>,
 ) -> Response {
+    if let Some(response) = rate_limit_check(state, headers) {
+        return response;
+    }
+
     let Some(host) = resolve_incoming_host(headers) else {
         return error_page(
             StatusCode::BAD_REQUEST,
@@ -235,6 +258,10 @@ pub async fn callback(
     Query(params): Query<CallbackParams>,
     jar: PrivateCookieJar,
 ) -> Response {
+    if let Some(response) = rate_limit_check(&state, &headers) {
+        return response;
+    }
+
     let Some(flow_cookie) = jar.get(FLOW_COOKIE_NAME) else {
         return error_page(
             StatusCode::BAD_REQUEST,
@@ -447,6 +474,16 @@ pub async fn verify(
         );
         return StatusCode::BAD_GATEWAY.into_response();
     };
+
+    // Bypass paths (Phase 9) skip auth entirely — checked before touching
+    // the session/bearer-token logic at all. Caddy carries the original
+    // app request's path+query in X-Forwarded-Uri; its absence just means
+    // no bypass can apply (fails closed into normal auth, not open).
+    if let Some(uri) = headers.get("x-forwarded-uri").and_then(|v| v.to_str().ok())
+        && crate::bypass::matches_bypass(uri, &resolved_host.bypass_paths)
+    {
+        return StatusCode::OK.into_response();
+    }
 
     let Some(cookie) = jar.get(SESSION_COOKIE_NAME) else {
         // No session cookie: fall back to a resource-scoped bearer token

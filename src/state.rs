@@ -11,6 +11,7 @@ use crate::crypto::RefreshTokenCipher;
 use crate::jwks_cache::JwksCache;
 use crate::locks::SessionLocks;
 use crate::oidc::DiscoveredClient;
+use crate::ratelimit::RateLimiter;
 
 #[derive(Clone)]
 pub struct AppState(Arc<AppStateInner>);
@@ -30,6 +31,10 @@ pub struct AppStateInner {
     pub end_session_endpoints: HashMap<String, Option<url::Url>>,
     pub http_client: openidconnect::reqwest::Client,
     pub session_locks: SessionLocks,
+    /// Shared across `/login` and `/callback` — a token-bucket burst
+    /// covers a normal three-hop login (redirect to IdP, then callback)
+    /// without the two endpoints needing separate budgets.
+    pub login_rate_limiter: RateLimiter,
 }
 
 impl AppState {

@@ -421,3 +421,100 @@ fn resolve_fallback_provider_override(raw: &RawProvider) -> Result<Provider, Con
         client_secret: raw.client_secret.clone(),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use super::*;
+
+    fn write_config(contents: &str) -> tempfile::NamedTempFile {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(contents.as_bytes()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(file.path(), std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        file
+    }
+
+    const VALID_TOML: &str = r#"
+[global]
+cookie_signing_key = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+refresh_token_encryption_key = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+[base_domain."Example.COM"]
+auth_subdomain = "auth.example.com"
+
+[base_domain."Example.COM".provider]
+discovery_url = "https://idp.example.com/.well-known/openid-configuration"
+client_id = "client"
+client_secret = "secret"
+
+[host."App.Example.COM"]
+base_domain = "Example.COM"
+"#;
+
+    #[test]
+    fn mixed_case_host_and_base_domain_keys_normalize_to_lowercase() {
+        let file = write_config(VALID_TOML);
+        let cfg = load(file.path()).expect("valid config should load");
+
+        assert!(
+            cfg.base_domains.contains_key("example.com"),
+            "base_domain key should be lowercased"
+        );
+        assert!(
+            cfg.hosts.contains_key("app.example.com"),
+            "host key should be lowercased"
+        );
+        assert_eq!(
+            cfg.hosts["app.example.com"].base_domain, "example.com",
+            "the base_domain reference should resolve case-insensitively too"
+        );
+    }
+
+    #[test]
+    fn malformed_toml_fails_hard_with_a_parse_error() {
+        let file = write_config("this is not [ valid toml");
+        let errors = load(file.path()).expect_err("malformed TOML must not load");
+        assert!(matches!(errors.as_slice(), [ConfigError::Parse { .. }]));
+    }
+
+    #[test]
+    fn host_referencing_an_unknown_base_domain_fails_hard() {
+        let file = write_config(
+            r#"
+[global]
+cookie_signing_key = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+refresh_token_encryption_key = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+[host."app.example.com"]
+base_domain = "nonexistent.example.com"
+"#,
+        );
+        let errors = load(file.path()).expect_err("a dangling base_domain reference must not load");
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ConfigError::UnknownBaseDomain { .. }))
+        );
+    }
+
+    #[test]
+    fn missing_keys_fail_hard_with_specific_errors() {
+        let file = write_config("");
+        let errors = load(file.path()).expect_err("a config with no keys at all must not load");
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ConfigError::MissingCookieSigningKey))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ConfigError::MissingRefreshKey))
+        );
+    }
+}
