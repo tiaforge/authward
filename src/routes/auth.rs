@@ -39,6 +39,12 @@ pub struct LoginParams {
 }
 
 #[derive(Deserialize)]
+pub struct TokenParams {
+    /// Which configured host's resource to request a token for.
+    host: String,
+}
+
+#[derive(Deserialize)]
 pub struct CallbackParams {
     code: Option<String>,
     state: Option<String>,
@@ -53,6 +59,9 @@ struct FlowState {
     pkce_verifier: String,
     rd: String,
     base_domain: String,
+    /// Set only for a `/token` flow (Phase 5): on success, `/callback`
+    /// displays the access token once instead of creating a session.
+    resource: Option<String>,
 }
 
 fn error_page(status: StatusCode, title: &str, message: &str) -> Response {
@@ -80,6 +89,19 @@ pub async fn login(
     Query(params): Query<LoginParams>,
     jar: PrivateCookieJar,
 ) -> Response {
+    start_authorization(&state, &headers, jar, params.rd, None).await
+}
+
+/// `/token` helper (Phase 5): authenticates the user exactly like `/login`,
+/// but adds `resource=<host's resource>` to the authorization request so
+/// the IdP scopes the issued access token to it, and displays that token
+/// once on `/callback` instead of creating a session.
+pub async fn token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<TokenParams>,
+    jar: PrivateCookieJar,
+) -> Response {
     let Some(host) = resolve_incoming_host(&headers) else {
         return error_page(
             StatusCode::BAD_REQUEST,
@@ -87,7 +109,58 @@ pub async fn login(
             "Missing Host header.",
         );
     };
-    let Some(base_domain) = base_domain_for_auth_host(&state, &host) else {
+    let Some(auth_base_domain) = base_domain_for_auth_host(&state, &host) else {
+        return error_page(
+            StatusCode::BAD_GATEWAY,
+            "Unknown auth host",
+            "This host isn't configured as an auth subdomain for any base domain.",
+        );
+    };
+
+    let Some(target_host) = state.config.hosts.get(&params.host.to_ascii_lowercase()) else {
+        return error_page(
+            StatusCode::BAD_REQUEST,
+            "Unknown host",
+            "That host isn't configured on this service.",
+        );
+    };
+    if target_host.base_domain != auth_base_domain.name {
+        return error_page(
+            StatusCode::BAD_REQUEST,
+            "Wrong auth domain",
+            "That host belongs to a different base domain than this auth subdomain.",
+        );
+    }
+    let Some(resource) = target_host.resource.clone() else {
+        return error_page(
+            StatusCode::BAD_REQUEST,
+            "No API resource configured",
+            "This host has no `resource` configured, so no API token can be issued for it.",
+        );
+    };
+
+    start_authorization(&state, &headers, jar, None, Some(resource)).await
+}
+
+/// Shared by `/login` and `/token`: resolves the auth subdomain to its
+/// base domain, builds the authorization URL (with PKCE/state/nonce, and
+/// `resource` when requesting an API token), and stashes everything the
+/// eventual `/callback` needs in an encrypted flow cookie.
+async fn start_authorization(
+    state: &AppState,
+    headers: &HeaderMap,
+    jar: PrivateCookieJar,
+    rd: Option<String>,
+    resource: Option<String>,
+) -> Response {
+    let Some(host) = resolve_incoming_host(headers) else {
+        return error_page(
+            StatusCode::BAD_REQUEST,
+            "Bad request",
+            "Missing Host header.",
+        );
+    };
+    let Some(base_domain) = base_domain_for_auth_host(state, &host) else {
         return error_page(
             StatusCode::BAD_GATEWAY,
             "Unknown auth host",
@@ -102,15 +175,14 @@ pub async fn login(
         );
     };
 
-    let rd = params
-        .rd
+    let rd = rd
         .as_deref()
         .and_then(|rd| validate_redirect_target(rd, &base_domain.name))
         .unwrap_or_else(|| format!("https://{}/", base_domain.auth_subdomain));
 
     let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
 
-    let (auth_url, csrf_token, nonce) = oidc_client
+    let mut request = oidc_client
         .authorize_url(
             CoreAuthenticationFlow::AuthorizationCode,
             CsrfToken::new_random,
@@ -118,8 +190,13 @@ pub async fn login(
         )
         .add_scope(Scope::new("email".to_string()))
         .add_scope(Scope::new("profile".to_string()))
-        .set_pkce_challenge(pkce_challenge)
-        .url();
+        .set_pkce_challenge(pkce_challenge);
+    if let Some(resource) = &resource {
+        // RFC 8707 resource indicator, so the IdP scopes the issued
+        // access token's audience to this specific resource.
+        request = request.add_extra_param("resource", resource.clone());
+    }
+    let (auth_url, csrf_token, nonce) = request.url();
 
     let flow = FlowState {
         csrf_state: csrf_token.secret().clone(),
@@ -127,6 +204,7 @@ pub async fn login(
         pkce_verifier: pkce_verifier.secret().clone(),
         rd,
         base_domain: base_domain.name.clone(),
+        resource,
     };
     let flow_json = match serde_json::to_string(&flow) {
         Ok(json) => json,
@@ -142,7 +220,7 @@ pub async fn login(
     let flow_cookie = Cookie::build((FLOW_COOKIE_NAME, flow_json))
         .path("/")
         .http_only(true)
-        .secure(cookies_should_be_secure(&headers))
+        .secure(cookies_should_be_secure(headers))
         .same_site(SameSite::Lax)
         .max_age(CookieDuration::minutes(FLOW_COOKIE_MAX_AGE_MINUTES))
         .build();
@@ -230,11 +308,15 @@ pub async fn callback(
         }
     };
 
-    let token_response = match token_request
-        .set_pkce_verifier(PkceCodeVerifier::new(flow.pkce_verifier.clone()))
-        .request_async(&state.http_client)
-        .await
-    {
+    let mut token_request =
+        token_request.set_pkce_verifier(PkceCodeVerifier::new(flow.pkce_verifier.clone()));
+    if let Some(resource) = &flow.resource {
+        // RFC 8707: include the resource indicator on the token request
+        // too, not just the authorization request.
+        token_request = token_request.add_extra_param("resource", resource.clone());
+    }
+
+    let token_response = match token_request.request_async(&state.http_client).await {
         Ok(response) => response,
         Err(err) => {
             tracing::error!(%err, "token exchange failed");
@@ -279,6 +361,20 @@ pub async fn callback(
             );
         }
     };
+
+    if let Some(resource) = &flow.resource {
+        // /token flow (Phase 5): show the access token once, no session.
+        let access_token = token_response.access_token().secret().clone();
+        return (
+            jar,
+            [(axum::http::header::CACHE_CONTROL, "no-store")],
+            crate::templates::TokenPage {
+                resource,
+                access_token: &access_token,
+            },
+        )
+            .into_response();
+    }
 
     let subject = claims.subject().as_str().to_string();
     let email = claims.email().as_ref().map(|e| e.as_str().to_string());
@@ -353,7 +449,11 @@ pub async fn verify(
     };
 
     let Some(cookie) = jar.get(SESSION_COOKIE_NAME) else {
-        return StatusCode::UNAUTHORIZED.into_response();
+        // No session cookie: fall back to a resource-scoped bearer token
+        // (Phase 5), for non-browser clients. Unavailable for this host
+        // (no `resource` configured, or provider has no JWKS cache) is
+        // not an error — it just means there's nothing left to try.
+        return bearer_auth(&state, &headers, resolved_host).await;
     };
 
     let session =
@@ -384,4 +484,42 @@ pub async fn verify(
     }
 
     StatusCode::OK.into_response()
+}
+
+/// Resource-scoped bearer-token bypass (Phase 5) for non-browser clients.
+/// Only reached when `/verify` found no session cookie at all.
+async fn bearer_auth(
+    state: &AppState,
+    headers: &HeaderMap,
+    resolved_host: &crate::config::ResolvedHost,
+) -> Response {
+    let Some(resource) = &resolved_host.resource else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let Some(cache) = state.jwks_caches.get(&resolved_host.base_domain) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let Some(token) = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+    else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+
+    match crate::bearer::validate(
+        cache,
+        &state.http_client,
+        resource,
+        resolved_host.required_scope.as_deref(),
+        token,
+    )
+    .await
+    {
+        Ok(_claims) => StatusCode::OK.into_response(),
+        Err(err) => {
+            tracing::info!(%err, host = ?resolved_host.host, "bearer token rejected");
+            StatusCode::UNAUTHORIZED.into_response()
+        }
+    }
 }

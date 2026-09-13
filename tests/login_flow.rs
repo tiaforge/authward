@@ -60,7 +60,7 @@ struct PendingAuth {
 #[derive(Clone)]
 struct MockIdp {
     base_url: String,
-    hmac_key: Arc<CoreHmacKey>,
+    hmac_key: Arc<Mutex<CoreHmacKey>>,
     pending: Arc<Mutex<HashMap<String, PendingAuth>>>,
     /// Refresh tokens issued so far, keyed by token value. The mock
     /// *rotates* refresh tokens on every use (removing the consumed one
@@ -114,7 +114,9 @@ async fn discovery(State(idp): State<MockIdp>) -> Json<serde_json::Value> {
 async fn jwks(
     State(idp): State<MockIdp>,
 ) -> Json<JsonWebKeySet<openidconnect::core::CoreJsonWebKey>> {
-    Json(JsonWebKeySet::new(vec![idp.hmac_key.as_verification_key()]))
+    Json(JsonWebKeySet::new(vec![
+        idp.hmac_key.lock().unwrap().as_verification_key(),
+    ]))
 }
 
 async fn authorize(
@@ -179,6 +181,8 @@ fn issue_tokens(
     let signing_input = format!("{header_b64}.{payload_b64}");
     let signature = idp
         .hmac_key
+        .lock()
+        .unwrap()
         .sign(
             &CoreJwsSigningAlgorithm::HmacSha256,
             signing_input.as_bytes(),
@@ -272,13 +276,34 @@ async fn spawn_mock_idp_with_refresh_delay(
     Arc<AtomicUsize>,
     Arc<Mutex<HashMap<String, PendingAuth>>>,
 ) {
+    let (base_url, refresh_grant_count, refresh_tokens, _hmac_key) =
+        spawn_mock_idp_full(access_token_ttl, refresh_delay).await;
+    (base_url, refresh_grant_count, refresh_tokens)
+}
+
+/// Full form of `spawn_mock_idp`, also returning the mock's HMAC signing
+/// key handle so a test can rotate it (Phase 5's key-rotation test) or
+/// sign a hand-built bearer token directly without a real /token round
+/// trip (`build_access_token`).
+async fn spawn_mock_idp_full(
+    access_token_ttl: Duration,
+    refresh_delay: Duration,
+) -> (
+    String,
+    Arc<AtomicUsize>,
+    Arc<Mutex<HashMap<String, PendingAuth>>>,
+    Arc<Mutex<CoreHmacKey>>,
+) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base_url = format!("http://{}", listener.local_addr().unwrap());
 
     let refresh_grant_count = Arc::new(AtomicUsize::new(0));
+    let hmac_key = Arc::new(Mutex::new(CoreHmacKey::new(
+        CLIENT_SECRET.as_bytes().to_vec(),
+    )));
     let idp = MockIdp {
         base_url: base_url.clone(),
-        hmac_key: Arc::new(CoreHmacKey::new(CLIENT_SECRET.as_bytes().to_vec())),
+        hmac_key: hmac_key.clone(),
         pending: Arc::new(Mutex::new(HashMap::new())),
         refresh_tokens: Arc::new(Mutex::new(HashMap::new())),
         refresh_grant_count: refresh_grant_count.clone(),
@@ -298,7 +323,46 @@ async fn spawn_mock_idp_with_refresh_delay(
         axum::serve(listener, app).await.unwrap();
     });
 
-    (base_url, refresh_grant_count, refresh_tokens)
+    (base_url, refresh_grant_count, refresh_tokens, hmac_key)
+}
+
+/// Builds a resource-scoped access token JWT by hand and signs it with
+/// `hmac_key` directly — bypassing the mock's `/token` endpoint, since
+/// these tests are about the app's bearer-validation logic, not a full
+/// OAuth round trip.
+fn build_access_token(
+    hmac_key: &CoreHmacKey,
+    issuer: &str,
+    aud: &str,
+    scope: Option<&str>,
+    exp_offset_secs: i64,
+) -> String {
+    use base64::Engine;
+    let now = Utc::now();
+    let mut payload = serde_json::json!({
+        "iss": issuer,
+        "aud": aud,
+        "sub": "test-user",
+        "iat": now.timestamp(),
+        "exp": now.timestamp() + exp_offset_secs,
+    });
+    if let Some(scope) = scope {
+        payload["scope"] = serde_json::Value::String(scope.to_string());
+    }
+    let header_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"alg":"HS256"}"#);
+    let payload_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(serde_json::to_vec(&payload).unwrap());
+    let signing_input = format!("{header_b64}.{payload_b64}");
+    let signature = hmac_key
+        .sign(
+            &CoreJwsSigningAlgorithm::HmacSha256,
+            signing_input.as_bytes(),
+        )
+        .expect("mock HMAC signing should not fail");
+    format!(
+        "{signing_input}.{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signature)
+    )
 }
 
 // ---- App under test ---------------------------------------------------
@@ -874,7 +938,7 @@ async fn reaper_deletes_sessions_with_no_refresh_token_survivors() {
 #[tokio::test]
 async fn reaper_does_not_delete_a_session_mid_refresh() {
     let ttl = Duration::from_secs(1);
-    let refresh_delay = Duration::from_millis(1500);
+    let refresh_delay = Duration::from_millis(3000);
     let (idp_base_url, refresh_grant_count, _refresh_tokens) =
         spawn_mock_idp_with_refresh_delay(ttl, refresh_delay).await;
     let db_dir = tempfile::tempdir().unwrap();
@@ -908,8 +972,11 @@ async fn reaper_does_not_delete_a_session_mid_refresh() {
         tokio::spawn(async move { raw_verify(&app_clone, &cookie_header_clone).await });
 
     // Give the refresh time to start (acquire the lock, reach the IdP)
-    // but not to finish.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // but not to finish. Margin is generous relative to refresh_delay
+    // above to stay robust when many tests run concurrently under CPU
+    // contention (this specific timing relationship, not the 3s total,
+    // is what the test needs).
+    tokio::time::sleep(Duration::from_millis(1000)).await;
 
     // The reaper runs while that refresh is still in flight. It must not
     // delete the row out from under it: it can only proceed past the
@@ -1294,4 +1361,278 @@ async fn revoking_group_membership_denies_access_on_next_refresh_without_relogin
         reqwest::StatusCode::FORBIDDEN,
         "losing required group membership should deny access on the next silent refresh, without waiting for full re-login"
     );
+}
+
+// ---- Phase 5: resource-scoped bearer tokens ------------------------------
+
+async fn raw_verify_bearer(app: &str, host: &str, token: &str) -> reqwest::StatusCode {
+    reqwest::Client::new()
+        .get(format!("{app}/verify"))
+        .header("host", host)
+        .header("authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .unwrap()
+        .status()
+}
+
+fn api_host(
+    resource: &str,
+    required_scope: Option<&str>,
+    idp_base_url: &str,
+) -> config::ResolvedHost {
+    config::ResolvedHost {
+        resource: Some(resource.to_string()),
+        required_scope: required_scope.map(str::to_string),
+        ..resolved_host("api.test.local", "test.local", idp_base_url)
+    }
+}
+
+#[tokio::test]
+async fn bearer_token_grants_access_for_matching_resource_and_scope() {
+    let (idp_base_url, _count, _tokens, hmac_key) =
+        spawn_mock_idp_full(Duration::from_secs(3600), Duration::ZERO).await;
+    let db_dir = tempfile::tempdir().unwrap();
+    let mut cfg = base_config(&db_dir.path().join("sessions.db"));
+    cfg.base_domains.insert(
+        "test.local".to_string(),
+        base_domain_block("test.local", "auth.test.local", &idp_base_url),
+    );
+    cfg.hosts.insert(
+        "api.test.local".to_string(),
+        api_host("https://api.test.local/", Some("read"), &idp_base_url),
+    );
+    let (app, _state) = spawn_app_with_config(cfg).await;
+
+    let token = build_access_token(
+        &hmac_key.lock().unwrap(),
+        &idp_base_url,
+        "https://api.test.local/",
+        Some("read write"),
+        3600,
+    );
+    assert_eq!(
+        raw_verify_bearer(&app, "api.test.local", &token).await,
+        reqwest::StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn bearer_token_for_a_different_resource_is_rejected() {
+    let (idp_base_url, _count, _tokens, hmac_key) =
+        spawn_mock_idp_full(Duration::from_secs(3600), Duration::ZERO).await;
+    let db_dir = tempfile::tempdir().unwrap();
+    let mut cfg = base_config(&db_dir.path().join("sessions.db"));
+    cfg.base_domains.insert(
+        "test.local".to_string(),
+        base_domain_block("test.local", "auth.test.local", &idp_base_url),
+    );
+    cfg.hosts.insert(
+        "api.test.local".to_string(),
+        api_host("https://api.test.local/", None, &idp_base_url),
+    );
+    let (app, _state) = spawn_app_with_config(cfg).await;
+
+    // Token minted for a *different* host's resource.
+    let token = build_access_token(
+        &hmac_key.lock().unwrap(),
+        &idp_base_url,
+        "https://other-api.test.local/",
+        None,
+        3600,
+    );
+    assert_eq!(
+        raw_verify_bearer(&app, "api.test.local", &token).await,
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn bearer_token_missing_required_scope_is_rejected() {
+    let (idp_base_url, _count, _tokens, hmac_key) =
+        spawn_mock_idp_full(Duration::from_secs(3600), Duration::ZERO).await;
+    let db_dir = tempfile::tempdir().unwrap();
+    let mut cfg = base_config(&db_dir.path().join("sessions.db"));
+    cfg.base_domains.insert(
+        "test.local".to_string(),
+        base_domain_block("test.local", "auth.test.local", &idp_base_url),
+    );
+    cfg.hosts.insert(
+        "api.test.local".to_string(),
+        api_host("https://api.test.local/", Some("admin"), &idp_base_url),
+    );
+    let (app, _state) = spawn_app_with_config(cfg).await;
+
+    let token = build_access_token(
+        &hmac_key.lock().unwrap(),
+        &idp_base_url,
+        "https://api.test.local/",
+        Some("read"),
+        3600,
+    );
+    assert_eq!(
+        raw_verify_bearer(&app, "api.test.local", &token).await,
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn expired_bearer_token_is_rejected() {
+    let (idp_base_url, _count, _tokens, hmac_key) =
+        spawn_mock_idp_full(Duration::from_secs(3600), Duration::ZERO).await;
+    let db_dir = tempfile::tempdir().unwrap();
+    let mut cfg = base_config(&db_dir.path().join("sessions.db"));
+    cfg.base_domains.insert(
+        "test.local".to_string(),
+        base_domain_block("test.local", "auth.test.local", &idp_base_url),
+    );
+    cfg.hosts.insert(
+        "api.test.local".to_string(),
+        api_host("https://api.test.local/", None, &idp_base_url),
+    );
+    let (app, _state) = spawn_app_with_config(cfg).await;
+
+    let token = build_access_token(
+        &hmac_key.lock().unwrap(),
+        &idp_base_url,
+        "https://api.test.local/",
+        None,
+        -3600,
+    );
+    assert_eq!(
+        raw_verify_bearer(&app, "api.test.local", &token).await,
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn bearer_token_survives_idp_key_rotation() {
+    let (idp_base_url, _count, _tokens, hmac_key) =
+        spawn_mock_idp_full(Duration::from_secs(3600), Duration::ZERO).await;
+    let db_dir = tempfile::tempdir().unwrap();
+    let mut cfg = base_config(&db_dir.path().join("sessions.db"));
+    cfg.base_domains.insert(
+        "test.local".to_string(),
+        base_domain_block("test.local", "auth.test.local", &idp_base_url),
+    );
+    cfg.hosts.insert(
+        "api.test.local".to_string(),
+        api_host("https://api.test.local/", None, &idp_base_url),
+    );
+    // build_state discovers and caches the JWKS for the *original* key here.
+    let (app, _state) = spawn_app_with_config(cfg).await;
+
+    // The IdP rotates its signing key — the app's cached JWKS (from
+    // startup discovery) still reflects the old one.
+    *hmac_key.lock().unwrap() = CoreHmacKey::new(b"a-brand-new-rotated-secret".to_vec());
+
+    let token = build_access_token(
+        &hmac_key.lock().unwrap(),
+        &idp_base_url,
+        "https://api.test.local/",
+        None,
+        3600,
+    );
+    assert_eq!(
+        raw_verify_bearer(&app, "api.test.local", &token).await,
+        reqwest::StatusCode::OK,
+        "a signature failure against the stale cached JWKS should trigger an on-demand refresh and succeed on retry"
+    );
+}
+
+// ---- Phase 5: /token helper end-to-end -----------------------------------
+
+#[tokio::test]
+async fn token_helper_scopes_the_request_to_the_selected_hosts_resource() {
+    let (idp_base_url, _count, _tokens, _hmac_key) =
+        spawn_mock_idp_full(Duration::from_secs(3600), Duration::ZERO).await;
+    let db_dir = tempfile::tempdir().unwrap();
+    let mut cfg = base_config(&db_dir.path().join("sessions.db"));
+    cfg.base_domains.insert(
+        "test.local".to_string(),
+        base_domain_block("test.local", "auth.test.local", &idp_base_url),
+    );
+    cfg.hosts.insert(
+        "api.test.local".to_string(),
+        api_host("https://api.test.local/", None, &idp_base_url),
+    );
+    let (app, _state) = spawn_app_with_config(cfg).await;
+    let idp_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    let mut browser = Browser::new();
+    let resp = browser
+        .get(&app, "auth.test.local", "/token?host=api.test.local")
+        .await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::SEE_OTHER,
+        "expected /token to redirect to the IdP like /login"
+    );
+    let mut authorize_url = url::Url::parse(&location(&resp)).unwrap();
+
+    // The authorization request must carry the resource indicator so the
+    // IdP can scope the issued access token to it.
+    assert_eq!(
+        authorize_url
+            .query_pairs()
+            .find(|(k, _)| k == "resource")
+            .map(|(_, v)| v.to_string()),
+        Some("https://api.test.local/".to_string())
+    );
+
+    authorize_url
+        .query_pairs_mut()
+        .append_pair("login_hint", "alice");
+    let idp_resp = follow_real_redirect(&idp_client, authorize_url.as_str()).await;
+    let callback_location = location(&idp_resp);
+    let code = query_param(&callback_location, "code");
+    let state_param = query_param(&callback_location, "state");
+
+    let resp = browser
+        .get(
+            &app,
+            "auth.test.local",
+            &format!("/callback?code={code}&state={state_param}"),
+        )
+        .await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "the /token callback should render the token page directly, not redirect"
+    );
+    assert!(
+        !browser.cookies.contains_key("fa_session"),
+        "a /token flow must not create a browser session"
+    );
+
+    let cache_control = resp
+        .headers()
+        .get("cache-control")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert_eq!(cache_control, "no-store");
+
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("api.test.local"),
+        "page should name the resource the token is for"
+    );
+}
+
+#[tokio::test]
+async fn token_helper_rejects_a_host_with_no_resource_configured() {
+    let (idp_base_url, _count, _tokens) = spawn_mock_idp(Duration::from_secs(3600)).await;
+    let db_dir = tempfile::tempdir().unwrap();
+    // spawn_app's default host ("app.test.local") has no resource configured.
+    let (app, _state) = spawn_app(&idp_base_url, &db_dir.path().join("sessions.db")).await;
+
+    let mut browser = Browser::new();
+    let resp = browser
+        .get(&app, "auth.test.local", "/token?host=app.test.local")
+        .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
 }

@@ -16,3 +16,13 @@ pub struct ErrorPage<'a> {
     pub title: &'a str,
     pub message: &'a str,
 }
+
+/// `/token` helper's one-time confirmation page (Phase 5). Shown once,
+/// never persisted server-side — the access token only ever exists in
+/// this HTTP response and the operator's clipboard.
+#[derive(Template, WebTemplate)]
+#[template(path = "token.html")]
+pub struct TokenPage<'a> {
+    pub resource: &'a str,
+    pub access_token: &'a str,
+}

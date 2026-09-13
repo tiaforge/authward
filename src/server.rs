@@ -15,6 +15,7 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/login", get(routes::login))
+        .route("/token", get(routes::token))
         .route("/callback", get(routes::callback))
         .route("/verify", get(routes::verify))
         .fallback(not_found)

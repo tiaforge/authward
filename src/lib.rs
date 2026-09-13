@@ -1,9 +1,11 @@
 pub mod authz;
+pub mod bearer;
 pub mod cli;
 pub mod config;
 pub mod crypto;
 pub mod db;
 pub mod host;
+pub mod jwks_cache;
 pub mod locks;
 pub mod logging;
 pub mod oidc;
@@ -21,6 +23,7 @@ use openidconnect::RedirectUrl;
 
 use crate::config::Config;
 use crate::crypto::RefreshTokenCipher;
+use crate::jwks_cache::JwksCache;
 use crate::locks::SessionLocks;
 use crate::state::{AppState, AppStateInner};
 
@@ -33,12 +36,17 @@ pub async fn build_state(cfg: Config) -> anyhow::Result<AppState> {
     let http_client = oidc::build_http_client()?;
 
     let mut oidc_clients = HashMap::new();
+    let mut jwks_caches = HashMap::new();
     for (name, base_domain) in &cfg.base_domains {
         let redirect_uri =
             RedirectUrl::new(format!("https://{}/callback", base_domain.auth_subdomain))?;
         tracing::info!(base_domain = name, discovery_url = %base_domain.provider.discovery_url, "discovering OIDC provider");
-        let client = oidc::discover(&http_client, &base_domain.provider, redirect_uri).await?;
-        oidc_clients.insert(name.clone(), client);
+        let discovered = oidc::discover(&http_client, &base_domain.provider, redirect_uri).await?;
+        jwks_caches.insert(
+            name.clone(),
+            JwksCache::new(discovered.issuer, discovered.jwks_uri, discovered.jwks),
+        );
+        oidc_clients.insert(name.clone(), discovered.client);
     }
 
     let db = db::connect(&cfg.global.sqlite_path).await?;
@@ -54,6 +62,7 @@ pub async fn build_state(cfg: Config) -> anyhow::Result<AppState> {
         cookie_key,
         refresh_cipher,
         oidc_clients,
+        jwks_caches,
         http_client,
         session_locks: SessionLocks::new(),
     }))

@@ -14,10 +14,10 @@
 //! instead of appending to it).
 
 use anyhow::Context;
-use openidconnect::core::{CoreClient, CoreProviderMetadata};
+use openidconnect::core::{CoreClient, CoreJsonWebKey, CoreProviderMetadata};
 use openidconnect::{
-    ClientId, ClientSecret, EndpointMaybeSet, EndpointNotSet, EndpointSet, JsonWebKeySet,
-    RedirectUrl,
+    ClientId, ClientSecret, EndpointMaybeSet, EndpointNotSet, EndpointSet, IssuerUrl,
+    JsonWebKeySet, JsonWebKeySetUrl, RedirectUrl,
 };
 
 use crate::config::Provider as ProviderConfig;
@@ -40,11 +40,23 @@ pub type DiscoveredClient = CoreClient<
     EndpointMaybeSet,
 >;
 
+/// Everything a base domain's discovery step produces: the OIDC client
+/// used for the browser login/refresh flows, plus the issuer and JWKS
+/// separately, since bearer-token validation (Phase 5) needs its *own*,
+/// independently-refreshable copy of the JWKS — the client's is baked in
+/// at construction and never changes.
+pub struct DiscoveredProvider {
+    pub client: DiscoveredClient,
+    pub issuer: IssuerUrl,
+    pub jwks_uri: JsonWebKeySetUrl,
+    pub jwks: JsonWebKeySet<CoreJsonWebKey>,
+}
+
 pub async fn discover(
     http_client: &openidconnect::reqwest::Client,
     provider: &ProviderConfig,
     redirect_uri: RedirectUrl,
-) -> anyhow::Result<DiscoveredClient> {
+) -> anyhow::Result<DiscoveredProvider> {
     let response = http_client
         .get(provider.discovery_url.clone())
         .send()
@@ -71,10 +83,12 @@ pub async fn discover(
         )
     })?;
 
-    let jwks = JsonWebKeySet::fetch_async(metadata.jwks_uri(), http_client)
+    let issuer = metadata.issuer().clone();
+    let jwks_uri = metadata.jwks_uri().clone();
+    let jwks = JsonWebKeySet::fetch_async(&jwks_uri, http_client)
         .await
         .with_context(|| format!("fetching JWKS for provider at {}", provider.discovery_url))?;
-    let metadata = metadata.set_jwks(jwks);
+    let metadata = metadata.set_jwks(jwks.clone());
 
     let client = CoreClient::from_provider_metadata(
         metadata,
@@ -83,7 +97,24 @@ pub async fn discover(
     )
     .set_redirect_uri(redirect_uri);
 
-    Ok(client)
+    Ok(DiscoveredProvider {
+        client,
+        issuer,
+        jwks_uri,
+        jwks,
+    })
+}
+
+/// Re-fetches just the JWKS for a provider, using its already-known
+/// `jwks_uri` (from the initial [`discover`] call) — no need to re-fetch
+/// or re-parse the discovery document itself.
+pub async fn fetch_jwks(
+    http_client: &openidconnect::reqwest::Client,
+    jwks_uri: &JsonWebKeySetUrl,
+) -> anyhow::Result<JsonWebKeySet<CoreJsonWebKey>> {
+    JsonWebKeySet::fetch_async(jwks_uri, http_client)
+        .await
+        .with_context(|| format!("fetching JWKS from {}", jwks_uri.url()))
 }
 
 /// Builds the shared HTTP client used for discovery, token exchange, and

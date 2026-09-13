@@ -6,6 +6,10 @@ use forward_auth::{config, logging, server};
 
 /// How often the expired-session reaper sweeps SQLite (Phase 2/9).
 const REAPER_INTERVAL: Duration = Duration::from_secs(300);
+/// How often the JWKS cache for resource-scoped bearer tokens refreshes
+/// in the background, independent of the on-demand refresh triggered by
+/// a signature-verification failure (Phase 5).
+const JWKS_REFRESH_INTERVAL: Duration = Duration::from_secs(900);
 
 #[derive(Parser)]
 #[command(
@@ -71,6 +75,7 @@ async fn run_server(config_path: &Path) -> anyhow::Result<()> {
     let state = forward_auth::build_state(cfg).await?;
 
     forward_auth::session::spawn_reaper(state.clone(), REAPER_INTERVAL);
+    forward_auth::jwks_cache::spawn_periodic_refresh(state.clone(), JWKS_REFRESH_INTERVAL);
 
     let app = server::build_router(state);
     let listener = tokio::net::TcpListener::bind(listen_addr).await?;
