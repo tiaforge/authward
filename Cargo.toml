@@ -1,0 +1,24 @@
+[package]
+name = "forward-auth"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+askama = "0.16.1"
+askama_web = { version = "0.16.0", features = ["axum-0.8"] }
+axum = "0.8.9"
+clap = { version = "4.6.6", features = ["derive"] }
+dialoguer = "0.12.0"
+opentelemetry = "0.32.0"
+opentelemetry-appender-tracing = "0.32.0"
+opentelemetry-otlp = { version = "0.32.0", features = ["logs", "grpc-tonic"] }
+opentelemetry_sdk = { version = "0.32.1", features = ["logs", "rt-tokio"] }
+rand = "0.10.2"
+serde = { version = "1.0.229", features = ["derive"] }
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["full"] }
+toml = "1.1.6"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["json", "env-filter"] }
+url = "2.5.8"

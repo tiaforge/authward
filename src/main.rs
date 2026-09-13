@@ -1,0 +1,88 @@
+mod cli;
+mod config;
+mod logging;
+mod server;
+mod templates;
+
+use std::path::{Path, PathBuf};
+
+use clap::{Parser, Subcommand};
+
+#[derive(Parser)]
+#[command(
+    name = "forward-auth",
+    version,
+    about = "Forward-auth OIDC login service"
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+
+    /// Path to the config file (used when no subcommand is given).
+    #[arg(long, short, default_value = "config.toml")]
+    config: PathBuf,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Interactively generate a starter config file.
+    Init {
+        /// Where to write the generated config.
+        #[arg(long, default_value = "config.toml")]
+        output: PathBuf,
+    },
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+
+    match cli.command {
+        Some(Command::Init { output }) => cli::init::run(&output),
+        None => run_server(&cli.config).await,
+    }
+}
+
+async fn run_server(config_path: &Path) -> anyhow::Result<()> {
+    let cfg = match config::load(config_path) {
+        Ok(cfg) => cfg,
+        Err(errors) => {
+            eprintln!(
+                "forward-auth: {} config error(s) found in {}:\n",
+                errors.len(),
+                config_path.display()
+            );
+            for e in &errors {
+                eprintln!("  - {e}");
+            }
+            anyhow::bail!("refusing to start with invalid config");
+        }
+    };
+
+    let otel_provider = logging::init(cfg.global.otel_endpoint.as_deref());
+
+    tracing::info!(
+        base_domains = cfg.base_domains.len(),
+        hosts = cfg.hosts.len(),
+        has_fallback = cfg.fallback.is_some(),
+        "config loaded"
+    );
+
+    let app = server::build_router();
+    let listener = tokio::net::TcpListener::bind(cfg.global.listen_addr).await?;
+    tracing::info!(addr = %cfg.global.listen_addr, "listening");
+
+    let result = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await;
+
+    logging::shutdown(otel_provider);
+    result.map_err(Into::into)
+}
+
+async fn shutdown_signal() {
+    tokio::signal::ctrl_c()
+        .await
+        .expect("failed to listen for ctrl-c");
+    tracing::info!("shutdown signal received");
+}
