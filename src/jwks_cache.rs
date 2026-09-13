@@ -35,6 +35,19 @@ impl JwksCache {
     /// Called both periodically (background refresh) and on-demand after a
     /// signature-verification failure, so a key rotation at the IdP is
     /// picked up without waiting for the next scheduled refresh.
+    ///
+    /// IdP-unavailability decision (Phase 11): `bearer::validate` always
+    /// tries the current — possibly stale — cached keys first, so a
+    /// resource-scoped bearer token keeps validating against a signing key
+    /// the IdP already issued even if the IdP is briefly unreachable. A
+    /// refresh (this method) is only attempted after a signature check
+    /// fails against the stale set, to pick up a genuine key rotation. If
+    /// that refresh itself fails because the IdP is unreachable, the token
+    /// is rejected rather than the stale keys being trusted indefinitely —
+    /// i.e. this cache serves stale keys briefly, but never substitutes for
+    /// a live refresh it can't complete. Callers must not treat a failed
+    /// `refresh()` as "keep using the old keys and let the request through";
+    /// they must fail closed.
     pub async fn refresh(
         &self,
         http_client: &openidconnect::reqwest::Client,

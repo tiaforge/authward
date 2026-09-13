@@ -298,7 +298,18 @@ pub async fn callback(
             "Missing state parameter.",
         );
     };
-    if returned_state != flow.csrf_state {
+    // Constant-time: the state value is compared against attacker-
+    // influenceable input (the callback query string), so a naive `!=`
+    // could in principle leak timing information about the real value —
+    // standard JWT/cookie-signing libraries already do this internally
+    // for their own comparisons, but this one is ours (Phase 11).
+    use subtle::ConstantTimeEq;
+    if returned_state
+        .as_bytes()
+        .ct_eq(flow.csrf_state.as_bytes())
+        .unwrap_u8()
+        != 1
+    {
         tracing::warn!("callback state mismatch — possible CSRF or stale flow cookie");
         return error_page(
             StatusCode::BAD_REQUEST,
@@ -559,6 +570,24 @@ async fn bearer_auth(
     .await
     {
         Ok(claims) => {
+            // Group-membership authorization applies to resource-scoped
+            // tokens too (Phase 11 decision), not just browser sessions —
+            // a host that requires a group shouldn't be reachable via an
+            // API token just because that path skipped the check. If the
+            // IdP's access tokens don't carry the group claim at all,
+            // this fails closed (denies) rather than silently skipping
+            // the check, consistent with the rest of this codebase.
+            if let Some(required_group) = &resolved_host.required_group
+                && !crate::authz::has_required_group(
+                    &claims,
+                    &resolved_host.group_claim_name,
+                    required_group,
+                )
+            {
+                tracing::info!(host = ?resolved_host.host, required_group, "bearer token denied: missing required group");
+                return StatusCode::FORBIDDEN.into_response();
+            }
+
             let subject = claims
                 .get("sub")
                 .and_then(|v| v.as_str())

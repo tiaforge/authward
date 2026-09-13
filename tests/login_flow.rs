@@ -783,6 +783,61 @@ async fn concurrent_logins_do_not_cross_contaminate() {
     );
 }
 
+/// Phase 11 hardening checklist item: "load test N concurrent hosts/
+/// sessions against SQLite, confirm no lock contention." Each login is a
+/// session-creating write (`db::create_session`) against the single
+/// shared SQLite pool; firing many at once is exactly the scenario a
+/// naive SQLite setup (default rollback journal, no busy timeout) would
+/// serialize into `SQLITE_BUSY` errors under write contention. This
+/// asserts every login still succeeds, and that the whole batch completes
+/// well within a generous deadline rather than stalling on lock waits.
+#[tokio::test]
+async fn concurrent_session_creation_does_not_error_under_sqlite_contention() {
+    let (idp_base_url, _refresh_grant_count, _refresh_tokens) =
+        spawn_mock_idp(Duration::from_secs(3600)).await;
+    let db_dir = tempfile::tempdir().unwrap();
+    let (app, _state) = spawn_app(&idp_base_url, &db_dir.path().join("sessions.db")).await;
+
+    const CONCURRENT_LOGINS: usize = 50;
+    let mut tasks = tokio::task::JoinSet::new();
+    for i in 0..CONCURRENT_LOGINS {
+        let app = app.clone();
+        tasks.spawn(async move {
+            let idp_client = reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap();
+            let mut browser = Browser::new();
+            let login_hint = format!("user-{i}");
+            login_as(
+                &app,
+                &idp_client,
+                &mut browser,
+                &login_hint,
+                "https://app.test.local/dashboard",
+            )
+            .await;
+            let resp = browser.get(&app, "app.test.local", "/verify").await;
+            assert_eq!(
+                resp.status(),
+                reqwest::StatusCode::OK,
+                "login {i} failed to verify after concurrent session creation"
+            );
+        });
+    }
+
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        while let Some(result) = tasks.join_next().await {
+            result.expect("concurrent login task panicked");
+        }
+    })
+    .await
+    .expect(
+        "concurrent logins did not all complete within the deadline \
+         — possible SQLite lock contention",
+    );
+}
+
 // ---- Phase 2: silent refresh -------------------------------------------
 
 async fn raw_verify(app: &str, cookie_header: &str) -> reqwest::StatusCode {

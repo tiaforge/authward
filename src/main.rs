@@ -38,8 +38,26 @@ enum Command {
     },
 }
 
+/// Restricts every file this process creates from here on (the SQLite
+/// database and its transient rollback-journal sidecar, the config file
+/// written by `init`) to owner-only permissions by default, rather than
+/// relying on each call site to `chmod` after the fact — a backstop for
+/// any file-creation path that doesn't (Phase 11 hardening pass).
+#[cfg(unix)]
+fn restrict_default_file_permissions() {
+    // SAFETY: umask() has no preconditions; it only affects file modes
+    // this process creates from now on and cannot itself invalidate any
+    // Rust invariant.
+    unsafe {
+        libc::umask(0o077);
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    #[cfg(unix)]
+    restrict_default_file_permissions();
+
     let cli = Cli::parse();
 
     match cli.command {
