@@ -22,6 +22,17 @@ pub struct Config {
     pub fallback: Option<ResolvedHost>,
 }
 
+impl Config {
+    /// Resolves a (lowercased — see `host::resolve_incoming_host`)
+    /// `X-Forwarded-Host`/`Host` value to its per-host config, falling
+    /// back to `[fallback]` when the host has no entry of its own. `None`
+    /// means neither exists, which per the plan's locked-in decision is a
+    /// hard failure (log + 502), not a silent allow or deny.
+    pub fn resolve_host(&self, host: &str) -> Option<&ResolvedHost> {
+        self.hosts.get(host).or(self.fallback.as_ref())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Global {
     pub cookie_signing_key: String,
@@ -94,11 +105,17 @@ fn resolve(raw: RawConfig, path: &Path) -> Result<Config, Vec<ConfigError>> {
 
     let global = resolve_global(&raw, path, &mut errors);
 
+    // Host/base-domain names are lowercased once here so every downstream
+    // lookup (by `X-Forwarded-Host`, itself lowercased at ingress — see
+    // `host::resolve_incoming_host`) is a plain case-sensitive match,
+    // rather than repeating case-insensitive comparisons at every call
+    // site (the plan's locked-in decision, closing the class of bug where
+    // mixed-case hosts silently miss their config).
     let mut base_domains = HashMap::new();
     for (name, raw_bd) in &raw.base_domains {
         match resolve_base_domain(name, raw_bd) {
             Ok(bd) => {
-                base_domains.insert(name.clone(), bd);
+                base_domains.insert(name.to_ascii_lowercase(), bd);
             }
             Err(e) => errors.push(e),
         }
@@ -108,7 +125,7 @@ fn resolve(raw: RawConfig, path: &Path) -> Result<Config, Vec<ConfigError>> {
     for (host_name, raw_host) in &raw.hosts {
         match resolve_host(host_name, raw_host, &base_domains) {
             Ok(resolved) => {
-                hosts.insert(host_name.clone(), resolved);
+                hosts.insert(host_name.to_ascii_lowercase(), resolved);
             }
             Err(mut e) => errors.append(&mut e),
         }
@@ -285,7 +302,8 @@ fn resolve_host(
 ) -> Result<ResolvedHost, Vec<ConfigError>> {
     let mut errors = Vec::new();
 
-    let base_domain = match base_domains.get(&raw.base_domain) {
+    let base_domain_key = raw.base_domain.to_ascii_lowercase();
+    let base_domain = match base_domains.get(&base_domain_key) {
         Some(bd) => Some(bd),
         None => {
             errors.push(ConfigError::UnknownBaseDomain {
@@ -313,8 +331,8 @@ fn resolve_host(
     }
 
     Ok(ResolvedHost {
-        host: Some(host_name.to_string()),
-        base_domain: raw.base_domain.clone(),
+        host: Some(host_name.to_ascii_lowercase()),
+        base_domain: base_domain_key,
         provider: provider.expect("provider resolved without error"),
         required_group: raw.required_group.clone(),
         group_claim_name: raw
@@ -334,7 +352,8 @@ fn resolve_fallback(
 ) -> Result<ResolvedHost, Vec<ConfigError>> {
     let mut errors = Vec::new();
 
-    let base_domain = match base_domains.get(&raw.base_domain) {
+    let base_domain_key = raw.base_domain.to_ascii_lowercase();
+    let base_domain = match base_domains.get(&base_domain_key) {
         Some(bd) => Some(bd),
         None => {
             errors.push(ConfigError::FallbackUnknownBaseDomain {
@@ -362,7 +381,7 @@ fn resolve_fallback(
 
     Ok(ResolvedHost {
         host: None,
-        base_domain: raw.base_domain.clone(),
+        base_domain: base_domain_key,
         provider: provider.expect("provider resolved without error"),
         required_group: raw.required_group.clone(),
         group_claim_name: raw

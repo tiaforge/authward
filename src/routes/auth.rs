@@ -330,12 +330,28 @@ pub async fn callback(
     (jar, Redirect::to(&flow.rd)).into_response()
 }
 
-pub async fn verify(State(state): State<AppState>, jar: PrivateCookieJar) -> StatusCode {
+pub async fn verify(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    jar: PrivateCookieJar,
+) -> StatusCode {
+    let Some(host) = resolve_incoming_host(&headers) else {
+        tracing::error!("verify: request has no Host or X-Forwarded-Host header");
+        return StatusCode::BAD_GATEWAY;
+    };
+    let Some(resolved_host) = state.config.resolve_host(&host) else {
+        tracing::error!(
+            host,
+            "verify: no per-host config and no fallback provider configured"
+        );
+        return StatusCode::BAD_GATEWAY;
+    };
+
     let Some(cookie) = jar.get(SESSION_COOKIE_NAME) else {
         return StatusCode::UNAUTHORIZED;
     };
 
-    match crate::session::verify_session(&state, cookie.value()).await {
+    match crate::session::verify_session(&state, cookie.value(), &resolved_host.base_domain).await {
         crate::session::VerifyOutcome::Valid => StatusCode::OK,
         crate::session::VerifyOutcome::Invalid => StatusCode::UNAUTHORIZED,
     }

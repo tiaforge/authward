@@ -278,42 +278,38 @@ async fn spawn_mock_idp_with_refresh_delay(
 
 // ---- App under test ---------------------------------------------------
 
-async fn spawn_app(
-    idp_base_url: &str,
-    db_path: &std::path::Path,
-) -> (String, forward_auth::state::AppState) {
-    let base_domain_name = "test.local".to_string();
-    let mut base_domains = HashMap::new();
-    base_domains.insert(
-        base_domain_name.clone(),
-        config::BaseDomain {
-            name: base_domain_name.clone(),
-            auth_subdomain: "auth.test.local".to_string(),
-            provider: config::Provider {
-                discovery_url: url::Url::parse(&format!(
-                    "{idp_base_url}/.well-known/openid-configuration"
-                ))
-                .unwrap(),
-                client_id: CLIENT_ID.to_string(),
-                client_secret: CLIENT_SECRET.to_string(),
-            },
-        },
-    );
+fn test_provider(idp_base_url: &str) -> config::Provider {
+    config::Provider {
+        discovery_url: url::Url::parse(&format!("{idp_base_url}/.well-known/openid-configuration"))
+            .unwrap(),
+        client_id: CLIENT_ID.to_string(),
+        client_secret: CLIENT_SECRET.to_string(),
+    }
+}
 
-    let cfg = config::Config {
-        global: config::Global {
-            cookie_signing_key: "test-only-cookie-signing-key-32-bytes-min".to_string(),
-            refresh_token_encryption_key: "test-only-refresh-key-32-bytes-minimum!!".to_string(),
-            sqlite_path: db_path.to_path_buf(),
-            session_ttl_fallback: Duration::from_secs(3600),
-            otel_endpoint: None,
-            listen_addr: "127.0.0.1:0".parse().unwrap(),
-        },
-        base_domains,
-        hosts: HashMap::new(),
-        fallback: None,
-    };
+fn base_domain_block(name: &str, auth_subdomain: &str, idp_base_url: &str) -> config::BaseDomain {
+    config::BaseDomain {
+        name: name.to_string(),
+        auth_subdomain: auth_subdomain.to_string(),
+        provider: test_provider(idp_base_url),
+    }
+}
 
+fn resolved_host(host: &str, base_domain: &str, idp_base_url: &str) -> config::ResolvedHost {
+    config::ResolvedHost {
+        host: Some(host.to_string()),
+        base_domain: base_domain.to_string(),
+        provider: test_provider(idp_base_url),
+        required_group: None,
+        group_claim_name: "groups".to_string(),
+        bypass_paths: Vec::new(),
+        forward_identity_headers: false,
+        resource: None,
+        required_scope: None,
+    }
+}
+
+async fn spawn_app_with_config(cfg: config::Config) -> (String, forward_auth::state::AppState) {
     let state = forward_auth::build_state(cfg)
         .await
         .expect("build_state against mock IdP");
@@ -326,6 +322,38 @@ async fn spawn_app(
     });
 
     (format!("http://{addr}"), state)
+}
+
+fn base_config(db_path: &std::path::Path) -> config::Config {
+    config::Config {
+        global: config::Global {
+            cookie_signing_key: "test-only-cookie-signing-key-32-bytes-min".to_string(),
+            refresh_token_encryption_key: "test-only-refresh-key-32-bytes-minimum!!".to_string(),
+            sqlite_path: db_path.to_path_buf(),
+            session_ttl_fallback: Duration::from_secs(3600),
+            otel_endpoint: None,
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+        },
+        base_domains: HashMap::new(),
+        hosts: HashMap::new(),
+        fallback: None,
+    }
+}
+
+async fn spawn_app(
+    idp_base_url: &str,
+    db_path: &std::path::Path,
+) -> (String, forward_auth::state::AppState) {
+    let mut cfg = base_config(db_path);
+    cfg.base_domains.insert(
+        "test.local".to_string(),
+        base_domain_block("test.local", "auth.test.local", idp_base_url),
+    );
+    cfg.hosts.insert(
+        "app.test.local".to_string(),
+        resolved_host("app.test.local", "test.local", idp_base_url),
+    );
+    spawn_app_with_config(cfg).await
 }
 
 // ---- Manual "browser": relays cookies by hand (see module docs) -------
@@ -409,13 +437,17 @@ fn query_param(url: &str, key: &str) -> String {
         .expect("missing query param")
 }
 
+/// Drives a full login round trip and returns the final redirect target
+/// `/callback` sent back — callers that pass a same-base-domain `rd`
+/// generally just assert this equals it; `login_ignores_an_rd_pointing_at_a_foreign_host`
+/// instead checks the open-redirect guard substituted a safe default.
 async fn login_as(
     app: &str,
     idp_client: &reqwest::Client,
     browser: &mut Browser,
     login_hint: &str,
     rd: &str,
-) {
+) -> String {
     let resp = browser
         .get(
             app,
@@ -454,13 +486,13 @@ async fn login_as(
     assert_eq!(
         resp.status(),
         reqwest::StatusCode::SEE_OTHER,
-        "expected /callback to redirect to rd"
+        "expected /callback to redirect somewhere"
     );
-    assert_eq!(location(&resp), rd);
     assert!(
         browser.cookies.contains_key("fa_session"),
         "expected a session cookie after login"
     );
+    location(&resp)
 }
 
 fn urlencode(s: &str) -> String {
@@ -479,14 +511,17 @@ async fn login_then_verify_succeeds() {
         .unwrap();
 
     let mut browser = Browser::new();
-    login_as(
-        &app,
-        &idp_client,
-        &mut browser,
-        "alice",
-        "https://app.test.local/dashboard",
-    )
-    .await;
+    assert_eq!(
+        login_as(
+            &app,
+            &idp_client,
+            &mut browser,
+            "alice",
+            "https://app.test.local/dashboard"
+        )
+        .await,
+        "https://app.test.local/dashboard"
+    );
 
     let resp = browser.get(&app, "app.test.local", "/verify").await;
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
@@ -620,14 +655,17 @@ async fn silent_refresh_extends_an_expired_session() {
         .unwrap();
 
     let mut browser = Browser::new();
-    login_as(
-        &app,
-        &idp_client,
-        &mut browser,
-        "alice",
-        "https://app.test.local/dashboard",
-    )
-    .await;
+    assert_eq!(
+        login_as(
+            &app,
+            &idp_client,
+            &mut browser,
+            "alice",
+            "https://app.test.local/dashboard"
+        )
+        .await,
+        "https://app.test.local/dashboard"
+    );
     let session_cookie_before = browser.cookies["fa_session"].clone();
 
     assert_eq!(
@@ -672,14 +710,17 @@ async fn refresh_failure_clears_the_session() {
         .unwrap();
 
     let mut browser = Browser::new();
-    login_as(
-        &app,
-        &idp_client,
-        &mut browser,
-        "alice",
-        "https://app.test.local/dashboard",
-    )
-    .await;
+    assert_eq!(
+        login_as(
+            &app,
+            &idp_client,
+            &mut browser,
+            "alice",
+            "https://app.test.local/dashboard"
+        )
+        .await,
+        "https://app.test.local/dashboard"
+    );
 
     tokio::time::sleep(ttl + Duration::from_millis(500)).await;
     assert_eq!(
@@ -713,14 +754,17 @@ async fn concurrent_verify_requests_collapse_into_one_refresh() {
         .unwrap();
 
     let mut browser = Browser::new();
-    login_as(
-        &app,
-        &idp_client,
-        &mut browser,
-        "alice",
-        "https://app.test.local/dashboard",
-    )
-    .await;
+    assert_eq!(
+        login_as(
+            &app,
+            &idp_client,
+            &mut browser,
+            "alice",
+            "https://app.test.local/dashboard"
+        )
+        .await,
+        "https://app.test.local/dashboard"
+    );
     let cookie_header = format!("fa_session={}", browser.cookies["fa_session"]);
 
     tokio::time::sleep(ttl + Duration::from_millis(500)).await;
@@ -796,14 +840,17 @@ async fn reaper_does_not_delete_a_session_mid_refresh() {
         .unwrap();
 
     let mut browser = Browser::new();
-    login_as(
-        &app,
-        &idp_client,
-        &mut browser,
-        "alice",
-        "https://app.test.local/dashboard",
-    )
-    .await;
+    assert_eq!(
+        login_as(
+            &app,
+            &idp_client,
+            &mut browser,
+            "alice",
+            "https://app.test.local/dashboard"
+        )
+        .await,
+        "https://app.test.local/dashboard"
+    );
     let cookie_header = format!("fa_session={}", browser.cookies["fa_session"]);
 
     tokio::time::sleep(ttl + Duration::from_millis(500)).await;
@@ -845,5 +892,213 @@ async fn reaper_does_not_delete_a_session_mid_refresh() {
         refresh_grant_count.load(Ordering::SeqCst),
         1,
         "session should still be fresh from the earlier refresh, needing no second one"
+    );
+}
+
+// ---- Phase 3: multi-host / multi-base-domain resolution -----------------
+
+#[tokio::test]
+async fn multiple_hosts_on_one_base_domain_share_sso() {
+    let (idp_base_url, _refresh_grant_count, _refresh_tokens) =
+        spawn_mock_idp(Duration::from_secs(3600)).await;
+    let db_dir = tempfile::tempdir().unwrap();
+
+    let mut cfg = base_config(&db_dir.path().join("sessions.db"));
+    cfg.base_domains.insert(
+        "test.local".to_string(),
+        base_domain_block("test.local", "auth.test.local", &idp_base_url),
+    );
+    cfg.hosts.insert(
+        "app-one.test.local".to_string(),
+        resolved_host("app-one.test.local", "test.local", &idp_base_url),
+    );
+    cfg.hosts.insert(
+        "app-two.test.local".to_string(),
+        resolved_host("app-two.test.local", "test.local", &idp_base_url),
+    );
+    let (app, _state) = spawn_app_with_config(cfg).await;
+
+    let idp_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let mut browser = Browser::new();
+    assert_eq!(
+        login_as(
+            &app,
+            &idp_client,
+            &mut browser,
+            "alice",
+            "https://app-one.test.local/"
+        )
+        .await,
+        "https://app-one.test.local/"
+    );
+
+    assert_eq!(
+        browser
+            .get(&app, "app-one.test.local", "/verify")
+            .await
+            .status(),
+        reqwest::StatusCode::OK
+    );
+    assert_eq!(
+        browser
+            .get(&app, "app-two.test.local", "/verify")
+            .await
+            .status(),
+        reqwest::StatusCode::OK,
+        "a second host on the same base domain should share the session (SSO)"
+    );
+}
+
+#[tokio::test]
+async fn a_different_base_domain_does_not_accept_the_session() {
+    let (idp_base_url, _refresh_grant_count, _refresh_tokens) =
+        spawn_mock_idp(Duration::from_secs(3600)).await;
+    let db_dir = tempfile::tempdir().unwrap();
+
+    let mut cfg = base_config(&db_dir.path().join("sessions.db"));
+    cfg.base_domains.insert(
+        "test.local".to_string(),
+        base_domain_block("test.local", "auth.test.local", &idp_base_url),
+    );
+    cfg.base_domains.insert(
+        "other.local".to_string(),
+        base_domain_block("other.local", "auth.other.local", &idp_base_url),
+    );
+    cfg.hosts.insert(
+        "app.test.local".to_string(),
+        resolved_host("app.test.local", "test.local", &idp_base_url),
+    );
+    cfg.hosts.insert(
+        "app.other.local".to_string(),
+        resolved_host("app.other.local", "other.local", &idp_base_url),
+    );
+    let (app, _state) = spawn_app_with_config(cfg).await;
+
+    let idp_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let mut browser = Browser::new();
+    assert_eq!(
+        login_as(
+            &app,
+            &idp_client,
+            &mut browser,
+            "alice",
+            "https://app.test.local/"
+        )
+        .await,
+        "https://app.test.local/"
+    );
+
+    assert_eq!(
+        browser
+            .get(&app, "app.test.local", "/verify")
+            .await
+            .status(),
+        reqwest::StatusCode::OK
+    );
+    assert_eq!(
+        browser
+            .get(&app, "app.other.local", "/verify")
+            .await
+            .status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "a session for one base domain must not verify against a completely different base domain, even with the same (forged) cookie"
+    );
+}
+
+#[tokio::test]
+async fn unconfigured_host_with_no_fallback_is_a_hard_failure() {
+    let (idp_base_url, _refresh_grant_count, _refresh_tokens) =
+        spawn_mock_idp(Duration::from_secs(3600)).await;
+    let db_dir = tempfile::tempdir().unwrap();
+    let (app, _state) = spawn_app(&idp_base_url, &db_dir.path().join("sessions.db")).await;
+
+    let mut browser = Browser::new();
+    let resp = browser
+        .get(&app, "nobody-configured-this-host.example", "/verify")
+        .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_GATEWAY);
+}
+
+#[tokio::test]
+async fn fallback_provider_covers_hosts_with_no_explicit_config() {
+    let (idp_base_url, _refresh_grant_count, _refresh_tokens) =
+        spawn_mock_idp(Duration::from_secs(3600)).await;
+    let db_dir = tempfile::tempdir().unwrap();
+
+    let mut cfg = base_config(&db_dir.path().join("sessions.db"));
+    cfg.base_domains.insert(
+        "test.local".to_string(),
+        base_domain_block("test.local", "auth.test.local", &idp_base_url),
+    );
+    // No entry in `hosts` at all — every host on this instance relies on
+    // the fallback provider.
+    cfg.fallback = Some(config::ResolvedHost {
+        host: None,
+        ..resolved_host("<fallback>", "test.local", &idp_base_url)
+    });
+    let (app, _state) = spawn_app_with_config(cfg).await;
+
+    let idp_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let mut browser = Browser::new();
+    assert_eq!(
+        login_as(
+            &app,
+            &idp_client,
+            &mut browser,
+            "alice",
+            "https://some-unlisted-app.test.local/"
+        )
+        .await,
+        "https://some-unlisted-app.test.local/"
+    );
+
+    assert_eq!(
+        browser
+            .get(&app, "some-unlisted-app.test.local", "/verify")
+            .await
+            .status(),
+        reqwest::StatusCode::OK,
+        "a host with no explicit config should still work via the fallback provider"
+    );
+}
+
+#[tokio::test]
+async fn login_ignores_an_rd_pointing_at_a_foreign_host() {
+    let (idp_base_url, _refresh_grant_count, _refresh_tokens) =
+        spawn_mock_idp(Duration::from_secs(3600)).await;
+    let db_dir = tempfile::tempdir().unwrap();
+    let (app, _state) = spawn_app(&idp_base_url, &db_dir.path().join("sessions.db")).await;
+    let idp_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    let mut browser = Browser::new();
+    // A malicious/buggy rd pointing off the base domain entirely.
+    let landed_on = login_as(
+        &app,
+        &idp_client,
+        &mut browser,
+        "alice",
+        "https://evil.example/steal-session",
+    )
+    .await;
+
+    assert_ne!(
+        landed_on, "https://evil.example/steal-session",
+        "must never honor an rd targeting a foreign host"
+    );
+    assert_eq!(
+        landed_on, "https://auth.test.local/",
+        "should fall back to the auth subdomain's own root"
     );
 }

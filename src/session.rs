@@ -17,12 +17,24 @@ pub enum VerifyOutcome {
     Invalid,
 }
 
-/// Checks whether `session_id` names a currently-valid session, silently
-/// refreshing it first if its access/ID token has expired but its refresh
-/// token might still work. Never surfaces refresh failure as anything
-/// other than `Invalid` — per the plan's locked-in decision, a failed
-/// refresh just clears the session, no error shown to the user.
-pub async fn verify_session(state: &AppState, session_id: &str) -> VerifyOutcome {
+/// Checks whether `session_id` names a currently-valid session *for
+/// `expected_base_domain`*, silently refreshing it first if its access/ID
+/// token has expired but its refresh token might still work. Never
+/// surfaces refresh failure as anything other than `Invalid` — per the
+/// plan's locked-in decision, a failed refresh just clears the session,
+/// no error shown to the user.
+///
+/// The base-domain check matters once more than one base domain is
+/// configured (Phase 3): the session cookie's `Domain` attribute keeps a
+/// real browser from ever presenting a `.example.com` session to a
+/// `.other.com` app, but nothing stops a forged `Cookie` header from
+/// trying exactly that, so it's re-checked server-side rather than
+/// trusted implicitly.
+pub async fn verify_session(
+    state: &AppState,
+    session_id: &str,
+    expected_base_domain: &str,
+) -> VerifyOutcome {
     let session = match db::get_session(&state.db, session_id).await {
         Ok(Some(session)) => session,
         Ok(None) => return VerifyOutcome::Invalid,
@@ -31,6 +43,10 @@ pub async fn verify_session(state: &AppState, session_id: &str) -> VerifyOutcome
             return VerifyOutcome::Invalid;
         }
     };
+    if session.base_domain != expected_base_domain {
+        tracing::warn!(session_id, session_base_domain = %session.base_domain, expected_base_domain, "session presented against the wrong base domain");
+        return VerifyOutcome::Invalid;
+    }
 
     if !session.is_expired() {
         return VerifyOutcome::Valid;
@@ -53,6 +69,9 @@ pub async fn verify_session(state: &AppState, session_id: &str) -> VerifyOutcome
                     return VerifyOutcome::Invalid;
                 }
             };
+            if session.base_domain != expected_base_domain {
+                return VerifyOutcome::Invalid;
+            }
             if !session.is_expired() {
                 return VerifyOutcome::Valid;
             }
