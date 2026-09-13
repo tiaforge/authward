@@ -1,0 +1,125 @@
+# Operational runbook
+
+## Rotating keys
+
+`cookie_signing_key` and `refresh_token_encryption_key` have no
+zero-downtime rotation — this is an explicit deferred item (see the
+plan), not an oversight. Rotating either one:
+
+- **`cookie_signing_key`**: every existing session and flow cookie was
+  signed/encrypted with the old key, so it stops validating the moment
+  you switch keys. Every logged-in user is logged out and has to log in
+  again. There's no partial state to clean up — the old sessions simply
+  stop verifying and behave exactly like "no session."
+- **`refresh_token_encryption_key`**: every session row's stored refresh
+  token was encrypted with the old key and becomes undecryptable. The
+  next silent-refresh attempt for each such session fails closed (Phase
+  2/11 behavior: decrypt failure → clear the session, `401`, Caddy sends
+  to `/login`), so this also amounts to a full logout, just discovered
+  session-by-session at each one's next refresh instead of all at once.
+
+**Procedure**: generate two new random values (32+ bytes; `forward-auth
+init`'s own key generation — 32 random bytes, hex-encoded — is a fine
+reference for the shape, though you don't need to re-run the wizard
+itself), set them via `FORWARD_AUTH_COOKIE_KEY` / `FORWARD_AUTH_REFRESH_KEY`
+(or in the config file, keeping it `chmod 600`), and restart the
+service. Do this during a maintenance window if a mass forced re-login is
+disruptive for your users. There's nothing to migrate in SQLite —
+old session rows simply become permanently unreachable garbage; the
+background reaper will eventually clean them up once their `expires_at`
+passes, or delete the database file entirely if you'd rather not wait.
+
+Rotate both keys at the same time if you rotate either — there's no
+reason to leave the other one stale, and keeping them on the same
+schedule is one less thing to track.
+
+## Adding a new host
+
+1. Add a `[host."new.example.com"]` block under an existing base domain
+   (see [config-reference.md](config-reference.md) for every field).
+   Minimally just `base_domain = "..."` inherits everything.
+2. Add a Caddy `forward_auth` site block for it, modeled on
+   [`deploy/Caddyfile`](../deploy/Caddyfile)'s `app.example.com` example.
+3. Reload both Caddy and forward-auth. Order doesn't matter — forward-auth
+   rejects a request for an unconfigured host with a `502` rather than
+   crashing, so a brief window where Caddy knows about the host before
+   forward-auth's config is reloaded just produces `502`s, not confusion.
+
+No IdP-side change needed unless the new host also needs its own OIDC
+client (see "adding a second provider" below) or its own resource for
+API tokens (see [api-tokens.md](api-tokens.md)).
+
+## Adding a second provider
+
+Two shapes, depending on scope:
+
+- **A whole new base domain** (a different top-level property with its
+  own users): add a new `[base_domain."other.com"]` block with its own
+  `auth_subdomain` and `provider`, then hosts under it as usual. This is
+  the common case and needs no special handling — base domains are
+  already fully independent.
+- **One host on an existing base domain, but a different IdP than that
+  base domain's default** (e.g. a partner's app that authenticates
+  against the partner's own IdP while staying under your domain's
+  single-sign-on umbrella for everything else): give that one
+  `[host."..."]` block a full `provider` override — see
+  [config-reference.md](config-reference.md)'s two-provider example. All
+  three provider fields (`discovery_url`, `client_id`, `client_secret`)
+  must be set together; a partial override is a config error, not a
+  merge.
+
+Either way: register the new OIDC client at that provider with a
+redirect URI of `https://<that base domain's auth_subdomain>/callback`
+first, then update the config and reload.
+
+## Reading logs and OTel traces for auth failures
+
+Logs are JSON on stdout always (`RUST_LOG` controls level, default
+`info`), and optionally also exported via OTLP/gRPC when
+`otel_endpoint` is set. Every denial or error logs a reason as a
+structured field, not just a status code — grep/query on these instead
+of guessing from the HTTP response alone:
+
+| What you're chasing | Look for | Key fields |
+|---|---|---|
+| Denied at `/verify` for a browser session | `"session presented against the wrong base domain"`, `"no OIDC client for session's base domain; clearing session"`, `"denied: missing required group"` | `session_id`, `subject`, `host`, `required_group` |
+| Denied at `/verify` for a bearer token | `"bearer token rejected"` (validation failure — bad signature, wrong audience, expired, missing scope), `"bearer token denied: missing required group"` | `err`, `host`, `required_group` |
+| Silent refresh failing | `"refresh failed; clearing session"`, `"failed to decrypt stored refresh token"`, `"refreshed id_token failed verification; clearing session"` | `session_id`, `err` |
+| CSRF / stale flow cookie at `/callback` | `"callback state mismatch — possible CSRF or stale flow cookie"` | (no session_id yet at this point — it's pre-login) |
+| IdP returned an error at `/callback` | `"identity provider returned an error"` | `error`, `description` |
+| Config problem at startup | printed to stderr, not through the logger — `forward-auth: N config error(s) found in <path>` followed by every error | — |
+| JWKS refresh failing (bearer validation may start failing if this persists) | `"periodic JWKS refresh failed"` | `base_domain`, `err` |
+| Rate limited | `"rate limit exceeded on login/callback"` | `ip` |
+| Reaper activity (informational, not a failure) | `"reaper: swept expired sessions"` | `reaped` (count) |
+
+A `502` with no matching request-scoped log line at all usually means
+the *host* wasn't recognized — check `"config loaded"` at startup logged
+`hosts = N` matching what you expect, and that Caddy's `X-Forwarded-Host`
+matches the config's host key exactly (case doesn't matter — both sides
+lowercase — but the base hostname must match; `X-Forwarded-Host` should
+not include a port).
+
+## Revoking API access
+
+There is no per-token revoke on forward-auth's side by design (see
+[api-tokens.md](api-tokens.md)) — validation is stateless, and nothing
+about a specific issued token is tracked here. To cut off access:
+
+- Disable the OIDC client, or its permission on the specific resource,
+  at the IdP. This is immediate for IdPs that check client/permission
+  status at token-validation time, or takes effect as soon as the
+  currently-issued token expires otherwise (typically short-lived —
+  check your IdP's default access-token TTL for that resource).
+- To force an immediate cut, shorten the resource's access-token TTL at
+  the IdP (if supported) rather than trying to intervene from
+  forward-auth's side.
+
+Revoking a **browser session** is different and does have per-session
+control: the `/` overview page lists a user's own other active sessions
+with a revoke button (`POST /sessions/revoke`), scoped so a session can
+only ever revoke another session belonging to the same subject and base
+domain — never anyone else's, even by guessing a session ID. `/logout`
+(also POST-only) ends the current session and, when the provider
+supports RP-Initiated Logout, sends the browser to the IdP's own
+`end_session_endpoint` too so the IdP-side session ends as well, not
+just forward-auth's.

@@ -1,0 +1,122 @@
+# Deployment guide
+
+## What you're deploying
+
+A single Rust binary (`forward-auth`) plus one TOML config file and one
+SQLite database file. No external services required — not even the
+database is separate. This is deliberate: see the plan's locked-in
+"single instance, no HA requirement" decision. There's no clustering
+story and no shared session state; if you need forward-auth on more than
+one machine, run one instance per deployment, each with its own config
+and SQLite file.
+
+## The trust boundary — read this first
+
+forward-auth trusts three things unconditionally, because they're only
+supposed to be set by a proxy it trusts, not by end clients:
+
+- `X-Forwarded-Host` (falls back to `Host`) — which host config to apply
+- `X-Forwarded-Proto` — whether to set the `Secure` cookie flag
+- `X-Forwarded-For` (last hop only) — the client IP used for rate limiting
+
+And on the way out, when a host has `forward_identity_headers = true`,
+forward-auth's `/verify` response carries `X-Auth-User` /
+`X-Auth-Email` / `X-Auth-Groups`, which Caddy's `copy_headers` then
+overwrites onto the request forwarded to the backend app.
+
+None of this is safe unless **both** of the following hold:
+
+1. **forward-auth itself is unreachable except through Caddy.** Bind it
+   to `127.0.0.1` (the default) or a private network address, never
+   `0.0.0.0` on a host with a public interface, and never put it behind
+   a second proxy that doesn't strip/overwrite these headers.
+2. **Every backend app is unreachable except through Caddy.** If a
+   client can reach `app.example.com`'s backend directly — a
+   misconfigured firewall, a second exposed port, a container network
+   with no isolation — they can set their own `X-Auth-User` header and
+   the backend will trust it, because `copy_headers`' overwrite never
+   happens for a request that skipped Caddy entirely.
+
+In practice: put Caddy and every backend app on an internal network with
+no other route in (a dedicated Docker network, a private VPC, or
+loopback-only binds on a single host), and don't rely on the backend app
+itself to defend against a spoofed identity header — it has no way to
+tell forward-auth's header apart from a client's.
+
+## Files on disk
+
+| File | Contents | Permissions |
+|---|---|---|
+| the config file | OIDC client secrets, and (unless you use the env-var overrides below) the cookie-signing and refresh-token-encryption keys | must be `0600` — forward-auth refuses to start if key material lives in a config file that's group/other-readable |
+| the SQLite database (`sqlite_path`, default `forward-auth.db`) | session rows: subject, email, encrypted refresh token, expiry, raw ID token claims | chmod'd to `0600` automatically at startup |
+
+As a second layer, forward-auth sets `umask 0o077` for its own process
+at startup, so any file it creates defaults to owner-only permissions
+even if a call site forgot to `chmod` explicitly.
+
+Secrets can also come from the environment instead of the file:
+`FORWARD_AUTH_COOKIE_KEY` and `FORWARD_AUTH_REFRESH_KEY` take precedence
+over the config file's `cookie_signing_key` / `refresh_token_encryption_key`
+when set — useful for a secrets manager or container orchestrator that
+injects env vars rather than files.
+
+## Running it
+
+```sh
+forward-auth --config /etc/forward-auth/config.toml
+```
+
+There's no daemonization built in — run it under systemd, a container
+supervisor, or whatever your platform already uses for long-running
+services. It handles `SIGINT`/ctrl-c with a graceful shutdown (finishes
+in-flight requests, then exits); there's no separate `SIGTERM` handling
+distinct from that.
+
+A minimal systemd unit:
+
+```ini
+[Unit]
+Description=forward-auth
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/forward-auth --config /etc/forward-auth/config.toml
+Restart=on-failure
+User=forward-auth
+WorkingDirectory=/var/lib/forward-auth
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Run it as a dedicated non-root user that owns its config and database
+directory — nothing here needs root.
+
+## Caddy
+
+See [`deploy/Caddyfile`](../deploy/Caddyfile) for a fully-commented
+reference (validated with `caddy adapt`). The shape is: one plain
+`reverse_proxy` block for the auth subdomain, and one `forward_auth`
+block per protected app with an explicit `handle_response` for the 401
+case — `forward_auth` does not redirect on non-2xx by default, it relays
+the response verbatim, so without that block a denied request would show
+forward-auth's raw 401 instead of sending the user to `/login`.
+
+Requires Caddy v2.6+ for `forward_auth`'s `copy_headers` and
+`handle_response` support; verified against v2.11.4.
+
+## Observability
+
+JSON logs go to stdout always; level is controlled by `RUST_LOG`
+(defaults to `info`). Set `otel_endpoint` in `[global]` to also export
+logs via OTLP/gRPC to a collector. See the [runbook](runbook.md) for what
+to look for when diagnosing an auth failure.
+
+## What's explicitly not supported
+
+Per the plan's "Deferred" list: no multi-instance/shared session state,
+no zero-downtime key rotation (rotating `cookie_signing_key` or
+`refresh_token_encryption_key` invalidates all existing sessions — see
+the [runbook](runbook.md)'s rotation section for the safe procedure), no
+retry/backoff if the IdP is unreachable at login (you get a plain error
+page), and no central "logout everywhere" across multiple base domains.
