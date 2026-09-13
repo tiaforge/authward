@@ -1,0 +1,1 @@
+ALTER TABLE sessions ADD COLUMN claims_json TEXT NOT NULL DEFAULT '{}';

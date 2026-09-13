@@ -282,6 +282,10 @@ pub async fn callback(
 
     let subject = claims.subject().as_str().to_string();
     let email = claims.email().as_ref().map(|e| e.as_str().to_string());
+    let claims_json = crate::oidc::decode_claims_json(&id_token.to_string()).unwrap_or_else(|err| {
+        tracing::warn!(%err, "failed to decode id_token claims for group checks; treating as empty");
+        serde_json::Value::Null
+    });
 
     let session_id = crate::crypto::random_hex(32);
     let refresh_token = token_response
@@ -305,6 +309,7 @@ pub async fn callback(
         refresh_token,
         expires_at,
         user_agent,
+        &claims_json,
     )
     .await
     {
@@ -334,25 +339,49 @@ pub async fn verify(
     State(state): State<AppState>,
     headers: HeaderMap,
     jar: PrivateCookieJar,
-) -> StatusCode {
+) -> Response {
     let Some(host) = resolve_incoming_host(&headers) else {
         tracing::error!("verify: request has no Host or X-Forwarded-Host header");
-        return StatusCode::BAD_GATEWAY;
+        return StatusCode::BAD_GATEWAY.into_response();
     };
     let Some(resolved_host) = state.config.resolve_host(&host) else {
         tracing::error!(
             host,
             "verify: no per-host config and no fallback provider configured"
         );
-        return StatusCode::BAD_GATEWAY;
+        return StatusCode::BAD_GATEWAY.into_response();
     };
 
     let Some(cookie) = jar.get(SESSION_COOKIE_NAME) else {
-        return StatusCode::UNAUTHORIZED;
+        return StatusCode::UNAUTHORIZED.into_response();
     };
 
-    match crate::session::verify_session(&state, cookie.value(), &resolved_host.base_domain).await {
-        crate::session::VerifyOutcome::Valid => StatusCode::OK,
-        crate::session::VerifyOutcome::Invalid => StatusCode::UNAUTHORIZED,
+    let session =
+        match crate::session::verify_session(&state, cookie.value(), &resolved_host.base_domain)
+            .await
+        {
+            crate::session::VerifyOutcome::Valid(session) => session,
+            crate::session::VerifyOutcome::Invalid => {
+                return StatusCode::UNAUTHORIZED.into_response();
+            }
+        };
+
+    // Group-membership authorization (Phase 4): no `required_group`
+    // configured on this host means no check, any valid login passes.
+    if let Some(required_group) = &resolved_host.required_group
+        && !crate::authz::has_required_group(
+            &session.claims_json,
+            &resolved_host.group_claim_name,
+            required_group,
+        )
+    {
+        tracing::info!(subject = %session.subject, host, required_group, "denied: missing required group");
+        return error_page(
+            StatusCode::FORBIDDEN,
+            "Not authorized",
+            "You're signed in, but you don't have access to this application.",
+        );
     }
+
+    StatusCode::OK.into_response()
 }

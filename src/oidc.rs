@@ -94,3 +94,28 @@ pub fn build_http_client() -> anyhow::Result<openidconnect::reqwest::Client> {
         .build()
         .context("failed to build HTTP client")
 }
+
+/// Decodes the raw claims payload out of an ID token's compact JWT
+/// representation (`header.payload.signature`), as plain JSON.
+///
+/// This is *not* itself a signature check — call it only on a token whose
+/// signature/issuer/audience/expiry have already been verified via
+/// [`openidconnect::IdToken::claims`]. It exists because that verified,
+/// strongly-typed `IdTokenClaims` only models OIDC's standard claims;
+/// group/role claims live under a provider-specific, per-host-configurable
+/// key (`group_claim_name`) that no static Rust type can name in advance.
+/// Reading an extra field out of a payload whose signature was already
+/// checked doesn't introduce a new trust boundary — the whole payload is
+/// covered by that one signature.
+pub fn decode_claims_json(compact_jwt: &str) -> anyhow::Result<serde_json::Value> {
+    use base64::Engine;
+
+    let payload = compact_jwt
+        .split('.')
+        .nth(1)
+        .context("malformed JWT: expected header.payload.signature")?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .context("failed to base64url-decode JWT payload")?;
+    serde_json::from_slice(&bytes).context("failed to parse JWT payload as JSON")
+}

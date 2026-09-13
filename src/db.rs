@@ -15,15 +15,23 @@ use crate::crypto::RefreshTokenCipher;
 /// binary doesn't depend on that directory existing next to it wherever
 /// it's deployed.
 fn migrator() -> Migrator {
-    let sql = include_str!("../migrations/0001_sessions.sql");
-    let migration = Migration::new(
-        1,
-        "sessions".into(),
-        MigrationType::ReversibleUp,
-        sql.into_sql_str(),
-        false,
-    );
-    Migrator::with_migrations(vec![migration])
+    let migrations = vec![
+        Migration::new(
+            1,
+            "sessions".into(),
+            MigrationType::ReversibleUp,
+            include_str!("../migrations/0001_sessions.sql").into_sql_str(),
+            false,
+        ),
+        Migration::new(
+            2,
+            "session_claims".into(),
+            MigrationType::ReversibleUp,
+            include_str!("../migrations/0002_session_claims.sql").into_sql_str(),
+            false,
+        ),
+    ];
+    Migrator::with_migrations(migrations)
 }
 
 pub async fn connect(path: &Path) -> anyhow::Result<SqlitePool> {
@@ -46,6 +54,7 @@ pub async fn connect(path: &Path) -> anyhow::Result<SqlitePool> {
     Ok(pool)
 }
 
+#[derive(Debug, Clone)]
 pub struct Session {
     pub id: String,
     pub base_domain: String,
@@ -55,6 +64,10 @@ pub struct Session {
     pub expires_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
     pub user_agent: Option<String>,
+    /// Raw ID token claims as of the last login or refresh — the source
+    /// for the per-host group-membership check (Phase 4), since the
+    /// configurable `group_claim_name` isn't known at compile time.
+    pub claims_json: serde_json::Value,
 }
 
 impl Session {
@@ -84,6 +97,7 @@ pub async fn create_session(
     refresh_token: Option<(Vec<u8>, Vec<u8>)>,
     expires_at: DateTime<Utc>,
     user_agent: Option<&str>,
+    claims_json: &serde_json::Value,
 ) -> anyhow::Result<()> {
     let (nonce, ciphertext) = match refresh_token {
         Some((n, c)) => (Some(n), Some(c)),
@@ -92,8 +106,8 @@ pub async fn create_session(
     sqlx::query(
         "INSERT INTO sessions \
          (id, base_domain, subject, email, refresh_token_nonce, refresh_token_ciphertext, \
-          expires_at, created_at, user_agent) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          expires_at, created_at, user_agent, claims_json) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(id)
     .bind(base_domain)
@@ -104,6 +118,7 @@ pub async fn create_session(
     .bind(expires_at.timestamp())
     .bind(Utc::now().timestamp())
     .bind(user_agent)
+    .bind(claims_json.to_string())
     .execute(pool)
     .await?;
     Ok(())
@@ -112,7 +127,7 @@ pub async fn create_session(
 pub async fn get_session(pool: &SqlitePool, id: &str) -> anyhow::Result<Option<Session>> {
     let row = sqlx::query(
         "SELECT id, base_domain, subject, email, refresh_token_nonce, refresh_token_ciphertext, \
-                expires_at, created_at, user_agent \
+                expires_at, created_at, user_agent, claims_json \
          FROM sessions WHERE id = ?",
     )
     .bind(id)
@@ -129,6 +144,7 @@ pub async fn get_session(pool: &SqlitePool, id: &str) -> anyhow::Result<Option<S
         (Some(n), Some(c)) => Some((n, c)),
         _ => None,
     };
+    let claims_json: String = row.try_get("claims_json")?;
 
     Ok(Some(Session {
         id: row.try_get("id")?,
@@ -141,6 +157,7 @@ pub async fn get_session(pool: &SqlitePool, id: &str) -> anyhow::Result<Option<S
         created_at: DateTime::from_timestamp(row.try_get::<i64, _>("created_at")?, 0)
             .unwrap_or_default(),
         user_agent: row.try_get("user_agent")?,
+        claims_json: serde_json::from_str(&claims_json).unwrap_or(serde_json::Value::Null),
     }))
 }
 
@@ -152,16 +169,22 @@ pub async fn delete_session(pool: &SqlitePool, id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Updates a session's refresh token and expiry after a successful silent
-/// refresh (Phase 2). `refresh_token` is `None` when the IdP didn't rotate
-/// it and the caller chose to keep serving requests without persisting a
-/// new value (callers should generally pass the existing token back
-/// through here rather than omit it, so this stays a simple overwrite).
+/// Updates a session's refresh token, expiry, and (when the IdP returned a
+/// fresh ID token on refresh) claims, after a successful silent refresh
+/// (Phase 2). `refresh_token` is `None` when the IdP didn't rotate it and
+/// the caller chose to keep serving requests without persisting a new
+/// value (callers should generally pass the existing token back through
+/// here rather than omit it, so this stays a simple overwrite).
+/// `claims_json` is `None` when the refresh response carried no ID token
+/// (not every provider returns one on refresh) — the stored claims are
+/// left as-is rather than wiped, per the plan's group-recheck-on-refresh
+/// design: best-effort freshness, not a hard requirement per refresh.
 pub async fn update_session_after_refresh(
     pool: &SqlitePool,
     id: &str,
     refresh_token: Option<(Vec<u8>, Vec<u8>)>,
     expires_at: DateTime<Utc>,
+    claims_json: Option<&serde_json::Value>,
 ) -> anyhow::Result<()> {
     let (nonce, ciphertext) = match refresh_token {
         Some((n, c)) => (Some(n), Some(c)),
@@ -169,12 +192,14 @@ pub async fn update_session_after_refresh(
     };
     sqlx::query(
         "UPDATE sessions \
-         SET refresh_token_nonce = ?, refresh_token_ciphertext = ?, expires_at = ? \
+         SET refresh_token_nonce = ?, refresh_token_ciphertext = ?, expires_at = ?, \
+             claims_json = COALESCE(?, claims_json) \
          WHERE id = ?",
     )
     .bind(nonce)
     .bind(ciphertext)
     .bind(expires_at.timestamp())
+    .bind(claims_json.map(|v| v.to_string()))
     .bind(id)
     .execute(pool)
     .await?;

@@ -16,6 +16,7 @@
 //! addressing, not a bug in the service under test.
 
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -32,9 +33,8 @@ use openidconnect::core::{
     CoreTokenResponse, CoreTokenType,
 };
 use openidconnect::{
-    AccessToken, Audience, EmptyAdditionalClaims, EmptyExtraTokenFields, EndUserEmail, IdToken,
-    IdTokenClaims, IdTokenFields, IssuerUrl, JsonWebKeySet, Nonce, PrivateSigningKey, RefreshToken,
-    StandardClaims, SubjectIdentifier,
+    AccessToken, EmptyAdditionalClaims, EmptyExtraTokenFields, IdToken, IdTokenFields,
+    JsonWebKeySet, PrivateSigningKey, RefreshToken,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -54,6 +54,7 @@ struct PendingAuth {
     nonce: String,
     subject: String,
     email: String,
+    groups: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -86,6 +87,9 @@ struct AuthorizeParams {
     /// Doubles as "which test identity is logging in" — a real IdP would
     /// show a login form; we skip straight to picking an identity.
     login_hint: Option<String>,
+    /// Comma-separated group membership for this login, standing in for
+    /// whatever a real IdP's admin UI would configure per user.
+    groups: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -121,12 +125,17 @@ async fn authorize(
     let subject = params
         .login_hint
         .unwrap_or_else(|| "default-user".to_string());
+    let groups = params
+        .groups
+        .map(|g| g.split(',').map(str::to_string).collect())
+        .unwrap_or_default();
     idp.pending.lock().unwrap().insert(
         code.clone(),
         PendingAuth {
             nonce: params.nonce,
             email: format!("{subject}@example.test"),
             subject,
+            groups,
         },
     );
 
@@ -144,33 +153,49 @@ fn issue_tokens(
     nonce: Option<String>,
     refresh_token: String,
 ) -> CoreTokenResponse {
+    // Built by hand (JSON + HMAC-SHA256) rather than via `IdTokenClaims` /
+    // `IdToken::new`, so the mock can embed a `groups` claim without
+    // fighting openidconnect's `AdditionalClaims` generic — the app on
+    // the other end reads it back via raw JSON too (`decode_claims_json`),
+    // not through any typed claims struct, so there's no mismatch.
+    use base64::Engine;
     let now = Utc::now();
-    let mut claims = IdTokenClaims::new(
-        IssuerUrl::new(idp.base_url.clone()).unwrap(),
-        vec![Audience::new(CLIENT_ID.to_string())],
-        now + ChronoDuration::from_std(idp.access_token_ttl).unwrap(),
-        now,
-        StandardClaims::new(SubjectIdentifier::new(identity.subject.clone()))
-            .set_email(Some(EndUserEmail::new(identity.email.clone()))),
-        EmptyAdditionalClaims {},
-    );
+    let exp = now + ChronoDuration::from_std(idp.access_token_ttl).unwrap();
+    let mut payload = serde_json::json!({
+        "iss": idp.base_url,
+        "aud": [CLIENT_ID],
+        "sub": identity.subject,
+        "email": identity.email,
+        "iat": now.timestamp(),
+        "exp": exp.timestamp(),
+        "groups": identity.groups,
+    });
     if let Some(nonce) = nonce {
-        claims = claims.set_nonce(Some(Nonce::new(nonce)));
+        payload["nonce"] = serde_json::Value::String(nonce);
     }
+    let header_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"alg":"HS256"}"#);
+    let payload_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(serde_json::to_vec(&payload).unwrap());
+    let signing_input = format!("{header_b64}.{payload_b64}");
+    let signature = idp
+        .hmac_key
+        .sign(
+            &CoreJwsSigningAlgorithm::HmacSha256,
+            signing_input.as_bytes(),
+        )
+        .expect("mock HMAC signing should not fail");
+    let compact_jwt = format!(
+        "{signing_input}.{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signature)
+    );
 
     let id_token = IdToken::<
         EmptyAdditionalClaims,
         CoreGenderClaim,
         CoreJweContentEncryptionAlgorithm,
         CoreJwsSigningAlgorithm,
-    >::new(
-        claims,
-        idp.hmac_key.as_ref(),
-        CoreJwsSigningAlgorithm::HmacSha256,
-        None,
-        None,
-    )
-    .expect("signing the mock ID token should not fail");
+    >::from_str(&compact_jwt)
+    .expect("mock JWT should parse");
 
     idp.refresh_tokens
         .lock()
@@ -448,6 +473,20 @@ async fn login_as(
     login_hint: &str,
     rd: &str,
 ) -> String {
+    login_as_with_groups(app, idp_client, browser, login_hint, "", rd).await
+}
+
+/// Like `login_as`, but also sets the mock IdP's `groups` claim for this
+/// login (comma-separated; empty means no groups) — for Phase 4's
+/// group-membership authorization tests.
+async fn login_as_with_groups(
+    app: &str,
+    idp_client: &reqwest::Client,
+    browser: &mut Browser,
+    login_hint: &str,
+    groups: &str,
+    rd: &str,
+) -> String {
     let resp = browser
         .get(
             app,
@@ -468,6 +507,11 @@ async fn login_as(
     authorize_url
         .query_pairs_mut()
         .append_pair("login_hint", login_hint);
+    if !groups.is_empty() {
+        authorize_url
+            .query_pairs_mut()
+            .append_pair("groups", groups);
+    }
 
     let idp_resp = follow_real_redirect(idp_client, authorize_url.as_str()).await;
     assert_eq!(idp_resp.status(), reqwest::StatusCode::SEE_OTHER);
@@ -812,6 +856,7 @@ async fn reaper_deletes_sessions_with_no_refresh_token_survivors() {
         None,
         Utc::now() - ChronoDuration::seconds(1),
         None,
+        &serde_json::Value::Null,
     )
     .await
     .unwrap();
@@ -1100,5 +1145,153 @@ async fn login_ignores_an_rd_pointing_at_a_foreign_host() {
     assert_eq!(
         landed_on, "https://auth.test.local/",
         "should fall back to the auth subdomain's own root"
+    );
+}
+
+// ---- Phase 4: group-membership authorization -----------------------------
+
+#[tokio::test]
+async fn required_group_grants_or_denies_access() {
+    let (idp_base_url, _refresh_grant_count, _refresh_tokens) =
+        spawn_mock_idp(Duration::from_secs(3600)).await;
+    let db_dir = tempfile::tempdir().unwrap();
+
+    let mut cfg = base_config(&db_dir.path().join("sessions.db"));
+    cfg.base_domains.insert(
+        "test.local".to_string(),
+        base_domain_block("test.local", "auth.test.local", &idp_base_url),
+    );
+    let mut admin_host = resolved_host("admin.test.local", "test.local", &idp_base_url);
+    admin_host.required_group = Some("admins".to_string());
+    cfg.hosts.insert("admin.test.local".to_string(), admin_host);
+    let (app, _state) = spawn_app_with_config(cfg).await;
+
+    let idp_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    let mut alice = Browser::new();
+    login_as_with_groups(
+        &app,
+        &idp_client,
+        &mut alice,
+        "alice",
+        "admins",
+        "https://admin.test.local/",
+    )
+    .await;
+    assert_eq!(
+        alice
+            .get(&app, "admin.test.local", "/verify")
+            .await
+            .status(),
+        reqwest::StatusCode::OK,
+        "member of the required group should be granted access"
+    );
+
+    let mut bob = Browser::new();
+    login_as_with_groups(
+        &app,
+        &idp_client,
+        &mut bob,
+        "bob",
+        "users",
+        "https://admin.test.local/",
+    )
+    .await;
+    assert_eq!(
+        bob.get(&app, "admin.test.local", "/verify").await.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "authenticated but not a member of the required group should be denied, not just unauthenticated"
+    );
+}
+
+#[tokio::test]
+async fn no_required_group_means_any_valid_login_passes() {
+    let (idp_base_url, _refresh_grant_count, _refresh_tokens) =
+        spawn_mock_idp(Duration::from_secs(3600)).await;
+    let db_dir = tempfile::tempdir().unwrap();
+    // spawn_app's default host has no required_group configured at all.
+    let (app, _state) = spawn_app(&idp_base_url, &db_dir.path().join("sessions.db")).await;
+    let idp_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    let mut browser = Browser::new();
+    // No groups at all — should still pass, since the host requires none.
+    login_as_with_groups(
+        &app,
+        &idp_client,
+        &mut browser,
+        "alice",
+        "",
+        "https://app.test.local/",
+    )
+    .await;
+    assert_eq!(
+        browser
+            .get(&app, "app.test.local", "/verify")
+            .await
+            .status(),
+        reqwest::StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn revoking_group_membership_denies_access_on_next_refresh_without_relogin() {
+    let ttl = Duration::from_secs(1);
+    let (idp_base_url, _refresh_grant_count, refresh_tokens) = spawn_mock_idp(ttl).await;
+    let db_dir = tempfile::tempdir().unwrap();
+
+    let mut cfg = base_config(&db_dir.path().join("sessions.db"));
+    cfg.base_domains.insert(
+        "test.local".to_string(),
+        base_domain_block("test.local", "auth.test.local", &idp_base_url),
+    );
+    let mut admin_host = resolved_host("admin.test.local", "test.local", &idp_base_url);
+    admin_host.required_group = Some("admins".to_string());
+    cfg.hosts.insert("admin.test.local".to_string(), admin_host);
+    let (app, _state) = spawn_app_with_config(cfg).await;
+
+    let idp_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let mut browser = Browser::new();
+    login_as_with_groups(
+        &app,
+        &idp_client,
+        &mut browser,
+        "alice",
+        "admins",
+        "https://admin.test.local/",
+    )
+    .await;
+    assert_eq!(
+        browser
+            .get(&app, "admin.test.local", "/verify")
+            .await
+            .status(),
+        reqwest::StatusCode::OK
+    );
+
+    // Simulate the IdP admin removing alice from "admins" — the mock
+    // reports this on the *next* token issuance (refresh), exactly like a
+    // real IdP would, without alice's session being touched directly.
+    for identity in refresh_tokens.lock().unwrap().values_mut() {
+        identity.groups.clear();
+    }
+
+    tokio::time::sleep(ttl + Duration::from_millis(500)).await;
+
+    assert_eq!(
+        browser
+            .get(&app, "admin.test.local", "/verify")
+            .await
+            .status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "losing required group membership should deny access on the next silent refresh, without waiting for full re-login"
     );
 }

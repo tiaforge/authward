@@ -11,9 +11,16 @@ use openidconnect::{Nonce, OAuth2TokenResponse, RefreshToken, TokenResponse};
 use crate::db::{self, Session};
 use crate::state::AppState;
 
-#[derive(Debug, PartialEq, Eq)]
+// Boxing `Session` would trade a small amount of enum size for a heap
+// allocation on every successful verification — the overwhelmingly common
+// case for a running deployment — which isn't the right tradeoff here.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
 pub enum VerifyOutcome {
-    Valid,
+    /// Authenticated (and, if it had expired, freshly refreshed). Carries
+    /// the session so callers can run the per-host group-membership check
+    /// (Phase 4) against its `claims_json` without a second DB read.
+    Valid(Session),
     Invalid,
 }
 
@@ -49,7 +56,7 @@ pub async fn verify_session(
     }
 
     if !session.is_expired() {
-        return VerifyOutcome::Valid;
+        return VerifyOutcome::Valid(session);
     }
 
     // Expired: refresh under this session's lock. Concurrent requests for
@@ -73,14 +80,14 @@ pub async fn verify_session(
                 return VerifyOutcome::Invalid;
             }
             if !session.is_expired() {
-                return VerifyOutcome::Valid;
+                return VerifyOutcome::Valid(session);
             }
-            refresh(state, &session).await
+            refresh(state, session).await
         })
         .await
 }
 
-async fn refresh(state: &AppState, session: &Session) -> VerifyOutcome {
+async fn refresh(state: &AppState, mut session: Session) -> VerifyOutcome {
     let Some(oidc_client) = state.oidc_clients.get(&session.base_domain) else {
         tracing::warn!(session_id = %session.id, base_domain = %session.base_domain, "no OIDC client for session's base domain; clearing session");
         clear(state, &session.id).await;
@@ -128,6 +135,11 @@ async fn refresh(state: &AppState, session: &Session) -> VerifyOutcome {
     // (signature, issuer, audience, expiry/clock-skew). Not every provider
     // returns one on refresh; when present, a failure here means treating
     // the whole refresh as untrustworthy rather than keeping stale claims.
+    // When one *is* present and valid, its claims replace the session's
+    // stored snapshot — this is what lets a group-membership change at
+    // the IdP take effect on next refresh rather than only at next login
+    // (the plan's group-recheck-on-refresh design).
+    let mut fresh_claims_json = None;
     if let Some(id_token) = token_response.id_token() {
         let verifier = oidc_client
             .id_token_verifier()
@@ -150,6 +162,12 @@ async fn refresh(state: &AppState, session: &Session) -> VerifyOutcome {
             clear(state, &session.id).await;
             return VerifyOutcome::Invalid;
         }
+        match crate::oidc::decode_claims_json(&id_token.to_string()) {
+            Ok(json) => fresh_claims_json = Some(json),
+            Err(err) => {
+                tracing::warn!(session_id = %session.id, %err, "failed to decode refreshed id_token claims; keeping stale claims")
+            }
+        }
     }
 
     // Providers vary on whether they rotate the refresh token; keep the
@@ -168,15 +186,25 @@ async fn refresh(state: &AppState, session: &Session) -> VerifyOutcome {
             ChronoDuration::seconds(state.config.global.session_ttl_fallback.as_secs() as i64)
         });
 
-    if let Err(err) =
-        db::update_session_after_refresh(&state.db, &session.id, Some(encrypted), expires_at).await
+    if let Err(err) = db::update_session_after_refresh(
+        &state.db,
+        &session.id,
+        Some(encrypted),
+        expires_at,
+        fresh_claims_json.as_ref(),
+    )
+    .await
     {
         tracing::error!(session_id = %session.id, %err, "failed to persist refreshed session");
         return VerifyOutcome::Invalid;
     }
 
     tracing::debug!(session_id = %session.id, "session silently refreshed");
-    VerifyOutcome::Valid
+    session.expires_at = expires_at;
+    if let Some(claims_json) = fresh_claims_json {
+        session.claims_json = claims_json;
+    }
+    VerifyOutcome::Valid(session)
 }
 
 async fn clear(state: &AppState, session_id: &str) {

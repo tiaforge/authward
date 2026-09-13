@@ -9,6 +9,7 @@ askama = "0.16.1"
 askama_web = { version = "0.16.0", features = ["axum-0.8"] }
 axum = "0.8.9"
 axum-extra = { version = "0.12.6", features = ["cookie", "cookie-private"] }
+base64 = "0.23.1"
 blake3 = "1.8.7"
 chacha20poly1305 = { version = "0.11.0", features = ["getrandom"] }
 chrono = "0.4.45"
