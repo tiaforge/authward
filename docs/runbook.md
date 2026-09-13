@@ -59,14 +59,13 @@ Two shapes, depending on scope:
   the common case and needs no special handling — base domains are
   already fully independent.
 - **One host on an existing base domain, but a different IdP than that
-  base domain's default** (e.g. a partner's app that authenticates
-  against the partner's own IdP while staying under your domain's
-  single-sign-on umbrella for everything else): give that one
-  `[host."..."]` block a full `provider` override — see
-  [config-reference.md](config-reference.md)'s two-provider example. All
-  three provider fields (`discovery_url`, `client_id`, `client_secret`)
-  must be set together; a partial override is a config error, not a
-  merge.
+  base domain's default** — **not currently functional; do not rely on
+  it.** The per-host `provider` override is accepted by the config loader
+  but never used at runtime: login, refresh and bearer-token validation
+  all use the base domain's provider (see the known gap in
+  [config-reference.md](config-reference.md#known-gap-per-host-provider-override)).
+  Until that's wired up, a host that needs a different IdP must live on
+  its own base domain.
 
 Either way: register the new OIDC client at that provider with a
 redirect URI of `https://<that base domain's auth_subdomain>/callback`
@@ -78,7 +77,10 @@ Logs are JSON on stdout always (`RUST_LOG` controls level, default
 `info`), and optionally also exported via OTLP/gRPC when
 `otel_endpoint` is set. Every denial or error logs a reason as a
 structured field, not just a status code — grep/query on these instead
-of guessing from the HTTP response alone:
+of guessing from the HTTP response alone. The `session_id` field is a
+12-hex-character hash of the real ID, not the ID itself (which is the
+session's credential): stable enough to correlate one session's lines,
+useless as a cookie.
 
 | What you're chasing | Look for | Key fields |
 |---|---|---|

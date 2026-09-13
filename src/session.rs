@@ -11,6 +11,14 @@ use openidconnect::{Nonce, OAuth2TokenResponse, RefreshToken, TokenResponse};
 use crate::db::{self, Session};
 use crate::state::AppState;
 
+/// A session ID is the session's bearer credential, so it never goes into
+/// a log line verbatim — anyone with log access could replay it as a
+/// cookie. This is a stable, correlatable stand-in: the same ID always
+/// logs the same way, but nothing in the logs can be turned back into it.
+pub fn log_id(session_id: &str) -> String {
+    blake3::hash(session_id.as_bytes()).to_hex()[..12].to_string()
+}
+
 // Boxing `Session` would trade a small amount of enum size for a heap
 // allocation on every successful verification — the overwhelmingly common
 // case for a running deployment — which isn't the right tradeoff here.
@@ -51,7 +59,7 @@ pub async fn verify_session(
         }
     };
     if session.base_domain != expected_base_domain {
-        tracing::warn!(session_id, session_base_domain = %session.base_domain, expected_base_domain, "session presented against the wrong base domain");
+        tracing::warn!(session_id = %log_id(session_id), session_base_domain = %session.base_domain, expected_base_domain, "session presented against the wrong base domain");
         return VerifyOutcome::Invalid;
     }
 
@@ -89,7 +97,7 @@ pub async fn verify_session(
 
 async fn refresh(state: &AppState, mut session: Session) -> VerifyOutcome {
     let Some(oidc_client) = state.oidc_clients.get(&session.base_domain) else {
-        tracing::warn!(session_id = %session.id, base_domain = %session.base_domain, "no OIDC client for session's base domain; clearing session");
+        tracing::warn!(session_id = %log_id(&session.id), base_domain = %session.base_domain, "no OIDC client for session's base domain; clearing session");
         clear(state, &session.id).await;
         return VerifyOutcome::Invalid;
     };
@@ -103,7 +111,7 @@ async fn refresh(state: &AppState, mut session: Session) -> VerifyOutcome {
             return VerifyOutcome::Invalid;
         }
         Err(err) => {
-            tracing::error!(session_id = %session.id, %err, "failed to decrypt stored refresh token");
+            tracing::error!(session_id = %log_id(&session.id), %err, "failed to decrypt stored refresh token");
             clear(state, &session.id).await;
             return VerifyOutcome::Invalid;
         }
@@ -113,7 +121,7 @@ async fn refresh(state: &AppState, mut session: Session) -> VerifyOutcome {
     let token_request = match oidc_client.exchange_refresh_token(&refresh_token_value) {
         Ok(req) => req,
         Err(err) => {
-            tracing::error!(session_id = %session.id, %err, "failed to build refresh request");
+            tracing::error!(session_id = %log_id(&session.id), %err, "failed to build refresh request");
             clear(state, &session.id).await;
             return VerifyOutcome::Invalid;
         }
@@ -125,7 +133,7 @@ async fn refresh(state: &AppState, mut session: Session) -> VerifyOutcome {
             // Covers both "IdP unreachable" and "IdP rejected the refresh
             // token" (revoked, rotated out from under us, expired) — both
             // end the session the same way, silently.
-            tracing::info!(session_id = %session.id, %err, "refresh failed; clearing session");
+            tracing::info!(session_id = %log_id(&session.id), %err, "refresh failed; clearing session");
             clear(state, &session.id).await;
             return VerifyOutcome::Invalid;
         }
@@ -158,14 +166,14 @@ async fn refresh(state: &AppState, mut session: Session) -> VerifyOutcome {
             });
         // Refresh responses aren't bound to a login-time nonce.
         if let Err(err) = id_token.claims(&verifier, |_: Option<&Nonce>| Ok(())) {
-            tracing::warn!(session_id = %session.id, ?err, "refreshed id_token failed verification; clearing session");
+            tracing::warn!(session_id = %log_id(&session.id), ?err, "refreshed id_token failed verification; clearing session");
             clear(state, &session.id).await;
             return VerifyOutcome::Invalid;
         }
         match crate::oidc::decode_claims_json(&id_token.to_string()) {
             Ok(json) => fresh_claims_json = Some(json),
             Err(err) => {
-                tracing::warn!(session_id = %session.id, %err, "failed to decode refreshed id_token claims; keeping stale claims")
+                tracing::warn!(session_id = %log_id(&session.id), %err, "failed to decode refreshed id_token claims; keeping stale claims")
             }
         }
     }
@@ -195,11 +203,11 @@ async fn refresh(state: &AppState, mut session: Session) -> VerifyOutcome {
     )
     .await
     {
-        tracing::error!(session_id = %session.id, %err, "failed to persist refreshed session");
+        tracing::error!(session_id = %log_id(&session.id), %err, "failed to persist refreshed session");
         return VerifyOutcome::Invalid;
     }
 
-    tracing::debug!(session_id = %session.id, "session silently refreshed");
+    tracing::debug!(session_id = %log_id(&session.id), "session silently refreshed");
     session.expires_at = expires_at;
     if let Some(claims_json) = fresh_claims_json {
         session.claims_json = claims_json;
@@ -209,7 +217,7 @@ async fn refresh(state: &AppState, mut session: Session) -> VerifyOutcome {
 
 async fn clear(state: &AppState, session_id: &str) {
     if let Err(err) = db::delete_session(&state.db, session_id).await {
-        tracing::error!(%session_id, %err, "failed to delete session");
+        tracing::error!(session_id = %log_id(session_id), %err, "failed to delete session");
     }
 }
 
@@ -242,7 +250,7 @@ pub async fn reap_expired_sessions(state: &AppState) {
                     }
                     Ok(_) => false, // gone, or refreshed out from under us
                     Err(err) => {
-                        tracing::error!(session_id = %id, %err, "reaper: session lookup failed");
+                        tracing::error!(session_id = %log_id(&id), %err, "reaper: session lookup failed");
                         false
                     }
                 }

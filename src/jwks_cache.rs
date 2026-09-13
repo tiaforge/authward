@@ -4,14 +4,24 @@
 //! bearer-token validation needs to survive the IdP rotating its signing
 //! keys without a service restart.
 
+use std::time::{Duration, Instant};
+
 use openidconnect::core::CoreJsonWebKey;
 use openidconnect::{IssuerUrl, JsonWebKeySet, JsonWebKeySetUrl};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
+
+/// Minimum spacing between on-demand refreshes triggered by signature
+/// failures. Without it, every unsigned/garbage bearer token costs one
+/// HTTPS round trip to the IdP — an amplification vector against both the
+/// IdP and this service, since `/verify` isn't rate-limited. A real key
+/// rotation still gets picked up on the first failure after the window.
+pub const ON_DEMAND_REFRESH_COOLDOWN: Duration = Duration::from_secs(30);
 
 pub struct JwksCache {
     pub issuer: IssuerUrl,
     jwks_uri: JsonWebKeySetUrl,
     keys: RwLock<JsonWebKeySet<CoreJsonWebKey>>,
+    last_on_demand_refresh: Mutex<Option<Instant>>,
 }
 
 impl JwksCache {
@@ -24,7 +34,28 @@ impl JwksCache {
             issuer,
             jwks_uri,
             keys: RwLock::new(initial),
+            last_on_demand_refresh: Mutex::new(None),
         }
+    }
+
+    /// The signature-failure path's refresh: at most one attempt per
+    /// [`ON_DEMAND_REFRESH_COOLDOWN`], with concurrent callers serialized
+    /// on the timestamp lock so a burst of failures collapses into a
+    /// single fetch. Returns `Ok(false)` when skipped for the cooldown —
+    /// the cached keys are unchanged, so the caller's retry would fail
+    /// the same way and it should just reject. The attempt is stamped
+    /// before the fetch so a failing IdP is throttled too.
+    pub async fn refresh_on_demand(
+        &self,
+        http_client: &openidconnect::reqwest::Client,
+    ) -> anyhow::Result<bool> {
+        let mut last = self.last_on_demand_refresh.lock().await;
+        if last.is_some_and(|at| at.elapsed() < ON_DEMAND_REFRESH_COOLDOWN) {
+            return Ok(false);
+        }
+        *last = Some(Instant::now());
+        self.refresh(http_client).await?;
+        Ok(true)
     }
 
     pub async fn current(&self) -> JsonWebKeySet<CoreJsonWebKey> {

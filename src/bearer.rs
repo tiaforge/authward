@@ -58,7 +58,9 @@ pub async fn validate(
         result => return result,
     }
 
-    if cache.refresh(http_client).await.is_err() {
+    // Skipped-for-cooldown and fetch-failed both mean the cached keys are
+    // what we already tried, so reject rather than re-run the same check.
+    if !cache.refresh_on_demand(http_client).await.unwrap_or(false) {
         return Err(BearerError::SignatureInvalid);
     }
     let jwks = cache.current().await;

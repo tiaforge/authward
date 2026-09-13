@@ -102,8 +102,18 @@ case — `forward_auth` does not redirect on non-2xx by default, it relays
 the response verbatim, so without that block a denied request would show
 forward-auth's raw 401 instead of sending the user to `/login`.
 
-Requires Caddy v2.6+ for `forward_auth`'s `copy_headers` and
-`handle_response` support; verified against v2.11.4.
+**Requires Caddy v2.11.2 or newer.** Caddy 2.10.0 through 2.11.1 carry
+[GHSA-7r4p-vjf4-gxv4](https://github.com/caddyserver/caddy/security/advisories/GHSA-7r4p-vjf4-gxv4):
+`copy_headers` only overwrites a client-supplied header when the auth
+response includes that header, so a request that arrived with its own
+`X-Auth-User` would reach the backend with it intact whenever forward-auth
+had nothing to forward. forward-auth defends in depth by sending all three
+`X-Auth-*` headers on every successful `/verify` — empty when the host has
+`forward_identity_headers = false`, on bypass paths, or when a claim is
+absent — so the overwrite always happens. Run a patched Caddy anyway, and
+keep `copy_headers X-Auth-User X-Auth-Email X-Auth-Groups` on every
+protected host, not just the ones that forward identity. Verified against
+v2.11.4.
 
 ## Observability
 

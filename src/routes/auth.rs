@@ -493,7 +493,7 @@ pub async fn verify(
     if let Some(uri) = headers.get("x-forwarded-uri").and_then(|v| v.to_str().ok())
         && crate::bypass::matches_bypass(uri, &resolved_host.bypass_paths)
     {
-        return StatusCode::OK.into_response();
+        return ok_with_identity("", "", "");
     }
 
     let Some(cookie) = jar.get(SESSION_COOKIE_NAME) else {
@@ -602,14 +602,43 @@ async fn bearer_auth(
     }
 }
 
-/// Successful `/verify` response, optionally carrying verified identity
-/// as `X-Auth-User`/`X-Auth-Email`/`X-Auth-Groups` (Phase 7) when the
-/// host has `forward_identity_headers` enabled. Caddy's `copy_headers`
-/// then carries these from this response onto the proxied request to the
-/// backend, **replacing** any same-named header the client sent — the
-/// backend must still be unreachable except through the proxy (see the
-/// plan's trust-boundary decision), since that replacement is Caddy's
-/// job, not something this response can enforce by itself.
+const IDENTITY_HEADER_NAMES: [&str; 3] = ["x-auth-user", "x-auth-email", "x-auth-groups"];
+
+/// Every successful `/verify` response carries all three identity headers,
+/// even when there's nothing to forward (host has `forward_identity_headers`
+/// off, bypass path, no email claim) — as empty values in that case.
+///
+/// Caddy's `copy_headers` only overwrites a client-supplied header when this
+/// response actually carries it; on Caddy 2.10.0–2.11.1 (GHSA-7r4p-vjf4-gxv4)
+/// an absent header leaves the client's own `X-Auth-User` in place and
+/// forwards it to the backend. Emitting the header unconditionally makes
+/// the overwrite happen on every Caddy version. A value that can't be
+/// encoded as a header is a hard failure rather than a silently dropped
+/// header, for the same reason.
+fn ok_with_identity(user: &str, email: &str, groups: &str) -> Response {
+    let mut headers = HeaderMap::new();
+    for (name, value) in IDENTITY_HEADER_NAMES.iter().zip([user, email, groups]) {
+        match HeaderValue::from_str(value) {
+            Ok(value) => {
+                headers.insert(*name, value);
+            }
+            Err(_) => {
+                tracing::error!(
+                    header = name,
+                    "identity value is not a valid HTTP header value; refusing to forward"
+                );
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        }
+    }
+    (StatusCode::OK, headers).into_response()
+}
+
+/// Successful `/verify` response with verified identity (Phase 7) when the
+/// host has `forward_identity_headers` enabled. The backend must still be
+/// unreachable except through the proxy (see the plan's trust-boundary
+/// decision) — the overwrite is Caddy's job, not something this response
+/// can enforce by itself.
 fn ok_response(
     resolved_host: &crate::config::ResolvedHost,
     subject: &str,
@@ -617,18 +646,9 @@ fn ok_response(
     claims_json: &serde_json::Value,
 ) -> Response {
     if !resolved_host.forward_identity_headers {
-        return StatusCode::OK.into_response();
+        return ok_with_identity("", "", "");
     }
 
-    let mut headers = HeaderMap::new();
-    if let Ok(value) = HeaderValue::from_str(subject) {
-        headers.insert("x-auth-user", value);
-    }
-    if let Some(email) = email
-        && let Ok(value) = HeaderValue::from_str(email)
-    {
-        headers.insert("x-auth-email", value);
-    }
     let groups = match claims_json.get(&resolved_host.group_claim_name) {
         Some(serde_json::Value::Array(items)) => items
             .iter()
@@ -638,11 +658,7 @@ fn ok_response(
         Some(serde_json::Value::String(s)) => s.clone(),
         _ => String::new(),
     };
-    if let Ok(value) = HeaderValue::from_str(&groups) {
-        headers.insert("x-auth-groups", value);
-    }
-
-    (StatusCode::OK, headers).into_response()
+    ok_with_identity(subject, email.unwrap_or(""), &groups)
 }
 
 #[derive(Deserialize)]

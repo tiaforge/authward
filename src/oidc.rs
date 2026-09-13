@@ -130,9 +130,15 @@ pub async fn fetch_jwks(
 
 /// Builds the shared HTTP client used for discovery, token exchange, and
 /// JWKS fetches. Redirects are disabled per the crate's own SSRF guidance.
+/// Timeouts are mandatory: this client is called from `/callback`, from
+/// silent refresh (while holding the per-session lock), and from the
+/// on-demand JWKS refresh inside `/verify` — reqwest's default is no
+/// timeout at all, which would let a stalled IdP hang all of those.
 pub fn build_http_client() -> anyhow::Result<openidconnect::reqwest::Client> {
     openidconnect::reqwest::ClientBuilder::new()
         .redirect(openidconnect::reqwest::redirect::Policy::none())
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(15))
         .build()
         .context("failed to build HTTP client")
 }

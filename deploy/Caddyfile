@@ -1,7 +1,12 @@
 # Reference Caddyfile for forward-auth (Phase 10).
 #
-# Requires Caddy v2.6+ (the `forward_auth` directive with `copy_headers`
-# and `handle_response` support). Verified against Caddy v2.11.4.
+# Requires Caddy v2.11.2 or newer. Caddy 2.10.0 through 2.11.1 have
+# GHSA-7r4p-vjf4-gxv4: `copy_headers` leaves a client-supplied header in
+# place when the auth response doesn't carry that header, so a client
+# could inject its own X-Auth-User. forward-auth defends in depth by
+# always sending all three X-Auth-* headers (empty when there's nothing
+# to forward) on every 200, but run a patched Caddy regardless.
+# Verified against Caddy v2.11.4.
 #
 # Two site blocks per base domain: one for the auth subdomain itself
 # (reverse-proxied straight to forward-auth, no forward_auth wrapper —
@@ -27,9 +32,11 @@ app.example.com {
 	forward_auth localhost:8080 {
 		uri /verify
 
-		# Only needed if this host has forward_identity_headers = true
-		# in forward-auth's config; harmless (just copies nothing) if
-		# forward-auth never sets them for this host.
+		# Copies the verified identity onto the backend request. Keep
+		# this line even for hosts with forward_identity_headers = false:
+		# forward-auth sends the headers empty in that case, and copying
+		# them is what overwrites (rather than passes through) any
+		# X-Auth-* header the client sent.
 		copy_headers X-Auth-User X-Auth-Email X-Auth-Groups
 
 		# forward_auth does NOT redirect on a non-2xx response by

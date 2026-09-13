@@ -82,6 +82,17 @@ pub enum ConfigError {
     KeysMustDiffer,
 
     #[error(
+        "global: `{name}` is {len} bytes long but must be at least {min} — use \
+         random data (32 random bytes hex-encoded, as `forward-auth init` \
+         generates), never a passphrase"
+    )]
+    KeyTooShort {
+        name: &'static str,
+        len: usize,
+        min: usize,
+    },
+
+    #[error(
         "config file `{path}` contains secret key material in `[global]` but \
          is readable by group or other (mode {mode:o}) — run `chmod 600 \
          {path}` or move the keys to environment variables instead"

@@ -1909,8 +1909,12 @@ async fn identity_headers_forwarded_when_enabled() {
     assert_eq!(resp.headers().get("x-auth-groups").unwrap(), "admins,users");
 }
 
+/// When forwarding is off the headers are still *present*, as empty
+/// values: Caddy's `copy_headers` only overwrites a client-supplied header
+/// when the auth response carries it (GHSA-7r4p-vjf4-gxv4), so an absent
+/// header would let the client's own `X-Auth-User` reach the backend.
 #[tokio::test]
-async fn identity_headers_absent_when_disabled() {
+async fn identity_headers_present_but_empty_when_disabled() {
     let (idp_base_url, _count, _tokens) = spawn_mock_idp(Duration::from_secs(3600)).await;
     let db_dir = tempfile::tempdir().unwrap();
     // spawn_app's default host has forward_identity_headers = false.
@@ -1932,7 +1936,13 @@ async fn identity_headers_absent_when_disabled() {
 
     let resp = browser.get(&app, "app.test.local", "/verify").await;
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
-    assert!(resp.headers().get("x-auth-user").is_none());
+    for name in ["x-auth-user", "x-auth-email", "x-auth-groups"] {
+        assert_eq!(
+            resp.headers().get(name).map(|v| v.as_bytes()),
+            Some(&b""[..]),
+            "{name} must be present and empty so copy_headers overwrites any client-supplied value"
+        );
+    }
 }
 
 #[tokio::test]
@@ -2189,15 +2199,26 @@ async fn bypass_path_skips_auth_entirely() {
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
 
-    // ...but the bypassed path skips auth entirely.
+    // ...but the bypassed path skips auth entirely — while still emitting
+    // empty identity headers, so a client can't smuggle its own X-Auth-*
+    // through to the backend on a bypassed path (see the
+    // identity_headers_present_but_empty_when_disabled test).
     let resp = reqwest::Client::new()
         .get(format!("{app}/verify"))
         .header("host", "app.test.local")
         .header("x-forwarded-uri", "/public/logo.svg")
+        .header("x-auth-user", "root")
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    for name in ["x-auth-user", "x-auth-email", "x-auth-groups"] {
+        assert_eq!(
+            resp.headers().get(name).map(|v| v.as_bytes()),
+            Some(&b""[..]),
+            "{name} must be present and empty on a bypassed path"
+        );
+    }
 }
 
 #[tokio::test]

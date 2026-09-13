@@ -75,6 +75,7 @@ pub struct ResolvedHost {
 }
 
 const DEFAULT_GROUP_CLAIM_NAME: &str = "groups";
+const MIN_KEY_BYTES: usize = 32;
 
 /// Load, resolve and validate the config file at `path`. Env vars
 /// `FORWARD_AUTH_COOKIE_KEY` / `FORWARD_AUTH_REFRESH_KEY` take precedence
@@ -197,6 +198,27 @@ fn resolve_global(raw: &RawConfig, path: &Path, errors: &mut Vec<ConfigError>) -
     {
         errors.push(ConfigError::KeysMustDiffer);
         ok = false;
+    }
+    // `cookie::Key::derive_from` panics below 32 bytes; catching it here
+    // turns that into a config error alongside everything else. It's a
+    // floor, not an entropy check — a 32-byte passphrase still passes.
+    for (name, key) in [
+        ("cookie_signing_key", &cookie_signing_key),
+        (
+            "refresh_token_encryption_key",
+            &refresh_token_encryption_key,
+        ),
+    ] {
+        if let Some(key) = key
+            && key.len() < MIN_KEY_BYTES
+        {
+            errors.push(ConfigError::KeyTooShort {
+                name,
+                len: key.len(),
+                min: MIN_KEY_BYTES,
+            });
+            ok = false;
+        }
     }
 
     let listen_addr = match raw.global.listen_addr.parse::<SocketAddr>() {
@@ -500,6 +522,26 @@ base_domain = "nonexistent.example.com"
                 .iter()
                 .any(|e| matches!(e, ConfigError::UnknownBaseDomain { .. }))
         );
+    }
+
+    #[test]
+    fn short_keys_are_rejected_with_a_config_error_not_a_panic() {
+        let file = write_config(
+            r#"
+[global]
+cookie_signing_key = "changeme"
+refresh_token_encryption_key = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+"#,
+        );
+        let errors = load(file.path()).expect_err("a short key must not load");
+        assert!(errors.iter().any(|e| matches!(
+            e,
+            ConfigError::KeyTooShort {
+                name: "cookie_signing_key",
+                len: 8,
+                ..
+            }
+        )));
     }
 
     #[test]
