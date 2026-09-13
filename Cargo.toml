@@ -8,17 +8,34 @@ anyhow = "1.0.104"
 askama = "0.16.1"
 askama_web = { version = "0.16.0", features = ["axum-0.8"] }
 axum = "0.8.9"
+axum-extra = { version = "0.12.6", features = ["cookie", "cookie-private"] }
+blake3 = "1.8.7"
+chacha20poly1305 = { version = "0.11.0", features = ["getrandom"] }
+chrono = "0.4.45"
 clap = { version = "4.6.6", features = ["derive"] }
+cookie = { version = "0.18.2", features = ["key-expansion"] }
 dialoguer = "0.12.0"
+openidconnect = "4.0.1"
 opentelemetry = "0.32.0"
 opentelemetry-appender-tracing = "0.32.0"
 opentelemetry-otlp = { version = "0.32.0", features = ["logs", "grpc-tonic"] }
 opentelemetry_sdk = { version = "0.32.1", features = ["logs", "rt-tokio"] }
 rand = "0.10.2"
 serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sqlx = { version = "0.9.0", default-features = false, features = [
+    "sqlite",
+    "runtime-tokio",
+    "migrate",
+    "chrono",
+] }
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["full"] }
 toml = "1.1.6"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["json", "env-filter"] }
 url = "2.5.8"
+
+[dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+tempfile = "3.27.0"

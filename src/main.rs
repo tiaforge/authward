@@ -1,12 +1,7 @@
-mod cli;
-mod config;
-mod logging;
-mod server;
-mod templates;
-
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
+use forward_auth::{config, logging, server};
 
 #[derive(Parser)]
 #[command(
@@ -38,7 +33,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Command::Init { output }) => cli::init::run(&output),
+        Some(Command::Init { output }) => forward_auth::cli::init::run(&output),
         None => run_server(&cli.config).await,
     }
 }
@@ -68,9 +63,12 @@ async fn run_server(config_path: &Path) -> anyhow::Result<()> {
         "config loaded"
     );
 
-    let app = server::build_router();
-    let listener = tokio::net::TcpListener::bind(cfg.global.listen_addr).await?;
-    tracing::info!(addr = %cfg.global.listen_addr, "listening");
+    let listen_addr = cfg.global.listen_addr;
+    let state = forward_auth::build_state(cfg).await?;
+
+    let app = server::build_router(state);
+    let listener = tokio::net::TcpListener::bind(listen_addr).await?;
+    tracing::info!(addr = %listen_addr, "listening");
 
     let result = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
