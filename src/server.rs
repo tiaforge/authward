@@ -1,7 +1,7 @@
 use axum::Router;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::routing::get;
+use axum::routing::{get, post};
 
 use crate::routes;
 use crate::state::AppState;
@@ -14,10 +14,12 @@ use crate::templates::ErrorPage;
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/", get(routes::overview))
         .route("/login", get(routes::login))
         .route("/token", get(routes::token))
         .route("/callback", get(routes::callback))
         .route("/verify", get(routes::verify))
+        .route("/sessions/revoke", post(routes::revoke_session))
         .fallback(not_found)
         .with_state(state)
 }

@@ -26,3 +26,23 @@ pub struct TokenPage<'a> {
     pub resource: &'a str,
     pub access_token: &'a str,
 }
+
+/// One row in the dashboard's session list (Phase 6).
+pub struct SessionRow {
+    pub id: String,
+    pub created_at: String,
+    pub user_agent: String,
+    pub is_current: bool,
+}
+
+/// The `/` overview page (Phase 6): who's logged in, their other active
+/// sessions on this base domain, and links to request an API token for
+/// any host that has one configured.
+#[derive(Template, WebTemplate)]
+#[template(path = "dashboard.html")]
+pub struct DashboardPage<'a> {
+    pub subject: &'a str,
+    pub email: Option<&'a str>,
+    pub sessions: Vec<SessionRow>,
+    pub token_hosts: Vec<&'a str>,
+}

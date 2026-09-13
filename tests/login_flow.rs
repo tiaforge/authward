@@ -499,6 +499,27 @@ impl Browser {
         self.absorb_set_cookies(&resp);
         resp
     }
+
+    async fn post_form(
+        &mut self,
+        app_base_url: &str,
+        host: &str,
+        path: &str,
+        form: &[(&str, &str)],
+    ) -> reqwest::Response {
+        let resp = self
+            .client
+            .post(format!("{app_base_url}{path}"))
+            .header("host", host)
+            .header("x-forwarded-proto", "http")
+            .header("cookie", self.cookie_header())
+            .form(form)
+            .send()
+            .await
+            .unwrap();
+        self.absorb_set_cookies(&resp);
+        resp
+    }
 }
 
 fn location(resp: &reqwest::Response) -> String {
@@ -1635,4 +1656,135 @@ async fn token_helper_rejects_a_host_with_no_resource_configured() {
         .get(&app, "auth.test.local", "/token?host=app.test.local")
         .await;
     assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+}
+
+// ---- Phase 6: overview / dashboard ---------------------------------------
+
+fn extract_hidden_input_value(html: &str, name: &str) -> Option<String> {
+    let marker = format!("name=\"{name}\" value=\"");
+    let start = html.find(&marker)? + marker.len();
+    let end = html[start..].find('"')? + start;
+    Some(html[start..end].to_string())
+}
+
+#[tokio::test]
+async fn dashboard_requires_authentication() {
+    let (idp_base_url, _count, _tokens) = spawn_mock_idp(Duration::from_secs(3600)).await;
+    let db_dir = tempfile::tempdir().unwrap();
+    let (app, _state) = spawn_app(&idp_base_url, &db_dir.path().join("sessions.db")).await;
+
+    let mut browser = Browser::new();
+    let resp = browser.get(&app, "auth.test.local", "/").await;
+    assert_eq!(resp.status(), reqwest::StatusCode::SEE_OTHER);
+    assert!(
+        location(&resp).contains("/login"),
+        "unauthenticated dashboard access should redirect to /login, got {}",
+        location(&resp)
+    );
+}
+
+#[tokio::test]
+async fn revoking_a_different_session_only_invalidates_that_one() {
+    let (idp_base_url, _count, _tokens) = spawn_mock_idp(Duration::from_secs(3600)).await;
+    let db_dir = tempfile::tempdir().unwrap();
+    let (app, _state) = spawn_app(&idp_base_url, &db_dir.path().join("sessions.db")).await;
+    let idp_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    // The same user, logged in from two separate "devices".
+    let mut browser_a = Browser::new();
+    login_as(
+        &app,
+        &idp_client,
+        &mut browser_a,
+        "alice",
+        "https://app.test.local/",
+    )
+    .await;
+    let mut browser_b = Browser::new();
+    login_as(
+        &app,
+        &idp_client,
+        &mut browser_b,
+        "alice",
+        "https://app.test.local/",
+    )
+    .await;
+
+    assert_eq!(
+        browser_a
+            .get(&app, "app.test.local", "/verify")
+            .await
+            .status(),
+        reqwest::StatusCode::OK
+    );
+    assert_eq!(
+        browser_b
+            .get(&app, "app.test.local", "/verify")
+            .await
+            .status(),
+        reqwest::StatusCode::OK
+    );
+
+    // From browser A's dashboard, find browser B's (the *other*, non-current) session id.
+    let dashboard = browser_a.get(&app, "auth.test.local", "/").await;
+    assert_eq!(dashboard.status(), reqwest::StatusCode::OK);
+    let html = dashboard.text().await.unwrap();
+    let other_session_id = extract_hidden_input_value(&html, "session_id")
+        .expect("dashboard should list the other device's session");
+
+    let resp = browser_a
+        .post_form(
+            &app,
+            "auth.test.local",
+            "/sessions/revoke",
+            &[("session_id", &other_session_id)],
+        )
+        .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::SEE_OTHER);
+
+    assert_eq!(
+        browser_b
+            .get(&app, "app.test.local", "/verify")
+            .await
+            .status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "the revoked device's session should no longer be valid"
+    );
+    assert_eq!(
+        browser_a
+            .get(&app, "app.test.local", "/verify")
+            .await
+            .status(),
+        reqwest::StatusCode::OK,
+        "revoking a different session must not affect the caller's own session"
+    );
+}
+
+#[tokio::test]
+async fn revoke_session_rejects_get() {
+    let (idp_base_url, _count, _tokens) = spawn_mock_idp(Duration::from_secs(3600)).await;
+    let db_dir = tempfile::tempdir().unwrap();
+    let (app, _state) = spawn_app(&idp_base_url, &db_dir.path().join("sessions.db")).await;
+    let idp_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    let mut browser = Browser::new();
+    login_as(
+        &app,
+        &idp_client,
+        &mut browser,
+        "alice",
+        "https://app.test.local/",
+    )
+    .await;
+
+    let resp = browser
+        .get(&app, "auth.test.local", "/sessions/revoke")
+        .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::METHOD_NOT_ALLOWED);
 }

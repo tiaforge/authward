@@ -124,20 +124,10 @@ pub async fn create_session(
     Ok(())
 }
 
-pub async fn get_session(pool: &SqlitePool, id: &str) -> anyhow::Result<Option<Session>> {
-    let row = sqlx::query(
-        "SELECT id, base_domain, subject, email, refresh_token_nonce, refresh_token_ciphertext, \
-                expires_at, created_at, user_agent, claims_json \
-         FROM sessions WHERE id = ?",
-    )
-    .bind(id)
-    .fetch_optional(pool)
-    .await?;
+const SESSION_COLUMNS: &str = "id, base_domain, subject, email, refresh_token_nonce, refresh_token_ciphertext, \
+     expires_at, created_at, user_agent, claims_json";
 
-    let Some(row) = row else {
-        return Ok(None);
-    };
-
+fn session_from_row(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<Session> {
     let nonce: Option<Vec<u8>> = row.try_get("refresh_token_nonce")?;
     let ciphertext: Option<Vec<u8>> = row.try_get("refresh_token_ciphertext")?;
     let refresh_token = match (nonce, ciphertext) {
@@ -146,7 +136,7 @@ pub async fn get_session(pool: &SqlitePool, id: &str) -> anyhow::Result<Option<S
     };
     let claims_json: String = row.try_get("claims_json")?;
 
-    Ok(Some(Session {
+    Ok(Session {
         id: row.try_get("id")?,
         base_domain: row.try_get("base_domain")?,
         subject: row.try_get("subject")?,
@@ -158,7 +148,40 @@ pub async fn get_session(pool: &SqlitePool, id: &str) -> anyhow::Result<Option<S
             .unwrap_or_default(),
         user_agent: row.try_get("user_agent")?,
         claims_json: serde_json::from_str(&claims_json).unwrap_or(serde_json::Value::Null),
-    }))
+    })
+}
+
+pub async fn get_session(pool: &SqlitePool, id: &str) -> anyhow::Result<Option<Session>> {
+    // Safe: the only dynamic part is the compile-time-constant column
+    // list, never user input.
+    let row = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SELECT {SESSION_COLUMNS} FROM sessions WHERE id = ?"
+    )))
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+
+    row.as_ref().map(session_from_row).transpose()
+}
+
+/// Every session belonging to `subject` on `base_domain`, newest first —
+/// the overview page's device list (Phase 6). Deliberately scoped to one
+/// base domain: sessions on a different base domain are a different
+/// login even for the same subject string (no SSO across base domains).
+pub async fn list_sessions_for_subject(
+    pool: &SqlitePool,
+    base_domain: &str,
+    subject: &str,
+) -> anyhow::Result<Vec<Session>> {
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SELECT {SESSION_COLUMNS} FROM sessions WHERE base_domain = ? AND subject = ? ORDER BY created_at DESC"
+    )))
+    .bind(base_domain)
+    .bind(subject)
+    .fetch_all(pool)
+    .await?;
+
+    rows.iter().map(session_from_row).collect()
 }
 
 pub async fn delete_session(pool: &SqlitePool, id: &str) -> anyhow::Result<()> {

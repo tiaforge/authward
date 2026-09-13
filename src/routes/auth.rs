@@ -9,7 +9,7 @@
 //! incidental (see the plan's security-review pass re: tinyauth
 //! CVE-2026-33544).
 
-use axum::extract::{Query, State};
+use axum::extract::{Form, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum_extra::extract::cookie::{Cookie, PrivateCookieJar, SameSite};
@@ -521,5 +521,138 @@ async fn bearer_auth(
             tracing::info!(%err, host = ?resolved_host.host, "bearer token rejected");
             StatusCode::UNAUTHORIZED.into_response()
         }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct RevokeParams {
+    session_id: String,
+}
+
+/// `/` overview page (Phase 6): who's logged in, their other active
+/// sessions on this base domain, and links to request an API token for
+/// any host that has one configured. Behind normal auth, exactly like a
+/// protected app — redirects to `/login` if there's no valid session.
+pub async fn overview(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    jar: PrivateCookieJar,
+) -> Response {
+    let Some(host) = resolve_incoming_host(&headers) else {
+        return error_page(
+            StatusCode::BAD_REQUEST,
+            "Bad request",
+            "Missing Host header.",
+        );
+    };
+    let Some(base_domain) = base_domain_for_auth_host(&state, &host) else {
+        return error_page(
+            StatusCode::BAD_GATEWAY,
+            "Unknown auth host",
+            "This host isn't configured as an auth subdomain for any base domain.",
+        );
+    };
+
+    let Some(session) = current_session(&state, &jar, &base_domain.name).await else {
+        return redirect_to_login(&base_domain.auth_subdomain);
+    };
+
+    let sessions =
+        match db::list_sessions_for_subject(&state.db, &base_domain.name, &session.subject).await {
+            Ok(sessions) => sessions,
+            Err(err) => {
+                tracing::error!(%err, "failed to list sessions for dashboard");
+                return error_page(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Error",
+                    "Could not load your sessions.",
+                );
+            }
+        };
+
+    let session_rows = sessions
+        .iter()
+        .map(|s| crate::templates::SessionRow {
+            id: s.id.clone(),
+            created_at: s.created_at.format("%Y-%m-%d %H:%M UTC").to_string(),
+            user_agent: s
+                .user_agent
+                .clone()
+                .unwrap_or_else(|| "unknown device".to_string()),
+            is_current: s.id == session.id,
+        })
+        .collect();
+
+    let token_hosts: Vec<&str> = state
+        .config
+        .hosts
+        .values()
+        .filter(|h| h.base_domain == base_domain.name && h.resource.is_some())
+        .filter_map(|h| h.host.as_deref())
+        .collect();
+
+    crate::templates::DashboardPage {
+        subject: &session.subject,
+        email: session.email.as_deref(),
+        sessions: session_rows,
+        token_hosts,
+    }
+    .into_response()
+}
+
+/// Logs out a *different* device (Phase 6) — deletes one session row by
+/// ID. POST-only (see the router) and scoped to the caller's own
+/// subject+base_domain, so a valid session lets you manage your own other
+/// sessions but never anyone else's, even by guessing an ID.
+pub async fn revoke_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    jar: PrivateCookieJar,
+    Form(params): Form<RevokeParams>,
+) -> Response {
+    let Some(host) = resolve_incoming_host(&headers) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Some(base_domain) = base_domain_for_auth_host(&state, &host) else {
+        return StatusCode::BAD_GATEWAY.into_response();
+    };
+
+    let Some(session) = current_session(&state, &jar, &base_domain.name).await else {
+        return redirect_to_login(&base_domain.auth_subdomain);
+    };
+
+    match db::get_session(&state.db, &params.session_id).await {
+        Ok(Some(target))
+            if target.subject == session.subject && target.base_domain == session.base_domain =>
+        {
+            if let Err(err) = db::delete_session(&state.db, &params.session_id).await {
+                tracing::error!(%err, "failed to revoke session");
+            }
+        }
+        Ok(_) => {
+            tracing::warn!(subject = %session.subject, "attempted to revoke a session that isn't theirs; ignoring");
+        }
+        Err(err) => tracing::error!(%err, "failed to look up session to revoke"),
+    }
+
+    Redirect::to(&format!("https://{}/", base_domain.auth_subdomain)).into_response()
+}
+
+fn redirect_to_login(auth_subdomain: &str) -> Response {
+    Redirect::to(&format!("https://{auth_subdomain}/login")).into_response()
+}
+
+/// Looks up the caller's own current session from their cookie, requiring
+/// it to be valid for `base_domain`. Used by the dashboard routes, which
+/// live on the auth subdomain itself rather than behind `forward_auth`.
+async fn current_session(
+    state: &AppState,
+    jar: &PrivateCookieJar,
+    base_domain: &str,
+) -> Option<crate::db::Session> {
+    let cookie = jar.get(SESSION_COOKIE_NAME)?;
+    match crate::session::verify_session(state, cookie.value(), base_domain).await {
+        crate::session::VerifyOutcome::Valid(session) => Some(session),
+        crate::session::VerifyOutcome::Invalid => None,
     }
 }
