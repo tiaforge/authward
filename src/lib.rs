@@ -37,6 +37,7 @@ pub async fn build_state(cfg: Config) -> anyhow::Result<AppState> {
 
     let mut oidc_clients = HashMap::new();
     let mut jwks_caches = HashMap::new();
+    let mut end_session_endpoints = HashMap::new();
     for (name, base_domain) in &cfg.base_domains {
         let redirect_uri =
             RedirectUrl::new(format!("https://{}/callback", base_domain.auth_subdomain))?;
@@ -46,6 +47,7 @@ pub async fn build_state(cfg: Config) -> anyhow::Result<AppState> {
             name.clone(),
             JwksCache::new(discovered.issuer, discovered.jwks_uri, discovered.jwks),
         );
+        end_session_endpoints.insert(name.clone(), discovered.end_session_endpoint);
         oidc_clients.insert(name.clone(), discovered.client);
     }
 
@@ -63,6 +65,7 @@ pub async fn build_state(cfg: Config) -> anyhow::Result<AppState> {
         refresh_cipher,
         oidc_clients,
         jwks_caches,
+        end_session_endpoints,
         http_client,
         session_locks: SessionLocks::new(),
     }))

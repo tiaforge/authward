@@ -1,3 +1,3 @@
 mod auth;
 
-pub use auth::{callback, login, overview, revoke_session, token, verify};
+pub use auth::{callback, logged_out, login, logout, overview, revoke_session, token, verify};

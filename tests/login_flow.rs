@@ -77,6 +77,9 @@ struct MockIdp {
     /// Artificial delay applied to refresh-token-grant requests only, to
     /// give tests a window in which a refresh is provably in-flight.
     refresh_delay: Duration,
+    /// Whether this mock advertises RP-Initiated Logout support (Phase
+    /// 8) via `end_session_endpoint` in its discovery document.
+    supports_end_session: bool,
 }
 
 #[derive(Deserialize)]
@@ -100,7 +103,7 @@ struct TokenParams {
 }
 
 async fn discovery(State(idp): State<MockIdp>) -> Json<serde_json::Value> {
-    Json(json!({
+    let mut doc = json!({
         "issuer": idp.base_url,
         "authorization_endpoint": format!("{}/authorize", idp.base_url),
         "token_endpoint": format!("{}/token", idp.base_url),
@@ -108,7 +111,25 @@ async fn discovery(State(idp): State<MockIdp>) -> Json<serde_json::Value> {
         "response_types_supported": ["code"],
         "subject_types_supported": ["public"],
         "id_token_signing_alg_values_supported": ["HS256"],
-    }))
+    });
+    if idp.supports_end_session {
+        doc["end_session_endpoint"] =
+            serde_json::Value::String(format!("{}/end-session", idp.base_url));
+    }
+    Json(doc)
+}
+
+#[derive(Deserialize)]
+struct EndSessionParams {
+    post_logout_redirect_uri: String,
+}
+
+/// A real IdP would end its own session here; the mock just honors the
+/// redirect. The test itself inspects /logout's own Location header
+/// (which points here) to confirm client_id was included, rather than
+/// asserting inside a background task where a panic wouldn't fail the test.
+async fn end_session(Query(params): Query<EndSessionParams>) -> impl IntoResponse {
+    Redirect::to(&params.post_logout_redirect_uri)
 }
 
 async fn jwks(
@@ -277,7 +298,7 @@ async fn spawn_mock_idp_with_refresh_delay(
     Arc<Mutex<HashMap<String, PendingAuth>>>,
 ) {
     let (base_url, refresh_grant_count, refresh_tokens, _hmac_key) =
-        spawn_mock_idp_full(access_token_ttl, refresh_delay).await;
+        spawn_mock_idp_full(access_token_ttl, refresh_delay, true).await;
     (base_url, refresh_grant_count, refresh_tokens)
 }
 
@@ -288,6 +309,7 @@ async fn spawn_mock_idp_with_refresh_delay(
 async fn spawn_mock_idp_full(
     access_token_ttl: Duration,
     refresh_delay: Duration,
+    supports_end_session: bool,
 ) -> (
     String,
     Arc<AtomicUsize>,
@@ -309,6 +331,7 @@ async fn spawn_mock_idp_full(
         refresh_grant_count: refresh_grant_count.clone(),
         access_token_ttl,
         refresh_delay,
+        supports_end_session,
     };
 
     let refresh_tokens = idp.refresh_tokens.clone();
@@ -317,6 +340,7 @@ async fn spawn_mock_idp_full(
         .route("/jwks", get(jwks))
         .route("/authorize", get(authorize))
         .route("/token", post(token))
+        .route("/end-session", get(end_session))
         .with_state(idp);
 
     tokio::spawn(async move {
@@ -1412,7 +1436,7 @@ fn api_host(
 #[tokio::test]
 async fn bearer_token_grants_access_for_matching_resource_and_scope() {
     let (idp_base_url, _count, _tokens, hmac_key) =
-        spawn_mock_idp_full(Duration::from_secs(3600), Duration::ZERO).await;
+        spawn_mock_idp_full(Duration::from_secs(3600), Duration::ZERO, true).await;
     let db_dir = tempfile::tempdir().unwrap();
     let mut cfg = base_config(&db_dir.path().join("sessions.db"));
     cfg.base_domains.insert(
@@ -1441,7 +1465,7 @@ async fn bearer_token_grants_access_for_matching_resource_and_scope() {
 #[tokio::test]
 async fn bearer_token_for_a_different_resource_is_rejected() {
     let (idp_base_url, _count, _tokens, hmac_key) =
-        spawn_mock_idp_full(Duration::from_secs(3600), Duration::ZERO).await;
+        spawn_mock_idp_full(Duration::from_secs(3600), Duration::ZERO, true).await;
     let db_dir = tempfile::tempdir().unwrap();
     let mut cfg = base_config(&db_dir.path().join("sessions.db"));
     cfg.base_domains.insert(
@@ -1471,7 +1495,7 @@ async fn bearer_token_for_a_different_resource_is_rejected() {
 #[tokio::test]
 async fn bearer_token_missing_required_scope_is_rejected() {
     let (idp_base_url, _count, _tokens, hmac_key) =
-        spawn_mock_idp_full(Duration::from_secs(3600), Duration::ZERO).await;
+        spawn_mock_idp_full(Duration::from_secs(3600), Duration::ZERO, true).await;
     let db_dir = tempfile::tempdir().unwrap();
     let mut cfg = base_config(&db_dir.path().join("sessions.db"));
     cfg.base_domains.insert(
@@ -1500,7 +1524,7 @@ async fn bearer_token_missing_required_scope_is_rejected() {
 #[tokio::test]
 async fn expired_bearer_token_is_rejected() {
     let (idp_base_url, _count, _tokens, hmac_key) =
-        spawn_mock_idp_full(Duration::from_secs(3600), Duration::ZERO).await;
+        spawn_mock_idp_full(Duration::from_secs(3600), Duration::ZERO, true).await;
     let db_dir = tempfile::tempdir().unwrap();
     let mut cfg = base_config(&db_dir.path().join("sessions.db"));
     cfg.base_domains.insert(
@@ -1529,7 +1553,7 @@ async fn expired_bearer_token_is_rejected() {
 #[tokio::test]
 async fn bearer_token_survives_idp_key_rotation() {
     let (idp_base_url, _count, _tokens, hmac_key) =
-        spawn_mock_idp_full(Duration::from_secs(3600), Duration::ZERO).await;
+        spawn_mock_idp_full(Duration::from_secs(3600), Duration::ZERO, true).await;
     let db_dir = tempfile::tempdir().unwrap();
     let mut cfg = base_config(&db_dir.path().join("sessions.db"));
     cfg.base_domains.insert(
@@ -1566,7 +1590,7 @@ async fn bearer_token_survives_idp_key_rotation() {
 #[tokio::test]
 async fn token_helper_scopes_the_request_to_the_selected_hosts_resource() {
     let (idp_base_url, _count, _tokens, _hmac_key) =
-        spawn_mock_idp_full(Duration::from_secs(3600), Duration::ZERO).await;
+        spawn_mock_idp_full(Duration::from_secs(3600), Duration::ZERO, true).await;
     let db_dir = tempfile::tempdir().unwrap();
     let mut cfg = base_config(&db_dir.path().join("sessions.db"));
     cfg.base_domains.insert(
@@ -1904,4 +1928,182 @@ async fn spoofed_identity_header_on_the_request_is_ignored() {
         "alice",
         "the response must never echo a client-supplied X-Auth-User"
     );
+}
+
+// ---- Phase 8: logout -----------------------------------------------------
+
+#[tokio::test]
+async fn logout_clears_session_with_no_idp_logout_support() {
+    let (idp_base_url, _count, _tokens, _hmac_key) =
+        spawn_mock_idp_full(Duration::from_secs(3600), Duration::ZERO, false).await;
+    let db_dir = tempfile::tempdir().unwrap();
+    let (app, _state) = spawn_app(&idp_base_url, &db_dir.path().join("sessions.db")).await;
+    let idp_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    let mut browser = Browser::new();
+    login_as(
+        &app,
+        &idp_client,
+        &mut browser,
+        "alice",
+        "https://app.test.local/",
+    )
+    .await;
+    assert_eq!(
+        browser
+            .get(&app, "app.test.local", "/verify")
+            .await
+            .status(),
+        reqwest::StatusCode::OK
+    );
+
+    let resp = browser
+        .post_form(&app, "auth.test.local", "/logout", &[])
+        .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::SEE_OTHER);
+    assert_eq!(
+        location(&resp),
+        "https://auth.test.local/logged-out",
+        "no IdP logout support should fall back to the local confirmation page"
+    );
+
+    assert_eq!(
+        browser
+            .get(&app, "app.test.local", "/verify")
+            .await
+            .status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "the session should be cleared after logout"
+    );
+}
+
+#[tokio::test]
+async fn logout_redirects_to_idp_end_session_endpoint_when_supported() {
+    let (idp_base_url, _count, _tokens, _hmac_key) =
+        spawn_mock_idp_full(Duration::from_secs(3600), Duration::ZERO, true).await;
+    let db_dir = tempfile::tempdir().unwrap();
+    let (app, _state) = spawn_app(&idp_base_url, &db_dir.path().join("sessions.db")).await;
+    let idp_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    let mut browser = Browser::new();
+    login_as(
+        &app,
+        &idp_client,
+        &mut browser,
+        "alice",
+        "https://app.test.local/",
+    )
+    .await;
+
+    let resp = browser
+        .post_form(&app, "auth.test.local", "/logout", &[])
+        .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::SEE_OTHER);
+    let redirect = location(&resp);
+    assert!(
+        redirect.starts_with(&format!("{idp_base_url}/end-session")),
+        "should redirect to the IdP's end_session_endpoint, got {redirect}"
+    );
+    assert_eq!(query_param(&redirect, "client_id"), CLIENT_ID);
+    assert_eq!(
+        query_param(&redirect, "post_logout_redirect_uri"),
+        "https://auth.test.local/logged-out"
+    );
+
+    // Follow through to the mock IdP, which redirects back to our local
+    // logged-out page, completing RP-initiated logout end to end.
+    let idp_resp = follow_real_redirect(&idp_client, &redirect).await;
+    assert_eq!(location(&idp_resp), "https://auth.test.local/logged-out");
+
+    assert_eq!(
+        browser
+            .get(&app, "app.test.local", "/verify")
+            .await
+            .status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn logout_honors_a_valid_rd_and_rejects_a_foreign_one() {
+    let (idp_base_url, _count, _tokens, _hmac_key) =
+        spawn_mock_idp_full(Duration::from_secs(3600), Duration::ZERO, false).await;
+    let db_dir = tempfile::tempdir().unwrap();
+    let (app, _state) = spawn_app(&idp_base_url, &db_dir.path().join("sessions.db")).await;
+    let idp_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    let mut browser = Browser::new();
+    login_as(
+        &app,
+        &idp_client,
+        &mut browser,
+        "alice",
+        "https://app.test.local/",
+    )
+    .await;
+    let resp = browser
+        .post_form(
+            &app,
+            "auth.test.local",
+            &format!("/logout?rd={}", urlencode("https://app.test.local/bye")),
+            &[],
+        )
+        .await;
+    assert_eq!(location(&resp), "https://app.test.local/bye");
+
+    let mut browser2 = Browser::new();
+    login_as(
+        &app,
+        &idp_client,
+        &mut browser2,
+        "alice",
+        "https://app.test.local/",
+    )
+    .await;
+    let resp = browser2
+        .post_form(
+            &app,
+            "auth.test.local",
+            &format!("/logout?rd={}", urlencode("https://evil.example/")),
+            &[],
+        )
+        .await;
+    assert_eq!(
+        location(&resp),
+        "https://auth.test.local/logged-out",
+        "a foreign rd must fall back to the local page, same as /login's guard"
+    );
+}
+
+#[tokio::test]
+async fn logout_rejects_get() {
+    let (idp_base_url, _count, _tokens) = spawn_mock_idp(Duration::from_secs(3600)).await;
+    let db_dir = tempfile::tempdir().unwrap();
+    let (app, _state) = spawn_app(&idp_base_url, &db_dir.path().join("sessions.db")).await;
+    let idp_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    let mut browser = Browser::new();
+    login_as(
+        &app,
+        &idp_client,
+        &mut browser,
+        "alice",
+        "https://app.test.local/",
+    )
+    .await;
+
+    let resp = browser.get(&app, "auth.test.local", "/logout").await;
+    assert_eq!(resp.status(), reqwest::StatusCode::METHOD_NOT_ALLOWED);
 }

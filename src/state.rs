@@ -25,6 +25,9 @@ pub struct AppStateInner {
     /// Keyed by base domain name too, but refreshable independently of
     /// `oidc_clients` — see `jwks_cache` module docs (Phase 5).
     pub jwks_caches: HashMap<String, JwksCache>,
+    /// Keyed by base domain name; `None` for a provider with no
+    /// RP-Initiated Logout support (Phase 8).
+    pub end_session_endpoints: HashMap<String, Option<url::Url>>,
     pub http_client: openidconnect::reqwest::Client,
     pub session_locks: SessionLocks,
 }

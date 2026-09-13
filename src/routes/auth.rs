@@ -711,3 +711,81 @@ async fn current_session(
         crate::session::VerifyOutcome::Invalid => None,
     }
 }
+
+#[derive(Deserialize)]
+pub struct LogoutParams {
+    rd: Option<String>,
+}
+
+/// `/logout` (Phase 8), POST-only (see the router — CSRF hardening,
+/// matching `/sessions/revoke`). Always clears the local session
+/// regardless of whether the provider supports RP-Initiated Logout;
+/// when it does (`end_session_endpoint` from discovery), the browser is
+/// sent there afterward so the IdP's own session ends too, rather than
+/// just ours.
+pub async fn logout(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<LogoutParams>,
+    jar: PrivateCookieJar,
+) -> Response {
+    let Some(host) = resolve_incoming_host(&headers) else {
+        return error_page(
+            StatusCode::BAD_REQUEST,
+            "Bad request",
+            "Missing Host header.",
+        );
+    };
+    let Some(base_domain) = base_domain_for_auth_host(&state, &host) else {
+        return error_page(
+            StatusCode::BAD_GATEWAY,
+            "Unknown auth host",
+            "This host isn't configured as an auth subdomain for any base domain.",
+        );
+    };
+
+    if let Some(cookie) = jar.get(SESSION_COOKIE_NAME)
+        && let Err(err) = db::delete_session(&state.db, cookie.value()).await
+    {
+        tracing::error!(%err, "failed to delete session on logout");
+    }
+
+    // Must match the Domain/Path the session cookie was originally set
+    // with, or the browser treats this as removing an unrelated
+    // host-only cookie and leaves the real one in place.
+    let removal_cookie = Cookie::build((SESSION_COOKIE_NAME, ""))
+        .domain(format!(".{}", base_domain.name))
+        .path("/")
+        .build();
+    let jar = jar.remove(removal_cookie);
+
+    // Same open-redirect validation as /login's rd — no separate, less
+    // strict path for logout's redirect target (Phase 8's locked-in
+    // decision, extending Phase 3's).
+    let local_logged_out_url = format!("https://{}/logged-out", base_domain.auth_subdomain);
+    let post_logout_target = params
+        .rd
+        .as_deref()
+        .and_then(|rd| validate_redirect_target(rd, &base_domain.name))
+        .unwrap_or(local_logged_out_url);
+
+    let redirect_url = match state.end_session_endpoints.get(&base_domain.name) {
+        Some(Some(end_session_endpoint)) => {
+            let mut url = end_session_endpoint.clone();
+            url.query_pairs_mut()
+                .append_pair("client_id", &base_domain.provider.client_id)
+                .append_pair("post_logout_redirect_uri", &post_logout_target);
+            url.to_string()
+        }
+        _ => post_logout_target,
+    };
+
+    (jar, Redirect::to(&redirect_url)).into_response()
+}
+
+/// Local "logged out" confirmation page (Phase 8) — the default
+/// post-logout redirect target when the provider has no RP-Initiated
+/// Logout support, or when `/logout` itself was reached without one.
+pub async fn logged_out() -> Response {
+    error_page(StatusCode::OK, "Logged out", "You have been signed out.")
+}

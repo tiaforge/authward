@@ -20,6 +20,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/callback", get(routes::callback))
         .route("/verify", get(routes::verify))
         .route("/sessions/revoke", post(routes::revoke_session))
+        .route("/logout", post(routes::logout))
+        .route("/logged-out", get(routes::logged_out))
         .fallback(not_found)
         .with_state(state)
 }

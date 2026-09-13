@@ -50,6 +50,12 @@ pub struct DiscoveredProvider {
     pub issuer: IssuerUrl,
     pub jwks_uri: JsonWebKeySetUrl,
     pub jwks: JsonWebKeySet<CoreJsonWebKey>,
+    /// RP-Initiated Logout 1.0's `end_session_endpoint` (Phase 8) — not
+    /// part of OIDC Core, so read directly out of the raw discovery JSON
+    /// rather than through `CoreProviderMetadata`, which doesn't model it.
+    /// `None` means the provider doesn't support it; logout then just
+    /// clears the local session, no IdP round trip.
+    pub end_session_endpoint: Option<url::Url>,
 }
 
 pub async fn discover(
@@ -82,6 +88,10 @@ pub async fn discover(
             provider.discovery_url
         )
     })?;
+    let end_session_endpoint = serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()
+        .and_then(|v| v.get("end_session_endpoint")?.as_str().map(str::to_string))
+        .and_then(|s| url::Url::parse(&s).ok());
 
     let issuer = metadata.issuer().clone();
     let jwks_uri = metadata.jwks_uri().clone();
@@ -102,6 +112,7 @@ pub async fn discover(
         issuer,
         jwks_uri,
         jwks,
+        end_session_endpoint,
     })
 }
 

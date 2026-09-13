@@ -17,6 +17,9 @@
 </head>
 <body>
   <h1>Signed in as {{ subject }}{% if let Some(email) = email %} ({{ email }}){% endif %}</h1>
+  <form method="post" action="/logout">
+    <button type="submit">Log out</button>
+  </form>
 
   <h2>Active sessions</h2>
   <table>
