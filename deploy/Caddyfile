@@ -1,0 +1,50 @@
+# Reference Caddyfile for forward-auth (Phase 10).
+#
+# Requires Caddy v2.6+ (the `forward_auth` directive with `copy_headers`
+# and `handle_response` support). Verified against Caddy v2.11.4.
+#
+# Two site blocks per base domain: one for the auth subdomain itself
+# (reverse-proxied straight to forward-auth, no forward_auth wrapper —
+# it hosts /login, /callback, /logout, /healthz, / directly), and one
+# per protected app (forward_auth in front of the real backend).
+#
+# IMPORTANT — trust boundary: forward-auth trusts X-Forwarded-Host and,
+# when forward_identity_headers is enabled for a host, forwards
+# X-Auth-User/X-Auth-Email/X-Auth-Groups based on it. Both this Caddy
+# instance and every backend app it proxies to MUST be unreachable
+# except through this Caddyfile's own network path — if a backend app is
+# directly reachable from anywhere else, a client can send its own
+# X-Auth-* headers straight to the backend and they'll never pass
+# through copy_headers' overwrite. Put Caddy and the backends on an
+# internal network (a Docker network, a private VPC, loopback-only
+# binds) with no other route in.
+
+auth.example.com {
+	reverse_proxy localhost:8080
+}
+
+app.example.com {
+	forward_auth localhost:8080 {
+		uri /verify
+
+		# Only needed if this host has forward_identity_headers = true
+		# in forward-auth's config; harmless (just copies nothing) if
+		# forward-auth never sets them for this host.
+		copy_headers X-Auth-User X-Auth-Email X-Auth-Groups
+
+		# forward_auth does NOT redirect on a non-2xx response by
+		# default — it aborts and relays the auth response's status/body
+		# verbatim to the client. That's exactly what we want for a 403
+		# (forward-auth's own "not authorized" page) and a 502 (its
+		# "misconfigured host" page), but a 401 ("not authenticated")
+		# needs to become a redirect to /login instead. {scheme}, {host}
+		# and {uri} are the *original* app request's — reconstructing
+		# the exact URL the user was trying to reach.
+		@denied status 401
+		handle_response @denied {
+			redir * https://auth.example.com/login?rd={scheme}://{host}{uri} 302
+		}
+	}
+
+	reverse_proxy localhost:9000
+}
