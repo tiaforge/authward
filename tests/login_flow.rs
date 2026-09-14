@@ -1783,6 +1783,94 @@ async fn bearer_token_grants_access_for_matching_resource_and_scope() {
 }
 
 #[tokio::test]
+async fn bearer_token_is_tried_when_the_session_cookie_is_stale_and_scheme_is_case_insensitive() {
+    // A script running on a machine whose browser once logged in sends a
+    // session cookie that may no longer be valid alongside its bearer
+    // token. The stale cookie must not shadow the token.
+    let (idp_base_url, _count, _tokens, hmac_key) =
+        spawn_mock_idp_full(Duration::from_secs(3600), Duration::ZERO, true).await;
+    let db_dir = tempfile::tempdir().unwrap();
+    let mut cfg = base_config(&db_dir.path().join("sessions.db"));
+    cfg.base_domains.insert(
+        "test.local".to_string(),
+        base_domain_block("test.local", "auth.test.local", &idp_base_url),
+    );
+    cfg.hosts.insert(
+        "api.test.local".to_string(),
+        api_host("https://api.test.local/", Some("read"), &idp_base_url),
+    );
+    cfg.hosts.insert(
+        "app.test.local".to_string(),
+        resolved_host("app.test.local", "test.local", &idp_base_url),
+    );
+    let (app, state) = spawn_app_with_config(cfg).await;
+    let idp_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    // A real, correctly encrypted session cookie whose row is then
+    // deleted out from under it — the shape of a logged-out-elsewhere or
+    // reaped session still sitting in a cookie jar.
+    let mut browser = Browser::new();
+    login_as(
+        &app,
+        &idp_client,
+        &mut browser,
+        "alice",
+        "https://app.test.local/",
+    )
+    .await;
+    let rows =
+        authgate::db::list_sessions_for_subject(&state.db, "test.local", "test.local", "alice")
+            .await
+            .unwrap();
+    authgate::db::delete_session(&state.db, &rows[0].id)
+        .await
+        .unwrap();
+    let stale_cookie = format!("authgate_session={}", browser.cookies["authgate_session"]);
+
+    let token = build_access_token(
+        &hmac_key.lock().unwrap(),
+        &idp_base_url,
+        "https://api.test.local/",
+        Some("read"),
+        3600,
+    );
+    let verify = |scheme: &'static str, with_cookie: bool| {
+        let app = app.clone();
+        let token = token.clone();
+        let stale_cookie = stale_cookie.clone();
+        async move {
+            let mut req = reqwest::Client::new()
+                .get(format!("{app}/verify"))
+                .header("host", "api.test.local")
+                .header("authorization", format!("{scheme} {token}"));
+            if with_cookie {
+                req = req.header("cookie", stale_cookie);
+            }
+            req.send().await.unwrap().status()
+        }
+    };
+
+    assert_eq!(
+        verify("Bearer", true).await,
+        reqwest::StatusCode::OK,
+        "a stale session cookie must not shadow a valid bearer token"
+    );
+    assert_eq!(
+        verify("bearer", false).await,
+        reqwest::StatusCode::OK,
+        "the auth scheme is case-insensitive (RFC 9110 §11.1)"
+    );
+    assert_eq!(
+        verify("Basic", false).await,
+        reqwest::StatusCode::UNAUTHORIZED,
+        "a different scheme is not a bearer token"
+    );
+}
+
+#[tokio::test]
 async fn bearer_token_for_a_different_resource_is_rejected() {
     let (idp_base_url, _count, _tokens, hmac_key) =
         spawn_mock_idp_full(Duration::from_secs(3600), Duration::ZERO, true).await;

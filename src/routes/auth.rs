@@ -649,11 +649,15 @@ pub async fn verify(
         return ok_with_identity("", "", "");
     }
 
+    // No usable session — no cookie at all, or one that no longer names a
+    // valid session for this host — falls back to a resource-scoped bearer
+    // token (Phase 5), for non-browser clients. A stale cookie must not
+    // shadow a good bearer token: a script on a machine whose browser
+    // profile once logged in would otherwise get 401s until that cookie
+    // expired. Unavailable for this host (no `resource` configured, or
+    // provider has no JWKS cache) is not an error — it just means there's
+    // nothing left to try, and `bearer_auth` answers with the same 401.
     let Some(cookie) = jar.get(SESSION_COOKIE_NAME) else {
-        // No session cookie: fall back to a resource-scoped bearer token
-        // (Phase 5), for non-browser clients. Unavailable for this host
-        // (no `resource` configured, or provider has no JWKS cache) is
-        // not an error — it just means there's nothing left to try.
         return bearer_auth(&state, &headers, &host, resolved_host).await;
     };
 
@@ -667,7 +671,7 @@ pub async fn verify(
     {
         crate::session::VerifyOutcome::Valid(session) => session,
         crate::session::VerifyOutcome::Invalid => {
-            return unauthorized(&state, &headers, &host, resolved_host);
+            return bearer_auth(&state, &headers, &host, resolved_host).await;
         }
     };
 
@@ -697,7 +701,8 @@ pub async fn verify(
 }
 
 /// Resource-scoped bearer-token bypass (Phase 5) for non-browser clients.
-/// Only reached when `/verify` found no session cookie at all.
+/// Reached when `/verify` found no session cookie, or one that doesn't
+/// name a valid session for this host.
 async fn bearer_auth(
     state: &AppState,
     headers: &HeaderMap,
@@ -710,10 +715,17 @@ async fn bearer_auth(
     let Some(cache) = state.jwks_caches.get(&resolved_host.provider_key) else {
         return unauthorized(state, headers, host, resolved_host);
     };
+    // RFC 9110 §11.1: the auth scheme is case-insensitive, so `bearer`
+    // and `BEARER` are the same scheme as `Bearer`.
     let Some(token) = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
+        .and_then(|v| {
+            let (scheme, rest) = v.split_once(' ')?;
+            scheme
+                .eq_ignore_ascii_case("bearer")
+                .then(|| rest.trim_start())
+        })
     else {
         return unauthorized(state, headers, host, resolved_host);
     };

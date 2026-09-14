@@ -70,9 +70,11 @@ curl -H "Authorization: Bearer $TOKEN" https://app.example.com/api/...
 ```
 
 authgate's `/verify` (which Caddy's `forward_auth` calls for every
-request) checks for a session cookie first; only if that's absent does
-it try the `Authorization` header as a bearer token. Validation is
-entirely local and stateless:
+request) checks for a valid session cookie first; if there is none — no
+cookie, or one whose session has since been logged out, revoked, or
+expired — it tries the `Authorization` header as a bearer token (the
+`Bearer` scheme name is case-insensitive). Validation is entirely local
+and stateless:
 
 1. JWT signature checked against the IdP's JWKS (cached, refreshed
    periodically; refreshed on demand once if a signature check fails,
