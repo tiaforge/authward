@@ -66,7 +66,16 @@ struct FlowState {
     provider_key: String,
     /// Set only for a `/token` flow (Phase 5): on success, `/callback`
     /// displays the access token once instead of creating a session.
-    resource: Option<String>,
+    token: Option<TokenFlow>,
+}
+
+/// What a `/token` flow needs to remember about its target host: the
+/// resource to request, and how to tell the user to send the token back.
+#[derive(Serialize, Deserialize)]
+struct TokenFlow {
+    resource: String,
+    host: String,
+    header: String,
 }
 
 fn error_page(status: StatusCode, title: &str, message: &str) -> Response {
@@ -294,7 +303,11 @@ pub async fn token(
         &headers,
         jar,
         None,
-        Some(resource),
+        Some(TokenFlow {
+            resource,
+            host: params.host.to_ascii_lowercase(),
+            header: target_host.token_header.clone(),
+        }),
         Some(target_host.provider_key.clone()),
     )
     .await
@@ -309,7 +322,7 @@ async fn start_authorization(
     headers: &HeaderMap,
     jar: PrivateCookieJar,
     rd: Option<String>,
-    resource: Option<String>,
+    token: Option<TokenFlow>,
     provider_key: Option<String>,
 ) -> Response {
     if let Some(response) = rate_limit_check(state, headers) {
@@ -368,10 +381,10 @@ async fn start_authorization(
         // rather than silently ignoring it.
         request = request.add_scope(Scope::new("groups".to_string()));
     }
-    if let Some(resource) = &resource {
+    if let Some(token) = &token {
         // RFC 8707 resource indicator, so the IdP scopes the issued
         // access token's audience to this specific resource.
-        request = request.add_extra_param("resource", resource.clone());
+        request = request.add_extra_param("resource", token.resource.clone());
     }
     let (auth_url, csrf_token, nonce) = request.url();
 
@@ -382,7 +395,7 @@ async fn start_authorization(
         rd,
         base_domain: base_domain.name.clone(),
         provider_key,
-        resource,
+        token,
     };
     let flow_json = match serde_json::to_string(&flow) {
         Ok(json) => json,
@@ -511,10 +524,10 @@ pub async fn callback(
 
     let mut token_request =
         token_request.set_pkce_verifier(PkceCodeVerifier::new(flow.pkce_verifier.clone()));
-    if let Some(resource) = &flow.resource {
+    if let Some(token) = &flow.token {
         // RFC 8707: include the resource indicator on the token request
         // too, not just the authorization request.
-        token_request = token_request.add_extra_param("resource", resource.clone());
+        token_request = token_request.add_extra_param("resource", token.resource.clone());
     }
 
     let token_response = match token_request.request_async(&state.http_client).await {
@@ -566,14 +579,19 @@ pub async fn callback(
         }
     };
 
-    if let Some(resource) = &flow.resource {
-        // /token flow (Phase 5): show the access token once, no session.
+    if let Some(token) = &flow.token {
+        // /token flow (Phase 5): show the access token once, no session,
+        // along with the exact header the host expects it in.
         let access_token = token_response.access_token().secret().clone();
+        let (header_name, header_value) = token_header_display(&token.header, &access_token);
         return (
             jar,
             [(axum::http::header::CACHE_CONTROL, "no-store")],
             crate::templates::TokenPage {
-                resource,
+                resource: &token.resource,
+                host: &token.host,
+                header_name: &header_name,
+                header_value: &header_value,
                 access_token: &access_token,
             },
         )
@@ -749,17 +767,10 @@ async fn bearer_auth(
         return unauthorized(state, headers, host, resolved_host);
     };
     let cache = &runtime.jwks;
-    // RFC 9110 §11.1: the auth scheme is case-insensitive, so `bearer`
-    // and `BEARER` are the same scheme as `Bearer`.
     let Some(token) = headers
-        .get(axum::http::header::AUTHORIZATION)
+        .get(resolved_host.token_header.as_str())
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| {
-            let (scheme, rest) = v.split_once(' ')?;
-            scheme
-                .eq_ignore_ascii_case("bearer")
-                .then(|| rest.trim_start())
-        })
+        .and_then(|v| extract_token(&resolved_host.token_header, v))
     else {
         return unauthorized(state, headers, host, resolved_host);
     };
@@ -808,6 +819,57 @@ async fn bearer_auth(
             unauthorized(state, headers, host, resolved_host)
         }
     }
+}
+
+/// Pulls the token out of the configured header's value. `Authorization`
+/// must use the `Bearer` scheme (RFC 9110 §11.1: scheme names are
+/// case-insensitive, so `bearer` and `BEARER` are the same scheme). Any
+/// other header carries the raw token — a leading `Bearer ` is tolerated
+/// there too, since people paste it out of habit and it's unambiguous.
+fn extract_token<'a>(header: &str, value: &'a str) -> Option<&'a str> {
+    let value = value.trim();
+    let bearer = value.split_once(' ').and_then(|(scheme, rest)| {
+        scheme
+            .eq_ignore_ascii_case("bearer")
+            .then(|| rest.trim_start())
+    });
+    let token = if header.eq_ignore_ascii_case("authorization") {
+        bearer?
+    } else {
+        bearer.unwrap_or(value)
+    };
+    (!token.is_empty()).then_some(token)
+}
+
+/// How the token page tells the user to send the token: the header name
+/// in conventional casing, and its full value — `Bearer <token>` for
+/// `Authorization`, the bare token for anything else.
+fn token_header_display(header: &str, access_token: &str) -> (String, String) {
+    let name = if header.eq_ignore_ascii_case("authorization") {
+        "Authorization".to_string()
+    } else if header.eq_ignore_ascii_case(crate::config::DEFAULT_TOKEN_HEADER) {
+        "X-Auth-Token".to_string()
+    } else {
+        // Capitalize each dash-separated word, e.g. `x-api-token` →
+        // `X-Api-Token`; header names are case-insensitive on the wire.
+        header
+            .split('-')
+            .map(|word| {
+                let mut chars = word.chars();
+                match chars.next() {
+                    Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
+                    None => String::new(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("-")
+    };
+    let value = if name == "Authorization" {
+        format!("Bearer {access_token}")
+    } else {
+        access_token.to_string()
+    };
+    (name, value)
 }
 
 const IDENTITY_HEADER_NAMES: [&str; 3] = ["x-auth-user", "x-auth-email", "x-auth-groups"];

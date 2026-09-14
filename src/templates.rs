@@ -24,6 +24,12 @@ pub struct ErrorPage<'a> {
 #[template(path = "token.html")]
 pub struct TokenPage<'a> {
     pub resource: &'a str,
+    /// The host the token is for, and the header it must be sent in on
+    /// every request to that host (`header_value` is the complete value,
+    /// `Bearer <token>` or the bare token depending on the header).
+    pub host: &'a str,
+    pub header_name: &'a str,
+    pub header_value: &'a str,
     pub access_token: &'a str,
 }
 

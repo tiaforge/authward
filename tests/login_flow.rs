@@ -454,6 +454,7 @@ fn resolved_host(host: &str, base_domain: &str, idp_base_url: &str) -> config::R
         forward_identity_headers: false,
         resource: None,
         required_scope: None,
+        token_header: "x-auth-token".to_string(),
     }
 }
 
@@ -1859,7 +1860,7 @@ async fn raw_verify_bearer(app: &str, host: &str, token: &str) -> reqwest::Statu
     reqwest::Client::new()
         .get(format!("{app}/verify"))
         .header("host", host)
-        .header("authorization", format!("Bearer {token}"))
+        .header("x-auth-token", token)
         .send()
         .await
         .unwrap()
@@ -1874,6 +1875,7 @@ fn api_host(
     config::ResolvedHost {
         resource: Some(resource.to_string()),
         required_scope: required_scope.map(str::to_string),
+        token_header: "x-auth-token".to_string(),
         ..resolved_host("api.test.local", "test.local", idp_base_url)
     }
 }
@@ -1962,7 +1964,7 @@ async fn bearer_token_is_tried_when_the_session_cookie_is_stale_and_scheme_is_ca
         Some("read"),
         3600,
     );
-    let verify = |scheme: &'static str, with_cookie: bool| {
+    let verify = |prefix: &'static str, with_cookie: bool| {
         let app = app.clone();
         let token = token.clone();
         let stale_cookie = stale_cookie.clone();
@@ -1970,7 +1972,7 @@ async fn bearer_token_is_tried_when_the_session_cookie_is_stale_and_scheme_is_ca
             let mut req = reqwest::Client::new()
                 .get(format!("{app}/verify"))
                 .header("host", "api.test.local")
-                .header("authorization", format!("{scheme} {token}"));
+                .header("x-auth-token", format!("{prefix}{token}"));
             if with_cookie {
                 req = req.header("cookie", stale_cookie);
             }
@@ -1979,19 +1981,104 @@ async fn bearer_token_is_tried_when_the_session_cookie_is_stale_and_scheme_is_ca
     };
 
     assert_eq!(
-        verify("Bearer", true).await,
+        verify("", true).await,
         reqwest::StatusCode::OK,
-        "a stale session cookie must not shadow a valid bearer token"
+        "a stale session cookie must not shadow a valid API token"
     );
     assert_eq!(
-        verify("bearer", false).await,
+        verify("Bearer ", false).await,
+        reqwest::StatusCode::OK,
+        "a pasted `Bearer ` prefix is tolerated in a non-Authorization header"
+    );
+    assert_eq!(
+        verify("Basic ", false).await,
+        reqwest::StatusCode::UNAUTHORIZED,
+        "anything else in front of the token is not the token"
+    );
+}
+
+#[tokio::test]
+async fn token_header_is_configurable_and_authorization_requires_the_bearer_scheme() {
+    let (idp_base_url, _count, _tokens, hmac_key) =
+        spawn_mock_idp_full(Duration::from_secs(3600), Duration::ZERO, true).await;
+    let db_dir = tempfile::tempdir().unwrap();
+    let mut cfg = base_config(&db_dir.path().join("sessions.db"));
+    cfg.base_domains.insert(
+        "test.local".to_string(),
+        base_domain_block("test.local", "auth.test.local", &idp_base_url),
+    );
+    cfg.hosts.insert(
+        "api.test.local".to_string(),
+        config::ResolvedHost {
+            token_header: "authorization".to_string(),
+            ..api_host("https://api.test.local/", Some("read"), &idp_base_url)
+        },
+    );
+    cfg.hosts.insert(
+        "custom.test.local".to_string(),
+        config::ResolvedHost {
+            host: Some("custom.test.local".to_string()),
+            token_header: "x-api-token".to_string(),
+            ..api_host("https://api.test.local/", Some("read"), &idp_base_url)
+        },
+    );
+    let (app, _state) = spawn_app_with_config(cfg).await;
+
+    let token = build_access_token(
+        &hmac_key.lock().unwrap(),
+        &idp_base_url,
+        "https://api.test.local/",
+        Some("read"),
+        3600,
+    );
+    let verify = |host: &'static str, header: &'static str, value: String| {
+        let app = app.clone();
+        async move {
+            reqwest::Client::new()
+                .get(format!("{app}/verify"))
+                .header("host", host)
+                .header(header, value)
+                .send()
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+
+    assert_eq!(
+        verify("api.test.local", "authorization", format!("Bearer {token}")).await,
+        reqwest::StatusCode::OK,
+        "token_header = \"Authorization\" reads a Bearer credential"
+    );
+    assert_eq!(
+        verify("api.test.local", "authorization", format!("bearer {token}")).await,
         reqwest::StatusCode::OK,
         "the auth scheme is case-insensitive (RFC 9110 §11.1)"
     );
     assert_eq!(
-        verify("Basic", false).await,
+        verify("api.test.local", "authorization", token.clone()).await,
         reqwest::StatusCode::UNAUTHORIZED,
-        "a different scheme is not a bearer token"
+        "a bare token in Authorization has no scheme and is not a bearer credential"
+    );
+    assert_eq!(
+        verify("api.test.local", "x-auth-token", token.clone()).await,
+        reqwest::StatusCode::UNAUTHORIZED,
+        "only the configured header is read"
+    );
+    assert_eq!(
+        verify("custom.test.local", "x-api-token", token.clone()).await,
+        reqwest::StatusCode::OK,
+        "a custom header name carries the raw token"
+    );
+    assert_eq!(
+        verify(
+            "custom.test.local",
+            "authorization",
+            format!("Bearer {token}")
+        )
+        .await,
+        reqwest::StatusCode::UNAUTHORIZED,
+        "Authorization is ignored when another header is configured — it's the app's to use"
     );
 }
 
@@ -2256,7 +2343,15 @@ async fn token_helper_scopes_the_request_to_the_selected_hosts_resource() {
     let body = resp.text().await.unwrap();
     assert!(
         body.contains("api.test.local"),
-        "page should name the resource the token is for"
+        "page should name the host the token is for"
+    );
+    assert!(
+        body.contains("X-Auth-Token"),
+        "page should tell the user which header to send the token in"
+    );
+    assert!(
+        !body.contains("Bearer"),
+        "with the default header the value is the bare token, no scheme word"
     );
 }
 

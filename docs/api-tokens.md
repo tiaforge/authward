@@ -71,18 +71,26 @@ token URL is `https://<that domain's auth_subdomain>/token?host=...`.
 Asking `auth.example.com` for a token for a host on `other.com` returns
 a 400 ("Wrong auth domain").
 
+The confirmation page also names the exact header to send the token in
+for that host — by default `X-Auth-Token` with the bare token as its
+value, so a user never has to know what "Bearer" means.
+
 ## 4. Call the API
 
 ```sh
-curl -H "Authorization: Bearer $TOKEN" https://app.example.com/api/...
+curl -H "X-Auth-Token: $TOKEN" https://app.example.com/api/...
 ```
 
 authward's `/verify` (which Caddy's `forward_auth` calls for every
 request) checks for a valid session cookie first; if there is none — no
 cookie, or one whose session has since been logged out, revoked, or
-expired — it tries the `Authorization` header as a bearer token (the
-`Bearer` scheme name is case-insensitive). Validation is entirely local
-and stateless:
+expired — it reads the token from the host's `token_header`. Only that
+header is looked at. With the default `X-Auth-Token`, the value is the
+token itself (a pasted leading `Bearer ` is tolerated). Set
+`token_header = "Authorization"` on a host to read a conventional
+`Authorization: Bearer <token>` instead; there the `Bearer` scheme is
+required (and case-insensitive, per RFC 9110). Validation is entirely
+local and stateless:
 
 1. JWT signature checked against the IdP's JWKS (cached, refreshed
    periodically; refreshed on demand once if a signature check fails,
@@ -98,6 +106,32 @@ and stateless:
 
 Any failure is a `401` (or `403` for the group check specifically),
 logged with the reason — see the [runbook](runbook.md).
+
+## Apps that use `Authorization` themselves (e.g. Immich)
+
+Some apps authenticate their own clients with `Authorization: Bearer`
+— Immich's mobile app sends its Immich session token that way on every
+API call. That token isn't an IdP-issued JWT, so if authward read the
+same header it would reject every request, and an authward token in
+that header would break the app's own login. This is why the default
+`token_header` is `X-Auth-Token`: the app keeps `Authorization`, and
+authward's token travels in its own header alongside it.
+
+For Immich specifically:
+
+1. Configure the Immich host with a `resource` as above (keep the
+   default `token_header`).
+2. Each user visits `https://auth.example.com/` and requests a token for
+   the Immich host. The page shows `X-Auth-Token: <token>`.
+3. In the Immich mobile app, open *Settings → Advanced → Custom proxy
+   headers* and add a header named `X-Auth-Token` with the token as its
+   value. The app then sends it with every request, and authward
+   accepts those while Immich continues to handle its own login.
+
+The token expires on the IdP's access-token TTL for that resource;
+when the app starts failing, fetch a new one from the overview page and
+update the header. If that's too frequent, raise the TTL for the
+resource at the IdP.
 
 ## Revocation
 

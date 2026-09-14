@@ -96,6 +96,7 @@ pub struct RawHost {
     pub forward_identity_headers: Option<bool>,
     pub resource: Option<String>,
     pub required_scope: Option<String>,
+    pub token_header: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -109,4 +110,5 @@ pub struct RawFallback {
     pub forward_identity_headers: Option<bool>,
     pub resource: Option<String>,
     pub required_scope: Option<String>,
+    pub token_header: Option<String>,
 }

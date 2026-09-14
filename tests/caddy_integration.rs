@@ -267,6 +267,7 @@ async fn full_flow_through_real_caddy() {
             forward_identity_headers: true,
             resource: None,
             required_scope: None,
+            token_header: "x-auth-token".to_string(),
         },
     );
     let db_dir = tempfile::tempdir().unwrap();

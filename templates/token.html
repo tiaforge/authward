@@ -10,19 +10,26 @@
 <body>
   <main class="narrow">
     <header>
-      <div class="brand">authgate</div>
+      <div class="brand">authward</div>
       <a class="back" href="/">&larr; Account</a>
     </header>
 
     <section class="card identity">
       <div>
         <p class="label">API token for</p>
-        <h1><code>{{ resource }}</code></h1>
+        <h1><code>{{ host }}</code></h1>
         <p class="notice">This token is shown once and is not stored anywhere &mdash; copy it now. Reloading this page will request a new one.</p>
         <textarea id="token" rows="6" readonly>{{ access_token }}</textarea>
         <div class="toolbar">
           <button class="primary" type="button" onclick="navigator.clipboard.writeText(document.getElementById('token').value)">Copy to clipboard</button>
         </div>
+        <p class="label">How to use it</p>
+        <p>Send it on every request to <code>{{ host }}</code> in a header named <code>{{ header_name }}</code>. In an app that lets you add custom headers, enter that name and paste the token as the value:</p>
+        <pre class="example"><code>{{ header_name }}: <span id="header-value">{{ header_value }}</span></code></pre>
+        <div class="toolbar">
+          <button type="button" onclick="navigator.clipboard.writeText(document.getElementById('header-value').textContent)">Copy header value</button>
+        </div>
+        <p class="hint">The token is scoped to <code>{{ resource }}</code> and expires on the identity provider's schedule. Come back here for a new one when it stops working.</p>
       </div>
     </section>
   </main>

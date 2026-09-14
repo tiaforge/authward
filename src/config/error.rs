@@ -62,6 +62,13 @@ pub enum ConfigError {
     )]
     BypassPathHasQueryOrFragment { host: String, path: String },
 
+    #[error("host `{host}`: `token_header` `{header}` can't be used: {reason}")]
+    InvalidTokenHeader {
+        host: String,
+        header: String,
+        reason: &'static str,
+    },
+
     #[error(
         "global: `cookie_signing_key` is not set — provide it in `[global]` \
          or via the `AUTHWARD_COOKIE_KEY` environment variable"

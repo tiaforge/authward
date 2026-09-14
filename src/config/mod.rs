@@ -118,9 +118,16 @@ pub struct ResolvedHost {
     pub forward_identity_headers: bool,
     pub resource: Option<String>,
     pub required_scope: Option<String>,
+    /// The request header an API token is read from (lowercased; header
+    /// names are case-insensitive). Defaults to `X-Auth-Token`, carrying
+    /// the raw token. Apps like Immich use `Authorization` for their own
+    /// session token, so the default keeps out of that header's way. When
+    /// this *is* `authorization`, the value must use the `Bearer` scheme.
+    pub token_header: String,
 }
 
 const DEFAULT_GROUP_CLAIM_NAME: &str = "groups";
+pub const DEFAULT_TOKEN_HEADER: &str = "x-auth-token";
 const MIN_KEY_BYTES: usize = 32;
 
 /// Load, resolve and validate the config file at `path`. Env vars
@@ -381,6 +388,36 @@ fn validate_bypass_path(host: &str, path: &str, errors: &mut Vec<ConfigError>) {
     }
 }
 
+/// A token header must be a syntactically valid header name, and not one
+/// whose meaning is already taken: `Cookie` carries the session cookie
+/// and `Host` drives config lookup, so neither can carry a token.
+fn resolve_token_header(host: &str, raw: Option<&str>, errors: &mut Vec<ConfigError>) -> String {
+    let Some(raw) = raw else {
+        return DEFAULT_TOKEN_HEADER.to_string();
+    };
+    let name = raw.trim().to_ascii_lowercase();
+    let reason = if name.is_empty() {
+        Some("it is empty")
+    } else if axum::http::HeaderName::from_bytes(name.as_bytes()).is_err() {
+        Some("it is not a valid HTTP header name")
+    } else if matches!(
+        name.as_str(),
+        "cookie" | "host" | "x-forwarded-host" | "x-forwarded-uri"
+    ) {
+        Some("that header already has a meaning for authward")
+    } else {
+        None
+    };
+    if let Some(reason) = reason {
+        errors.push(ConfigError::InvalidTokenHeader {
+            host: host.to_string(),
+            header: raw.to_string(),
+            reason,
+        });
+    }
+    name
+}
+
 fn resolve_host(
     host_name: &str,
     raw: &RawHost,
@@ -411,6 +448,7 @@ fn resolve_host(
     for path in &raw.bypass_paths {
         validate_bypass_path(host_name, path, &mut errors);
     }
+    let token_header = resolve_token_header(host_name, raw.token_header.as_deref(), &mut errors);
 
     if !errors.is_empty() {
         return Err(errors);
@@ -435,6 +473,7 @@ fn resolve_host(
         forward_identity_headers: raw.forward_identity_headers.unwrap_or(false),
         resource: raw.resource.clone(),
         required_scope: raw.required_scope.clone(),
+        token_header,
     })
 }
 
@@ -466,6 +505,7 @@ fn resolve_fallback(
     for path in &raw.bypass_paths {
         validate_bypass_path("<fallback>", path, &mut errors);
     }
+    let token_header = resolve_token_header("<fallback>", raw.token_header.as_deref(), &mut errors);
 
     if !errors.is_empty() {
         return Err(errors);
@@ -490,6 +530,7 @@ fn resolve_fallback(
         forward_identity_headers: raw.forward_identity_headers.unwrap_or(false),
         resource: raw.resource.clone(),
         required_scope: raw.required_scope.clone(),
+        token_header,
     })
 }
 
@@ -584,6 +625,70 @@ base_domain = "Example.COM"
         let file = write_config("this is not [ valid toml");
         let errors = load(file.path()).expect_err("malformed TOML must not load");
         assert!(matches!(errors.as_slice(), [ConfigError::Parse { .. }]));
+    }
+
+    #[test]
+    fn token_header_defaults_and_rejects_reserved_or_malformed_names() {
+        let ok = write_config(
+            r#"
+[global]
+cookie_signing_key = "1111111111111111111111111111111111111111111111111111111111111111"
+refresh_token_encryption_key = "2222222222222222222222222222222222222222222222222222222222222222"
+sqlite_path = "/tmp/x.db"
+
+[base_domain."example.com"]
+auth_subdomain = "auth.example.com"
+
+[base_domain."example.com".provider]
+discovery_url = "https://idp.example.com/.well-known/openid-configuration"
+client_id = "c"
+client_secret = "s"
+
+[host."app.example.com"]
+base_domain = "example.com"
+
+[host."api.example.com"]
+base_domain = "example.com"
+resource = "https://api.example.com/"
+token_header = "Authorization"
+"#,
+        );
+        let cfg = load(ok.path()).expect("valid token_header config should load");
+        assert_eq!(
+            cfg.hosts["app.example.com"].token_header,
+            DEFAULT_TOKEN_HEADER
+        );
+        assert_eq!(cfg.hosts["api.example.com"].token_header, "authorization");
+
+        for bad in ["Cookie", "host", "not a header", ""] {
+            let file = write_config(&format!(
+                r#"
+[global]
+cookie_signing_key = "1111111111111111111111111111111111111111111111111111111111111111"
+refresh_token_encryption_key = "2222222222222222222222222222222222222222222222222222222222222222"
+sqlite_path = "/tmp/x.db"
+
+[base_domain."example.com"]
+auth_subdomain = "auth.example.com"
+
+[base_domain."example.com".provider]
+discovery_url = "https://idp.example.com/.well-known/openid-configuration"
+client_id = "c"
+client_secret = "s"
+
+[host."api.example.com"]
+base_domain = "example.com"
+token_header = "{bad}"
+"#
+            ));
+            let errors = load(file.path()).expect_err("bad token_header must not load");
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| matches!(e, ConfigError::InvalidTokenHeader { .. })),
+                "token_header {bad:?} should be rejected, got {errors:?}"
+            );
+        }
     }
 
     #[test]
