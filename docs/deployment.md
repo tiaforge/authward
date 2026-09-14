@@ -92,6 +92,20 @@ WantedBy=multi-user.target
 Run it as a dedicated non-root user that owns its config and database
 directory — nothing here needs root.
 
+### Startup and IdP availability
+
+Every configured provider is discovered at startup (its
+`.well-known/openid-configuration` and JWKS are fetched). A provider
+whose IdP can't be reached is logged as an error and retried in the
+background every 30 seconds; its hosts answer with a "Provider
+unavailable" page at `/login` (and a plain 401 for bearer tokens) until
+the retry succeeds, while every other provider's hosts serve normally.
+So a restart during one IdP's outage doesn't take the others down with
+it. If *no* provider can be discovered, authgate refuses to start and
+prints every failure — with nothing to serve, a config mistake is the
+likelier explanation than an outage, and a crash-loop under systemd's
+`Restart=on-failure` is the right way to keep trying.
+
 ### Login rate limiting
 
 `/login`, `/token` and `/callback` share a per-client-IP token bucket:
@@ -191,5 +205,8 @@ Per the plan's "Deferred" list: no multi-instance/shared session state,
 no zero-downtime key rotation (rotating `cookie_signing_key` or
 `refresh_token_encryption_key` invalidates all existing sessions — see
 the [runbook](runbook.md)'s rotation section for the safe procedure), no
-retry/backoff if the IdP is unreachable at login (you get a plain error
-page), and no central "logout everywhere" across multiple base domains.
+retry/backoff if the IdP is unreachable during a login or refresh (you
+get a plain error page; only startup discovery is retried), no buffering
+of a non-GET request body across a login redirect (a plain "please
+resubmit" page instead), and no central "logout everywhere" across
+multiple base domains.

@@ -86,13 +86,15 @@ useless as a cookie.
 
 | What you're chasing | Look for | Key fields |
 |---|---|---|
-| Denied at `/verify` for a browser session | `"session presented against the wrong base domain"`, `"session was established at a different provider than this host uses"`, `"session past its absolute max age; clearing"`, `"no OIDC client for session's provider; clearing session"`, `"denied: missing required group"` | `session_id`, `subject`, `host`, `required_group`, `session_provider` / `expected_provider` |
+| Denied at `/verify` for a browser session | `"session presented against the wrong base domain"`, `"session was established at a different provider than this host uses"`, `"session past its absolute max age; clearing"`, `"session's provider is not available; clearing session"`, `"denied: missing required group"` | `session_id`, `subject`, `host`, `required_group`, `session_provider` / `expected_provider` |
 | Denied at `/verify` for a bearer token | `"bearer token rejected"` (validation failure — bad signature, wrong audience, expired, missing scope), `"bearer token denied: missing required group"` | `err`, `host`, `required_group` |
 | Silent refresh failing | `"refresh failed; clearing session"`, `"failed to decrypt stored refresh token"`, `"refreshed id_token failed verification; clearing session"` | `session_id`, `err` |
 | CSRF / stale flow cookie at `/callback` | `"callback state mismatch — possible CSRF or stale flow cookie"` | (no session_id yet at this point — it's pre-login) |
 | IdP returned an error at `/callback` | `"identity provider returned an error"` | `error`, `description` |
 | Config problem at startup | printed to stderr, not through the logger — `authgate: N config error(s) found in <path>` followed by every error | — |
-| JWKS refresh failing (bearer validation may start failing if this persists) | `"periodic JWKS refresh failed"` | `base_domain`, `err` |
+| IdP unreachable at startup (its hosts show "Provider unavailable" until this clears) | `"OIDC provider discovery failed; will retry in the background"`, then `"OIDC provider discovery still failing"` every 30s, and `"OIDC provider discovered after earlier failure; now serving"` once it recovers. If no provider at all was reachable the process exits instead, with `no OIDC provider could be discovered` on stderr. | `provider_key`, `discovery_url`, `err` |
+| Login refused because its provider is still undiscovered | `"login refused: provider not yet discovered"` | `provider_key` |
+| JWKS refresh failing (bearer validation may start failing if this persists) | `"periodic JWKS refresh failed"` | `provider_key`, `err` |
 | Rate limited | `"rate limit exceeded on login/callback"` | `ip` |
 | Reaper activity (informational, not a failure) | `"reaper: swept expired sessions"` | `reaped` (count) |
 

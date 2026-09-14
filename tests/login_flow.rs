@@ -322,6 +322,29 @@ async fn spawn_mock_idp_full(
     Arc<Mutex<CoreHmacKey>>,
 ) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    spawn_mock_idp_on(
+        listener,
+        access_token_ttl,
+        refresh_delay,
+        supports_end_session,
+    )
+    .await
+}
+
+/// `spawn_mock_idp_full` on a caller-supplied listener — for tests that
+/// need the IdP to appear at an address authgate already knows about
+/// (a provider that was down at startup).
+async fn spawn_mock_idp_on(
+    listener: tokio::net::TcpListener,
+    access_token_ttl: Duration,
+    refresh_delay: Duration,
+    supports_end_session: bool,
+) -> (
+    String,
+    Arc<AtomicUsize>,
+    Arc<Mutex<HashMap<String, PendingAuth>>>,
+    Arc<Mutex<CoreHmacKey>>,
+) {
     let base_url = format!("http://{}", listener.local_addr().unwrap());
 
     let refresh_grant_count = Arc::new(AtomicUsize::new(0));
@@ -1485,6 +1508,108 @@ async fn per_host_provider_override_is_honored() {
         location(&resp).starts_with(&format!("{idp_b}/end-session")),
         "logout must go to the session's own IdP, got {}",
         location(&resp)
+    );
+}
+
+/// A loopback address with nothing listening on it: bound to pick a free
+/// port, then released. Connections to it are refused until a test
+/// re-binds it.
+async fn reserve_dead_address() -> std::net::SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    listener.local_addr().unwrap()
+}
+
+#[tokio::test]
+async fn startup_fails_when_no_provider_can_be_discovered() {
+    let dead = reserve_dead_address().await;
+    let db_dir = tempfile::tempdir().unwrap();
+    let mut cfg = base_config(&db_dir.path().join("sessions.db"));
+    cfg.base_domains.insert(
+        "test.local".to_string(),
+        base_domain_block("test.local", "auth.test.local", &format!("http://{dead}")),
+    );
+    let err = authgate::build_state(cfg)
+        .await
+        .err()
+        .expect("startup must fail when the only provider is unreachable");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("no OIDC provider could be discovered") && msg.contains("test.local"),
+        "error should say what failed: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn a_down_provider_does_not_block_startup_and_is_picked_up_later() {
+    let (idp_a, _count_a, _tokens_a) = spawn_mock_idp(Duration::from_secs(3600)).await;
+    let dead = reserve_dead_address().await;
+    let idp_b = format!("http://{dead}");
+    let db_dir = tempfile::tempdir().unwrap();
+    let mut cfg = base_config(&db_dir.path().join("sessions.db"));
+    cfg.base_domains.insert(
+        "test.local".to_string(),
+        base_domain_block("test.local", "auth.test.local", &idp_a),
+    );
+    cfg.hosts.insert(
+        "app.test.local".to_string(),
+        resolved_host("app.test.local", "test.local", &idp_a),
+    );
+    cfg.hosts.insert(
+        "partner.test.local".to_string(),
+        config::ResolvedHost {
+            provider: test_provider(&idp_b),
+            provider_key: "host:partner.test.local".to_string(),
+            ..resolved_host("partner.test.local", "test.local", &idp_a)
+        },
+    );
+    // IdP B is down: startup must still succeed for IdP A's hosts.
+    let (app, state) = spawn_app_with_config(cfg).await;
+    let idp_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    let mut browser = Browser::new();
+    assert_eq!(
+        login_as(
+            &app,
+            &idp_client,
+            &mut browser,
+            "alice",
+            "https://app.test.local/"
+        )
+        .await,
+        "https://app.test.local/",
+        "hosts on the reachable provider work normally"
+    );
+
+    let partner_login = format!("/login?rd={}", urlencode("https://partner.test.local/"));
+    let resp = browser.get(&app, "auth.test.local", &partner_login).await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::BAD_GATEWAY,
+        "a login at the down provider is a clear error, not a hang or a crash"
+    );
+    assert!(resp.text().await.unwrap().contains("Provider unavailable"));
+
+    // A bearer token for the partner host can't be validated either — its
+    // JWKS was never fetched — and that's a plain 401, not a 500.
+    assert_eq!(
+        raw_verify_bearer(&app, "partner.test.local", "eyJhbGciOiJIUzI1NiJ9.e30.x").await,
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+
+    // IdP B comes up at the address authgate was configured with; the
+    // retry loop's body picks it up and partner logins start working.
+    let listener = tokio::net::TcpListener::bind(dead).await.unwrap();
+    let _idp_b = spawn_mock_idp_on(listener, Duration::from_secs(3600), Duration::ZERO, true).await;
+    assert_eq!(authgate::discover_missing_providers(&state).await, 0);
+
+    let resp = browser.get(&app, "auth.test.local", &partner_login).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::SEE_OTHER);
+    assert!(
+        location(&resp).starts_with(&idp_b),
+        "once discovered, the partner host's login goes to its own IdP"
     );
 }
 

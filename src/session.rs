@@ -123,11 +123,16 @@ pub async fn verify_session(
 }
 
 async fn refresh(state: &AppState, mut session: Session) -> VerifyOutcome {
-    let Some(oidc_client) = state.oidc_clients.get(&session.provider_key) else {
-        tracing::warn!(session_id = %log_id(&session.id), provider_key = %session.provider_key, "no OIDC client for session's provider; clearing session");
+    // A provider that's still undiscovered (IdP down since startup) can't
+    // refresh anything; ending the session sends the user to /login,
+    // which reports the provider as unavailable. Same outcome as an IdP
+    // that's down mid-refresh, just one step earlier.
+    let Some(runtime) = state.provider_runtime(&session.provider_key) else {
+        tracing::warn!(session_id = %log_id(&session.id), provider_key = %session.provider_key, "session's provider is not available; clearing session");
         clear(state, &session.id).await;
         return VerifyOutcome::Invalid;
     };
+    let oidc_client = &runtime.client;
 
     let refresh_token = match session.decrypt_refresh_token(&state.refresh_cipher) {
         Ok(Some(token)) => token,

@@ -12,6 +12,9 @@ const REAPER_INTERVAL: Duration = Duration::from_secs(300);
 const JWKS_REFRESH_INTERVAL: Duration = Duration::from_secs(900);
 /// How often idle per-IP rate-limit buckets are pruned (Phase 9).
 const RATE_LIMIT_PRUNE_INTERVAL: Duration = Duration::from_secs(600);
+/// How often discovery is retried for a provider whose IdP was
+/// unreachable at startup.
+const DISCOVERY_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Parser)]
 #[command(name = "authgate", version, about = "Authgate OIDC login service")]
@@ -93,6 +96,7 @@ async fn run_server(config_path: &Path) -> anyhow::Result<()> {
     authgate::session::spawn_reaper(state.clone(), REAPER_INTERVAL);
     authgate::jwks_cache::spawn_periodic_refresh(state.clone(), JWKS_REFRESH_INTERVAL);
     authgate::ratelimit::spawn_periodic_prune(state.clone(), RATE_LIMIT_PRUNE_INTERVAL);
+    authgate::spawn_discovery_retry(state.clone(), DISCOVERY_RETRY_INTERVAL);
 
     let app = server::build_router(state);
     let listener = tokio::net::TcpListener::bind(listen_addr).await?;

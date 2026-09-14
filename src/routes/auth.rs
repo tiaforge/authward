@@ -338,13 +338,15 @@ async fn start_authorization(
 
     let provider_key =
         provider_key.unwrap_or_else(|| provider_key_for_redirect(state, &rd, base_domain));
-    let Some(oidc_client) = state.oidc_clients.get(&provider_key) else {
+    let Some(runtime) = state.provider_runtime(&provider_key) else {
+        tracing::warn!(provider_key, "login refused: provider not yet discovered");
         return error_page(
             StatusCode::BAD_GATEWAY,
             "Provider unavailable",
-            "The identity provider for this domain could not be reached at startup.",
+            "The identity provider for this site can't be reached right now. Please try again in a minute.",
         );
     };
+    let oidc_client = &runtime.client;
 
     let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
 
@@ -475,7 +477,7 @@ pub async fn callback(
         );
     };
 
-    let Some(oidc_client) = state.oidc_clients.get(&flow.provider_key) else {
+    let Some(runtime) = state.provider_runtime(&flow.provider_key) else {
         return error_page_clearing_flow(
             jar,
             StatusCode::BAD_GATEWAY,
@@ -483,6 +485,7 @@ pub async fn callback(
             "Unknown provider for this login.",
         );
     };
+    let oidc_client = &runtime.client;
 
     let token_request = match oidc_client.exchange_code(AuthorizationCode::new(code)) {
         Ok(req) => req,
@@ -733,9 +736,10 @@ async fn bearer_auth(
     let Some(resource) = &resolved_host.resource else {
         return unauthorized(state, headers, host, resolved_host);
     };
-    let Some(cache) = state.jwks_caches.get(&resolved_host.provider_key) else {
+    let Some(runtime) = state.provider_runtime(&resolved_host.provider_key) else {
         return unauthorized(state, headers, host, resolved_host);
     };
+    let cache = &runtime.jwks;
     // RFC 9110 §11.1: the auth scheme is case-insensitive, so `bearer`
     // and `BEARER` are the same scheme as `Bearer`.
     let Some(token) = headers
@@ -1081,12 +1085,12 @@ pub async fn logout(
         .and_then(|rd| validate_redirect_target(rd, &base_domain.name))
         .unwrap_or(local_logged_out_url);
 
-    let redirect_url = match (
-        state.end_session_endpoints.get(&provider_key),
-        state.providers.get(&provider_key),
-    ) {
-        (Some(Some(end_session_endpoint)), Some(provider)) => {
-            let mut url = end_session_endpoint.clone();
+    let end_session_endpoint = state
+        .provider_runtime(&provider_key)
+        .and_then(|runtime| runtime.end_session_endpoint.clone());
+    let redirect_url = match (end_session_endpoint, state.providers.get(&provider_key)) {
+        (Some(end_session_endpoint), Some(provider)) => {
+            let mut url = end_session_endpoint;
             url.query_pairs_mut()
                 .append_pair("client_id", &provider.client_id)
                 .append_pair("post_logout_redirect_uri", &post_logout_target);

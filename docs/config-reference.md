@@ -69,8 +69,10 @@ something.
 ## Per-host providers
 
 Every distinct provider — each base domain's default plus every host
-(or fallback) `provider` override — is discovered at startup and gets
-its own OIDC client and JWKS cache. All clients under one base domain
+(or fallback) `provider` override — is discovered at startup (retried
+in the background if its IdP is down at that moment — see the
+[deployment guide](deployment.md)) and gets its own OIDC client and
+JWKS cache. All clients under one base domain
 share that base domain's `https://<auth_subdomain>/callback` as their
 redirect URI, so register that URI at each IdP.
 

@@ -102,9 +102,9 @@ pub fn spawn_periodic_refresh(
         ticker.tick().await;
         loop {
             ticker.tick().await;
-            for (base_domain, cache) in &state.jwks_caches {
-                if let Err(err) = cache.refresh(&state.http_client).await {
-                    tracing::warn!(base_domain, %err, "periodic JWKS refresh failed");
+            for (provider_key, runtime) in state.provider_runtimes() {
+                if let Err(err) = runtime.jwks.refresh(&state.http_client).await {
+                    tracing::warn!(provider_key, %err, "periodic JWKS refresh failed");
                 }
             }
         }
