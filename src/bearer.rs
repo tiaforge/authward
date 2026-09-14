@@ -25,6 +25,7 @@ pub enum BearerError {
     IssuerMismatch,
     AudienceMismatch,
     Expired,
+    NotYetValid,
     MissingScope,
 }
 
@@ -36,6 +37,7 @@ impl std::fmt::Display for BearerError {
             Self::IssuerMismatch => write!(f, "issuer does not match this provider"),
             Self::AudienceMismatch => write!(f, "audience does not include the required resource"),
             Self::Expired => write!(f, "token is expired"),
+            Self::NotYetValid => write!(f, "token is not yet valid (nbf in the future)"),
             Self::MissingScope => write!(f, "token is missing the required scope"),
         }
     }
@@ -89,6 +91,19 @@ fn try_validate(
     }
 
     let header: serde_json::Value = decode_json_segment(header_b64)?;
+    // RFC 9068 access tokens are `at+jwt`; plain `JWT` is tolerated since
+    // plenty of IdPs still issue that. Anything else (`logout+jwt`,
+    // `id_token+jwt`, ...) is some other token type being replayed here.
+    if let Some(typ) = header.get("typ").and_then(|v| v.as_str())
+        && !matches!(
+            typ.to_ascii_lowercase().as_str(),
+            "at+jwt" | "application/at+jwt" | "jwt"
+        )
+    {
+        return Err(BearerError::Malformed(format!(
+            "unexpected typ {typ}: not an access token"
+        )));
+    }
     let alg_str = header
         .get("alg")
         .and_then(|v| v.as_str())
@@ -142,6 +157,22 @@ fn try_validate(
     let now = chrono::Utc::now().timestamp();
     if now - crate::oidc::CLOCK_SKEW_LEEWAY_SECS > exp {
         return Err(BearerError::Expired);
+    }
+    if let Some(nbf) = claims.get("nbf").and_then(|v| v.as_i64())
+        && now + crate::oidc::CLOCK_SKEW_LEEWAY_SECS < nbf
+    {
+        return Err(BearerError::NotYetValid);
+    }
+
+    // `sub` is what becomes X-Auth-User; a token without one would be
+    // forwarded as an empty identity, which some backends read as
+    // "anonymous but authorized".
+    if claims
+        .get("sub")
+        .and_then(|v| v.as_str())
+        .is_none_or(str::is_empty)
+    {
+        return Err(BearerError::Malformed("missing sub".into()));
     }
 
     if let Some(required_scope) = required_scope {

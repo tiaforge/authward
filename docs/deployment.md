@@ -100,7 +100,21 @@ reference (validated with `caddy adapt`). The shape is: one plain
 block per protected app with an explicit `handle_response` for the 401
 case — `forward_auth` does not redirect on non-2xx by default, it relays
 the response verbatim, so without that block a denied request would show
-forward-auth's raw 401 instead of sending the user to `/login`.
+forward-auth's raw 401 instead of sending the user to `/login`. The 401
+carries the login URL to redirect to in `X-Login-Url` (with the original
+request URL query-encoded inside `rd`); use
+`redir * {http.reverse_proxy.header.X-Login-Url} 302` rather than
+splicing `{uri}` into a query string yourself, which breaks on any `&`
+in the original request.
+
+One more trust-boundary note: the session cookie is scoped to
+`Domain=.<base_domain>` — that's what makes single sign-on across the
+apps work — so every subdomain under a base domain is *same-site* as far
+as the browser is concerned. forward-auth's own state-changing routes
+(`/logout`, `/sessions/revoke`) additionally check `Origin` /
+`Sec-Fetch-Site` so a compromised sibling app can't drive them, but a
+sibling app can still *set* a cookie for the whole base domain. Only put
+apps under one base domain that you'd trust with each other's sessions.
 
 **Requires Caddy v2.11.2 or newer.** Caddy 2.10.0 through 2.11.1 carry
 [GHSA-7r4p-vjf4-gxv4](https://github.com/caddyserver/caddy/security/advisories/GHSA-7r4p-vjf4-gxv4):

@@ -37,14 +37,17 @@ impl RateLimiter {
         }
     }
 
-    /// Consumes one token for `ip` if available. Returns `true` if the
-    /// request should proceed, `false` if it should be rejected.
+    /// Consumes one token for `ip`'s bucket if available. Returns `true`
+    /// if the request should proceed, `false` if it should be rejected.
     pub fn check(&self, ip: IpAddr) -> bool {
         let now = Instant::now();
-        let mut bucket = self.buckets.entry(ip).or_insert_with(|| Bucket {
-            tokens: self.capacity,
-            last_refill: now,
-        });
+        let mut bucket = self
+            .buckets
+            .entry(bucket_key(ip))
+            .or_insert_with(|| Bucket {
+                tokens: self.capacity,
+                last_refill: now,
+            });
 
         let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
         bucket.tokens = (bucket.tokens + elapsed * self.refill_per_sec).min(self.capacity);
@@ -86,6 +89,24 @@ pub fn spawn_periodic_prune(
             state.login_rate_limiter.prune_idle(interval);
         }
     })
+}
+
+/// One bucket per IPv4 address, but per /64 for IPv6: a single subscriber
+/// routinely holds a whole /64, so keying on the full address would hand
+/// them 2^64 independent budgets (and grow the map by one entry per
+/// request). IPv4-mapped IPv6 addresses key as their IPv4 form.
+fn bucket_key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => {
+                let mut octets = v6.octets();
+                octets[8..].fill(0);
+                IpAddr::V6(octets.into())
+            }
+        },
+    }
 }
 
 /// The client IP Caddy observed directly, from the last hop of
@@ -131,6 +152,25 @@ mod tests {
         assert!(limiter.check(a));
         assert!(!limiter.check(a));
         assert!(limiter.check(b), "a different IP must have its own budget");
+    }
+
+    #[test]
+    fn ipv6_addresses_share_a_bucket_per_64() {
+        let limiter = RateLimiter::new(1.0, 1.0);
+        let a: IpAddr = "2001:db8:1:2:aaaa::1".parse().unwrap();
+        let b: IpAddr = "2001:db8:1:2:bbbb::2".parse().unwrap();
+        let other: IpAddr = "2001:db8:1:3::1".parse().unwrap();
+        assert!(limiter.check(a));
+        assert!(!limiter.check(b), "same /64 must share the budget");
+        assert!(limiter.check(other), "a different /64 has its own");
+
+        let mapped: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
+        let v4: IpAddr = "127.0.0.1".parse().unwrap();
+        assert!(limiter.check(mapped));
+        assert!(
+            !limiter.check(v4),
+            "IPv4-mapped v6 keys as the IPv4 address"
+        );
     }
 
     #[test]

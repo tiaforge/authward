@@ -116,6 +116,14 @@ about a specific issued token is tracked here. To cut off access:
   the IdP (if supported) rather than trying to intervene from
   forward-auth's side.
 
+Disabling a **user** at the IdP takes effect at that user's next silent
+refresh — i.e. within one access-token lifetime (`expires_in`, typically
+minutes to an hour) — when the IdP refuses the refresh and forward-auth
+clears the session. There is no back-channel logout, so if you need it
+faster, shorten the access-token TTL at the IdP for forward-auth's
+client. `session_max_age_seconds` (default 24h) is the hard upper bound
+on any session regardless of what the IdP does.
+
 Revoking a **browser session** is different and does have per-session
 control: the `/` overview page lists a user's own other active sessions
 with a revoke button (`POST /sessions/revoke`), scoped so a session can

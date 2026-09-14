@@ -31,7 +31,7 @@
       <td>
         {% if !session.is_current %}
         <form class="inline" method="post" action="/sessions/revoke">
-          <input type="hidden" name="session_id" value="{{ session.id }}">
+          <input type="hidden" name="session" value="{{ session.handle }}">
           <button class="link" type="submit">Log out this device</button>
         </form>
         {% endif %}

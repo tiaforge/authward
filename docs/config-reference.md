@@ -19,6 +19,7 @@ time, and matched against the (also-lowercased) incoming `Host` /
 | `refresh_token_encryption_key` | yes, unless `FORWARD_AUTH_REFRESH_KEY` is set | — | Encrypts refresh tokens at rest in SQLite. Must differ from `cookie_signing_key`. |
 | `sqlite_path` | no | `forward-auth.db` | Path to the session database. Created if missing; chmod'd to `0600`. |
 | `session_ttl_fallback_seconds` | no | `3600` | Used only when the IdP's token response doesn't include an explicit `expires_in`. |
+| `session_max_age_seconds` | no | `86400` (24h) | Absolute lifetime of a browser session from login, regardless of how many silent refreshes succeed. Bounds how long a stolen session cookie stays usable. Must be > 0. |
 | `otel_endpoint` | no | unset | OTLP/gRPC endpoint for log export, e.g. `http://localhost:4317`. Logs always also go to stdout as JSON regardless. |
 | `listen_addr` | no | `127.0.0.1:8080` | Must stay unreachable except from Caddy — see [deployment.md](deployment.md). |
 
@@ -37,7 +38,7 @@ single sign-on across every host on it.
 | Field | Required | Notes |
 |---|---|---|
 | `auth_subdomain` | yes | The host that serves `/login`, `/callback`, `/logout`, `/`, `/healthz` for this base domain. Point Caddy's plain `reverse_proxy` block at this host. |
-| `provider.discovery_url` | yes | The IdP's `.well-known/openid-configuration` URL. |
+| `provider.discovery_url` | yes | The IdP's `.well-known/openid-configuration` URL. Must be `https` — plain `http` is only accepted for loopback addresses (`127.0.0.1`, `localhost`, `::1`), and the same rule is applied at startup to every endpoint the discovery document advertises, since the client secret and tokens go to those. |
 | `provider.client_id` | yes | |
 | `provider.client_secret` | yes | Treat as a secret. |
 
@@ -53,7 +54,7 @@ is optional and inherits from the named base domain when omitted.
 | `required_group` | no | none (any valid login passes) | Value the claim named by `group_claim_name` must contain. Checked after every login and every silent refresh — losing the group mid-session denies on the next refresh, not just at next login. |
 | `group_claim_name` | no | `groups` | The claim can be a JSON array of strings or a single string; anything else, or a missing claim while `required_group` is set, fails closed (denied). |
 | `bypass_paths` | no | `[]` | Exact paths (no query string, no fragment) that skip auth entirely — e.g. `/healthz` on an app that has its own. Must start with `/`; must not contain `?` or `#`. Matching is exact-path only after one round of percent-decoding; a query string or fragment appended to a protected path never matches a bypass entry. |
-| `forward_identity_headers` | no | `false` | When true, a successful `/verify` sets `X-Auth-User` / `X-Auth-Email` / `X-Auth-Groups`, which Caddy's `copy_headers` must be configured to relay (see the Caddyfile). |
+| `forward_identity_headers` | no | `false` | When true, a successful `/verify` fills in `X-Auth-User` / `X-Auth-Email` / `X-Auth-Groups`, which Caddy's `copy_headers` must be configured to relay (see the Caddyfile). All three headers are sent on every successful `/verify` even when this is false (as empty values) so `copy_headers` always overwrites a client-supplied one. `X-Auth-Email` is only populated when the IdP marks the email verified (`email_verified: true`); an unverified email is whatever the user typed into their profile. Backends should key on `X-Auth-User` (the OIDC `sub`), which is stable and IdP-assigned. `X-Auth-Groups` is comma-joined without escaping — don't use group names containing commas. |
 | `resource` | no | none | The OAuth resource identifier (RFC 8707) this host's API accepts. Required for `/token` to issue an API token for this host, and for a bearer token to be accepted at all (see [api-tokens.md](api-tokens.md)). |
 | `required_scope` | no | none | A scope that must be present in a bearer access token's `scope` claim for this host. Only meaningful alongside `resource`. |
 

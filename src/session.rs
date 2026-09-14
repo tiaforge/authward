@@ -19,6 +19,13 @@ pub fn log_id(session_id: &str) -> String {
     blake3::hash(session_id.as_bytes()).to_hex()[..12].to_string()
 }
 
+/// Opaque handle for naming a session in HTML/forms (the dashboard's
+/// revoke buttons) without exposing the ID itself — the full hash, so a
+/// handle can be matched back to a session the caller is allowed to see.
+pub fn session_handle(session_id: &str) -> String {
+    blake3::hash(session_id.as_bytes()).to_hex().to_string()
+}
+
 // Boxing `Session` would trade a small amount of enum size for a heap
 // allocation on every successful verification — the overwhelmingly common
 // case for a running deployment — which isn't the right tradeoff here.
@@ -60,6 +67,11 @@ pub async fn verify_session(
     };
     if session.base_domain != expected_base_domain {
         tracing::warn!(session_id = %log_id(session_id), session_base_domain = %session.base_domain, expected_base_domain, "session presented against the wrong base domain");
+        return VerifyOutcome::Invalid;
+    }
+    if session.is_past_max_age(state.config.global.session_max_age) {
+        tracing::info!(session_id = %log_id(session_id), "session past its absolute max age; clearing");
+        clear(state, session_id).await;
         return VerifyOutcome::Invalid;
     }
 
@@ -165,8 +177,20 @@ async fn refresh(state: &AppState, mut session: Session) -> VerifyOutcome {
                 }
             });
         // Refresh responses aren't bound to a login-time nonce.
-        if let Err(err) = id_token.claims(&verifier, |_: Option<&Nonce>| Ok(())) {
-            tracing::warn!(session_id = %log_id(&session.id), ?err, "refreshed id_token failed verification; clearing session");
+        let claims = match id_token.claims(&verifier, |_: Option<&Nonce>| Ok(())) {
+            Ok(claims) => claims,
+            Err(err) => {
+                tracing::warn!(session_id = %log_id(&session.id), ?err, "refreshed id_token failed verification; clearing session");
+                clear(state, &session.id).await;
+                return VerifyOutcome::Invalid;
+            }
+        };
+        // OIDC Core 12.2: a refreshed ID token MUST keep the original
+        // `sub`. Anything else means the IdP handed us someone else's
+        // claims, and the session's stored subject would no longer match
+        // the claims used for authorization.
+        if claims.subject().as_str() != session.subject {
+            tracing::warn!(session_id = %log_id(&session.id), "refreshed id_token has a different subject; clearing session");
             clear(state, &session.id).await;
             return VerifyOutcome::Invalid;
         }
@@ -230,7 +254,9 @@ async fn clear(state: &AppState, session_id: &str) {
 /// and deletes it if it's genuinely still expired.
 pub async fn reap_expired_sessions(state: &AppState) {
     let now = Utc::now();
-    let candidates = match db::list_expired_session_ids(&state.db, now).await {
+    let max_age = state.config.global.session_max_age;
+    let max_age_cutoff = now - ChronoDuration::from_std(max_age).unwrap_or(ChronoDuration::MAX);
+    let candidates = match db::list_expired_session_ids(&state.db, now, max_age_cutoff).await {
         Ok(ids) => ids,
         Err(err) => {
             tracing::error!(%err, "reaper: failed to list expired sessions");
@@ -244,7 +270,9 @@ pub async fn reap_expired_sessions(state: &AppState) {
             .session_locks
             .with_lock(&id, || async {
                 match db::get_session(&state.db, &id).await {
-                    Ok(Some(session)) if session.is_expired() => {
+                    Ok(Some(session))
+                        if session.is_expired() || session.is_past_max_age(max_age) =>
+                    {
                         clear(state, &id).await;
                         true
                     }

@@ -27,6 +27,11 @@ pub struct RawGlobal {
     pub sqlite_path: PathBuf,
     #[serde(default = "default_session_ttl_fallback_seconds")]
     pub session_ttl_fallback_seconds: u64,
+    /// Hard cap on how long a session lives after login, regardless of
+    /// how many silent refreshes succeed. Bounds the window a stolen
+    /// session cookie stays usable.
+    #[serde(default = "default_session_max_age_seconds")]
+    pub session_max_age_seconds: u64,
     pub otel_endpoint: Option<String>,
     /// Internal address the service listens on. Must only be reachable by
     /// the proxy (see Phase 11) — never expose this publicly.
@@ -41,6 +46,7 @@ impl Default for RawGlobal {
             refresh_token_encryption_key: None,
             sqlite_path: default_sqlite_path(),
             session_ttl_fallback_seconds: default_session_ttl_fallback_seconds(),
+            session_max_age_seconds: default_session_max_age_seconds(),
             otel_endpoint: None,
             listen_addr: default_listen_addr(),
         }
@@ -53,6 +59,10 @@ fn default_sqlite_path() -> PathBuf {
 
 fn default_session_ttl_fallback_seconds() -> u64 {
     3600
+}
+
+fn default_session_max_age_seconds() -> u64 {
+    24 * 3600
 }
 
 fn default_listen_addr() -> String {

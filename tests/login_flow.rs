@@ -21,13 +21,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use authgate::config;
 use axum::extract::{Form, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{Duration as ChronoDuration, Utc};
-use forward_auth::config;
 use openidconnect::core::{
     CoreGenderClaim, CoreHmacKey, CoreJweContentEncryptionAlgorithm, CoreJwsSigningAlgorithm,
     CoreTokenResponse, CoreTokenType,
@@ -54,6 +54,7 @@ struct PendingAuth {
     nonce: String,
     subject: String,
     email: String,
+    email_verified: bool,
     groups: Vec<String>,
 }
 
@@ -93,6 +94,8 @@ struct AuthorizeParams {
     /// Comma-separated group membership for this login, standing in for
     /// whatever a real IdP's admin UI would configure per user.
     groups: Option<String>,
+    /// "false" makes the mock mark this login's email as unverified.
+    email_verified: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -144,7 +147,7 @@ async fn authorize(
     State(idp): State<MockIdp>,
     Query(params): Query<AuthorizeParams>,
 ) -> impl IntoResponse {
-    let code = forward_auth::crypto::random_hex(16);
+    let code = authgate::crypto::random_hex(16);
     let subject = params
         .login_hint
         .unwrap_or_else(|| "default-user".to_string());
@@ -157,6 +160,7 @@ async fn authorize(
         PendingAuth {
             nonce: params.nonce,
             email: format!("{subject}@example.test"),
+            email_verified: params.email_verified.as_deref() != Some("false"),
             subject,
             groups,
         },
@@ -189,6 +193,7 @@ fn issue_tokens(
         "aud": [CLIENT_ID],
         "sub": identity.subject,
         "email": identity.email,
+        "email_verified": identity.email_verified,
         "iat": now.timestamp(),
         "exp": exp.timestamp(),
         "groups": identity.groups,
@@ -248,7 +253,7 @@ async fn token(State(idp): State<MockIdp>, Form(params): Form<TokenParams>) -> R
                 .remove(&code)
                 .expect("mock IdP received a code it never issued");
             let nonce = pending.nonce.clone();
-            let refresh_token = forward_auth::crypto::random_hex(16);
+            let refresh_token = authgate::crypto::random_hex(16);
             Json(issue_tokens(&idp, pending, Some(nonce), refresh_token)).into_response()
         }
         "refresh_token" => {
@@ -268,7 +273,7 @@ async fn token(State(idp): State<MockIdp>, Form(params): Form<TokenParams>) -> R
                 )
                     .into_response();
             };
-            let new_refresh_token = forward_auth::crypto::random_hex(16);
+            let new_refresh_token = authgate::crypto::random_hex(16);
             Json(issue_tokens(&idp, identity, None, new_refresh_token)).into_response()
         }
         other => (
@@ -361,7 +366,6 @@ fn build_access_token(
     scope: Option<&str>,
     exp_offset_secs: i64,
 ) -> String {
-    use base64::Engine;
     let now = Utc::now();
     let mut payload = serde_json::json!({
         "iss": issuer,
@@ -373,9 +377,16 @@ fn build_access_token(
     if let Some(scope) = scope {
         payload["scope"] = serde_json::Value::String(scope.to_string());
     }
-    let header_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"alg":"HS256"}"#);
+    sign_hs256(hmac_key, r#"{"alg":"HS256"}"#, &payload)
+}
+
+/// Signs an arbitrary header + payload — for tests that need a token the
+/// app should *reject* on its claims/header, not just its signature.
+fn sign_hs256(hmac_key: &CoreHmacKey, header_json: &str, payload: &serde_json::Value) -> String {
+    use base64::Engine;
+    let header_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(header_json);
     let payload_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .encode(serde_json::to_vec(&payload).unwrap());
+        .encode(serde_json::to_vec(payload).unwrap());
     let signing_input = format!("{header_b64}.{payload_b64}");
     let signature = hmac_key
         .sign(
@@ -422,11 +433,11 @@ fn resolved_host(host: &str, base_domain: &str, idp_base_url: &str) -> config::R
     }
 }
 
-async fn spawn_app_with_config(cfg: config::Config) -> (String, forward_auth::state::AppState) {
-    let state = forward_auth::build_state(cfg)
+async fn spawn_app_with_config(cfg: config::Config) -> (String, authgate::state::AppState) {
+    let state = authgate::build_state(cfg)
         .await
         .expect("build_state against mock IdP");
-    let app = forward_auth::server::build_router(state.clone());
+    let app = authgate::server::build_router(state.clone());
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -444,6 +455,7 @@ fn base_config(db_path: &std::path::Path) -> config::Config {
             refresh_token_encryption_key: "test-only-refresh-key-32-bytes-minimum!!".to_string(),
             sqlite_path: db_path.to_path_buf(),
             session_ttl_fallback: Duration::from_secs(3600),
+            session_max_age: Duration::from_secs(24 * 3600),
             otel_endpoint: None,
             listen_addr: "127.0.0.1:0".parse().unwrap(),
         },
@@ -456,7 +468,7 @@ fn base_config(db_path: &std::path::Path) -> config::Config {
 async fn spawn_app(
     idp_base_url: &str,
     db_path: &std::path::Path,
-) -> (String, forward_auth::state::AppState) {
+) -> (String, authgate::state::AppState) {
     let mut cfg = base_config(db_path);
     cfg.base_domains.insert(
         "test.local".to_string(),
@@ -531,16 +543,28 @@ impl Browser {
         path: &str,
         form: &[(&str, &str)],
     ) -> reqwest::Response {
-        let resp = self
+        self.post_form_with_headers(app_base_url, host, path, form, &[])
+            .await
+    }
+
+    async fn post_form_with_headers(
+        &mut self,
+        app_base_url: &str,
+        host: &str,
+        path: &str,
+        form: &[(&str, &str)],
+        extra_headers: &[(&str, &str)],
+    ) -> reqwest::Response {
+        let mut req = self
             .client
             .post(format!("{app_base_url}{path}"))
             .header("host", host)
             .header("x-forwarded-proto", "http")
-            .header("cookie", self.cookie_header())
-            .form(form)
-            .send()
-            .await
-            .unwrap();
+            .header("cookie", self.cookie_header());
+        for (name, value) in extra_headers {
+            req = req.header(*name, *value);
+        }
+        let resp = req.form(form).send().await.unwrap();
         self.absorb_set_cookies(&resp);
         resp
     }
@@ -596,6 +620,20 @@ async fn login_as_with_groups(
     groups: &str,
     rd: &str,
 ) -> String {
+    login_as_with(app, idp_client, browser, login_hint, groups, rd, &[]).await
+}
+
+/// Full form: `extra_authorize_params` are appended to the mock IdP's
+/// `/authorize` URL (e.g. `("email_verified", "false")`).
+async fn login_as_with(
+    app: &str,
+    idp_client: &reqwest::Client,
+    browser: &mut Browser,
+    login_hint: &str,
+    groups: &str,
+    rd: &str,
+    extra_authorize_params: &[(&str, &str)],
+) -> String {
     let resp = browser
         .get(
             app,
@@ -620,6 +658,9 @@ async fn login_as_with_groups(
         authorize_url
             .query_pairs_mut()
             .append_pair("groups", groups);
+    }
+    for (key, value) in extra_authorize_params {
+        authorize_url.query_pairs_mut().append_pair(key, value);
     }
 
     let idp_resp = follow_real_redirect(idp_client, authorize_url.as_str()).await;
@@ -1011,7 +1052,7 @@ async fn reaper_deletes_sessions_with_no_refresh_token_survivors() {
     let db_dir = tempfile::tempdir().unwrap();
     let (_app, state) = spawn_app(&idp_base_url, &db_dir.path().join("sessions.db")).await;
 
-    forward_auth::db::create_session(
+    authgate::db::create_session(
         &state.db,
         "reaper-test-session",
         "test.local",
@@ -1025,10 +1066,10 @@ async fn reaper_deletes_sessions_with_no_refresh_token_survivors() {
     .await
     .unwrap();
 
-    forward_auth::session::reap_expired_sessions(&state).await;
+    authgate::session::reap_expired_sessions(&state).await;
 
     assert!(
-        forward_auth::db::get_session(&state.db, "reaper-test-session")
+        authgate::db::get_session(&state.db, "reaper-test-session")
             .await
             .unwrap()
             .is_none()
@@ -1082,7 +1123,7 @@ async fn reaper_does_not_delete_a_session_mid_refresh() {
     // delete the row out from under it: it can only proceed past the
     // per-session lock once the refresh releases it, at which point the
     // row's expiry has already been pushed into the future.
-    forward_auth::session::reap_expired_sessions(&state).await;
+    authgate::session::reap_expired_sessions(&state).await;
 
     assert_eq!(
         verify_task.await.unwrap(),
@@ -1606,6 +1647,65 @@ async fn expired_bearer_token_is_rejected() {
 }
 
 #[tokio::test]
+async fn bearer_tokens_without_sub_or_not_yet_valid_or_wrong_typ_are_rejected() {
+    let (idp_base_url, _count, _tokens, hmac_key) =
+        spawn_mock_idp_full(Duration::from_secs(3600), Duration::ZERO, true).await;
+    let db_dir = tempfile::tempdir().unwrap();
+    let mut cfg = base_config(&db_dir.path().join("sessions.db"));
+    cfg.base_domains.insert(
+        "test.local".to_string(),
+        base_domain_block("test.local", "auth.test.local", &idp_base_url),
+    );
+    cfg.hosts.insert(
+        "api.test.local".to_string(),
+        api_host("https://api.test.local/", None, &idp_base_url),
+    );
+    let (app, _state) = spawn_app_with_config(cfg).await;
+
+    let now = Utc::now().timestamp();
+    let good = serde_json::json!({
+        "iss": idp_base_url,
+        "aud": "https://api.test.local/",
+        "sub": "test-user",
+        "iat": now,
+        "exp": now + 3600,
+    });
+    let key = hmac_key.lock().unwrap().clone();
+
+    // Control: the same claims with an honest header are accepted.
+    let token = sign_hs256(&key, r#"{"alg":"HS256","typ":"at+jwt"}"#, &good);
+    assert_eq!(
+        raw_verify_bearer(&app, "api.test.local", &token).await,
+        reqwest::StatusCode::OK
+    );
+
+    let mut no_sub = good.clone();
+    no_sub.as_object_mut().unwrap().remove("sub");
+    let token = sign_hs256(&key, r#"{"alg":"HS256"}"#, &no_sub);
+    assert_eq!(
+        raw_verify_bearer(&app, "api.test.local", &token).await,
+        reqwest::StatusCode::UNAUTHORIZED,
+        "a token with no sub would be forwarded as an empty identity"
+    );
+
+    let mut future = good.clone();
+    future["nbf"] = serde_json::json!(now + 3600);
+    let token = sign_hs256(&key, r#"{"alg":"HS256"}"#, &future);
+    assert_eq!(
+        raw_verify_bearer(&app, "api.test.local", &token).await,
+        reqwest::StatusCode::UNAUTHORIZED,
+        "nbf in the future"
+    );
+
+    let token = sign_hs256(&key, r#"{"alg":"HS256","typ":"logout+jwt"}"#, &good);
+    assert_eq!(
+        raw_verify_bearer(&app, "api.test.local", &token).await,
+        reqwest::StatusCode::UNAUTHORIZED,
+        "some other JWT type from the same issuer is not an access token"
+    );
+}
+
+#[tokio::test]
 async fn bearer_token_survives_idp_key_rotation() {
     let (idp_base_url, _count, _tokens, hmac_key) =
         spawn_mock_idp_full(Duration::from_secs(3600), Duration::ZERO, true).await;
@@ -1807,11 +1907,24 @@ async fn revoking_a_different_session_only_invalidates_that_one() {
         reqwest::StatusCode::OK
     );
 
-    // From browser A's dashboard, find browser B's (the *other*, non-current) session id.
+    // From browser A's dashboard, find browser B's (the *other*, non-current)
+    // session handle. The page must never contain a raw session ID — that's
+    // the credential itself.
     let dashboard = browser_a.get(&app, "auth.test.local", "/").await;
     assert_eq!(dashboard.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        dashboard.headers().get("cache-control").unwrap(),
+        "no-store",
+        "a page naming sessions must not be cached"
+    );
     let html = dashboard.text().await.unwrap();
-    let other_session_id = extract_hidden_input_value(&html, "session_id")
+    for (name, browser) in [("A", &browser_a), ("B", &browser_b)] {
+        assert!(
+            !html.contains(&browser.cookies["fa_session"]),
+            "dashboard leaked browser {name}'s raw session ID"
+        );
+    }
+    let other_session = extract_hidden_input_value(&html, "session")
         .expect("dashboard should list the other device's session");
 
     let resp = browser_a
@@ -1819,7 +1932,7 @@ async fn revoking_a_different_session_only_invalidates_that_one() {
             &app,
             "auth.test.local",
             "/sessions/revoke",
-            &[("session_id", &other_session_id)],
+            &[("session", &other_session)],
         )
         .await;
     assert_eq!(resp.status(), reqwest::StatusCode::SEE_OTHER);
@@ -1943,6 +2056,182 @@ async fn identity_headers_present_but_empty_when_disabled() {
             "{name} must be present and empty so copy_headers overwrites any client-supplied value"
         );
     }
+}
+
+#[tokio::test]
+async fn unverified_email_is_not_forwarded() {
+    let (idp_base_url, _count, _tokens) = spawn_mock_idp(Duration::from_secs(3600)).await;
+    let db_dir = tempfile::tempdir().unwrap();
+    let mut cfg = base_config(&db_dir.path().join("sessions.db"));
+    cfg.base_domains.insert(
+        "test.local".to_string(),
+        base_domain_block("test.local", "auth.test.local", &idp_base_url),
+    );
+    let mut app_host = resolved_host("app.test.local", "test.local", &idp_base_url);
+    app_host.forward_identity_headers = true;
+    cfg.hosts.insert("app.test.local".to_string(), app_host);
+    let (app, _state) = spawn_app_with_config(cfg).await;
+    let idp_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    let mut browser = Browser::new();
+    login_as_with(
+        &app,
+        &idp_client,
+        &mut browser,
+        "alice",
+        "",
+        "https://app.test.local/",
+        &[("email_verified", "false")],
+    )
+    .await;
+
+    let resp = browser.get(&app, "app.test.local", "/verify").await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(resp.headers().get("x-auth-user").unwrap(), "alice");
+    assert_eq!(
+        resp.headers().get("x-auth-email").unwrap(),
+        "",
+        "an email the IdP hasn't verified is whatever the user typed — never forwarded"
+    );
+}
+
+#[tokio::test]
+async fn session_is_cut_off_at_its_absolute_max_age() {
+    let (idp_base_url, _count, _tokens) = spawn_mock_idp(Duration::from_secs(3600)).await;
+    let db_dir = tempfile::tempdir().unwrap();
+    let mut cfg = base_config(&db_dir.path().join("sessions.db"));
+    cfg.global.session_max_age = Duration::from_secs(1);
+    cfg.base_domains.insert(
+        "test.local".to_string(),
+        base_domain_block("test.local", "auth.test.local", &idp_base_url),
+    );
+    cfg.hosts.insert(
+        "app.test.local".to_string(),
+        resolved_host("app.test.local", "test.local", &idp_base_url),
+    );
+    let (app, _state) = spawn_app_with_config(cfg).await;
+    let idp_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    let mut browser = Browser::new();
+    login_as(
+        &app,
+        &idp_client,
+        &mut browser,
+        "alice",
+        "https://app.test.local/",
+    )
+    .await;
+    assert_eq!(
+        browser
+            .get(&app, "app.test.local", "/verify")
+            .await
+            .status(),
+        reqwest::StatusCode::OK
+    );
+
+    // The access token is good for an hour, so only the absolute cap can
+    // end this session.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(
+        browser
+            .get(&app, "app.test.local", "/verify")
+            .await
+            .status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "a session must end at session_max_age no matter how fresh its tokens are"
+    );
+}
+
+#[tokio::test]
+async fn refresh_returning_a_different_subject_clears_the_session() {
+    let (idp_base_url, _count, refresh_tokens) = spawn_mock_idp(Duration::from_secs(1)).await;
+    let db_dir = tempfile::tempdir().unwrap();
+    let (app, _state) = spawn_app(&idp_base_url, &db_dir.path().join("sessions.db")).await;
+    let idp_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    let mut browser = Browser::new();
+    login_as(
+        &app,
+        &idp_client,
+        &mut browser,
+        "alice",
+        "https://app.test.local/",
+    )
+    .await;
+
+    // A misbehaving IdP hands back someone else's identity on refresh.
+    for identity in refresh_tokens.lock().unwrap().values_mut() {
+        identity.subject = "mallory".to_string();
+    }
+
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(
+        browser
+            .get(&app, "app.test.local", "/verify")
+            .await
+            .status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "a refreshed id_token whose sub differs from the session's must end the session (OIDC Core 12.2)"
+    );
+}
+
+#[tokio::test]
+async fn verify_401_carries_a_properly_encoded_login_url() {
+    let (idp_base_url, _count, _tokens) = spawn_mock_idp(Duration::from_secs(3600)).await;
+    let db_dir = tempfile::tempdir().unwrap();
+    let (app, _state) = spawn_app(&idp_base_url, &db_dir.path().join("sessions.db")).await;
+
+    let resp = reqwest::Client::new()
+        .get(format!("{app}/verify"))
+        .header("host", "app.test.local")
+        .header("x-forwarded-proto", "https")
+        .header("x-forwarded-uri", "/page?a=1&b=2")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let login_url = resp
+        .headers()
+        .get("x-login-url")
+        .expect("401 should tell Caddy where to send the browser")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(login_url.starts_with("https://auth.test.local/login?rd="));
+    assert_eq!(
+        query_param(&login_url, "rd"),
+        "https://app.test.local/page?a=1&b=2",
+        "the original URL must survive as one query-encoded rd value, `&` included"
+    );
+}
+
+#[tokio::test]
+async fn html_responses_carry_security_headers() {
+    let (idp_base_url, _count, _tokens) = spawn_mock_idp(Duration::from_secs(3600)).await;
+    let db_dir = tempfile::tempdir().unwrap();
+    let (app, _state) = spawn_app(&idp_base_url, &db_dir.path().join("sessions.db")).await;
+
+    let resp = Browser::new()
+        .get(&app, "auth.test.local", "/logged-out")
+        .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let h = resp.headers();
+    assert_eq!(h.get("x-frame-options").unwrap(), "DENY");
+    assert_eq!(
+        h.get("content-security-policy").unwrap(),
+        "frame-ancestors 'none'"
+    );
+    assert_eq!(h.get("x-content-type-options").unwrap(), "nosniff");
+    assert_eq!(h.get("cache-control").unwrap(), "no-store");
 }
 
 #[tokio::test]
@@ -2147,6 +2436,68 @@ async fn logout_honors_a_valid_rd_and_rejects_a_foreign_one() {
         "https://auth.test.local/logged-out",
         "a foreign rd must fall back to the local page, same as /login's guard"
     );
+}
+
+#[tokio::test]
+async fn state_changing_posts_refuse_cross_origin_browsers() {
+    let (idp_base_url, _count, _tokens, _hmac_key) =
+        spawn_mock_idp_full(Duration::from_secs(3600), Duration::ZERO, false).await;
+    let db_dir = tempfile::tempdir().unwrap();
+    let (app, _state) = spawn_app(&idp_base_url, &db_dir.path().join("sessions.db")).await;
+    let idp_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    let mut browser = Browser::new();
+    login_as(
+        &app,
+        &idp_client,
+        &mut browser,
+        "alice",
+        "https://app.test.local/",
+    )
+    .await;
+
+    // A sibling app on the same base domain is same-*site* (SameSite=Lax
+    // sends the cookie) but not same-origin: refused, session untouched.
+    for headers in [
+        &[("origin", "https://evil.test.local")][..],
+        &[("sec-fetch-site", "same-site")][..],
+        &[("origin", "null")][..],
+    ] {
+        let resp = browser
+            .post_form_with_headers(&app, "auth.test.local", "/logout", &[], headers)
+            .await;
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::FORBIDDEN,
+            "{headers:?} should be refused"
+        );
+        assert_eq!(
+            browser
+                .get(&app, "app.test.local", "/verify")
+                .await
+                .status(),
+            reqwest::StatusCode::OK,
+            "a refused logout must not touch the session"
+        );
+    }
+
+    // The account page itself is fine.
+    let resp = browser
+        .post_form_with_headers(
+            &app,
+            "auth.test.local",
+            "/logout",
+            &[],
+            &[
+                ("origin", "https://auth.test.local"),
+                ("sec-fetch-site", "same-origin"),
+            ],
+        )
+        .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::SEE_OTHER);
 }
 
 #[tokio::test]

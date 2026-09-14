@@ -75,6 +75,13 @@ impl Session {
         Utc::now() >= self.expires_at
     }
 
+    /// Past the absolute lifetime cap (`session_max_age`), which no number
+    /// of successful refreshes extends.
+    pub fn is_past_max_age(&self, max_age: std::time::Duration) -> bool {
+        let max_age = chrono::Duration::from_std(max_age).unwrap_or(chrono::Duration::MAX);
+        Utc::now() >= self.created_at + max_age
+    }
+
     /// Decrypts the stored refresh token, if this session has one.
     pub fn decrypt_refresh_token(
         &self,
@@ -229,16 +236,19 @@ pub async fn update_session_after_refresh(
     Ok(())
 }
 
-/// Session IDs whose access/ID token portion has already expired, as of
-/// `now` — candidates for the reaper (Phase 2). The reaper still has to
-/// re-check each one under its per-session lock before deleting, since a
-/// candidate may be mid-refresh (see `locks::SessionLocks`).
+/// Session IDs whose access/ID token portion has already expired as of
+/// `now`, or that were created before `max_age_cutoff` — candidates for
+/// the reaper (Phase 2). The reaper still has to re-check each one under
+/// its per-session lock before deleting, since a candidate may be
+/// mid-refresh (see `locks::SessionLocks`).
 pub async fn list_expired_session_ids(
     pool: &SqlitePool,
     now: DateTime<Utc>,
+    max_age_cutoff: DateTime<Utc>,
 ) -> anyhow::Result<Vec<String>> {
-    let rows = sqlx::query("SELECT id FROM sessions WHERE expires_at < ?")
+    let rows = sqlx::query("SELECT id FROM sessions WHERE expires_at < ? OR created_at < ?")
         .bind(now.timestamp())
+        .bind(max_age_cutoff.timestamp())
         .fetch_all(pool)
         .await?;
     rows.iter()

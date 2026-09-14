@@ -93,6 +93,29 @@ pub async fn discover(
         .and_then(|v| v.get("end_session_endpoint")?.as_str().map(str::to_string))
         .and_then(|s| url::Url::parse(&s).ok());
 
+    // The config check on `discovery_url` only covers the document itself;
+    // the endpoints it names are where the client secret and tokens go.
+    let mut endpoints: Vec<(&str, &url::Url)> = vec![
+        (
+            "authorization_endpoint",
+            metadata.authorization_endpoint().url(),
+        ),
+        ("jwks_uri", metadata.jwks_uri().url()),
+    ];
+    if let Some(token_endpoint) = metadata.token_endpoint() {
+        endpoints.push(("token_endpoint", token_endpoint.url()));
+    }
+    if let Some(end_session) = &end_session_endpoint {
+        endpoints.push(("end_session_endpoint", end_session));
+    }
+    for (name, url) in endpoints {
+        anyhow::ensure!(
+            crate::config::is_secure_provider_url(url),
+            "OIDC discovery document at {} advertises a plain-http {name} ({url}); refusing to send secrets over it",
+            provider.discovery_url
+        );
+    }
+
     let issuer = metadata.issuer().clone();
     let jwks_uri = metadata.jwks_uri().clone();
     let jwks = JsonWebKeySet::fetch_async(&jwks_uri, http_client)

@@ -27,9 +27,11 @@ pub struct TokenPage<'a> {
     pub access_token: &'a str,
 }
 
-/// One row in the dashboard's session list (Phase 6).
+/// One row in the dashboard's session list (Phase 6). `handle` is
+/// `session::session_handle` of the ID — the ID itself is a credential
+/// and never goes into a page.
 pub struct SessionRow {
-    pub id: String,
+    pub handle: String,
     pub created_at: String,
     pub user_agent: String,
     pub is_current: bool,

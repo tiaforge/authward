@@ -44,12 +44,14 @@ app.example.com {
 		# verbatim to the client. That's exactly what we want for a 403
 		# (forward-auth's own "not authorized" page) and a 502 (its
 		# "misconfigured host" page), but a 401 ("not authenticated")
-		# needs to become a redirect to /login instead. {scheme}, {host}
-		# and {uri} are the *original* app request's — reconstructing
-		# the exact URL the user was trying to reach.
+		# needs to become a redirect to /login instead. forward-auth's
+		# 401 carries the exact login URL to use in X-Login-Url, with the
+		# original request URL query-encoded inside `rd` — don't rebuild
+		# it here as `...?rd={scheme}://{host}{uri}`: {uri} goes in raw,
+		# so an `&` in the original query string truncates rd.
 		@denied status 401
 		handle_response @denied {
-			redir * https://auth.example.com/login?rd={scheme}://{host}{uri} 302
+			redir * {http.reverse_proxy.header.X-Login-Url} 302
 		}
 	}
 

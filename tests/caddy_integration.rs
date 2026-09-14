@@ -108,7 +108,7 @@ async fn spawn_mock_idp() -> String {
         move |Query(params): Query<AuthorizeParams>| {
             let idp = idp.clone();
             async move {
-                let code = forward_auth::crypto::random_hex(16);
+                let code = authgate::crypto::random_hex(16);
                 idp.pending
                     .lock()
                     .unwrap()
@@ -228,10 +228,10 @@ async fn full_flow_through_real_caddy() {
     let mut base_domains = std::collections::HashMap::new();
     base_domains.insert(
         "test.local".to_string(),
-        forward_auth::config::BaseDomain {
+        authgate::config::BaseDomain {
             name: "test.local".to_string(),
             auth_subdomain: "auth.test.local".to_string(),
-            provider: forward_auth::config::Provider {
+            provider: authgate::config::Provider {
                 discovery_url: url::Url::parse(&format!(
                     "{idp_base_url}/.well-known/openid-configuration"
                 ))
@@ -244,10 +244,10 @@ async fn full_flow_through_real_caddy() {
     let mut hosts = std::collections::HashMap::new();
     hosts.insert(
         "app.test.local".to_string(),
-        forward_auth::config::ResolvedHost {
+        authgate::config::ResolvedHost {
             host: Some("app.test.local".to_string()),
             base_domain: "test.local".to_string(),
-            provider: forward_auth::config::Provider {
+            provider: authgate::config::Provider {
                 discovery_url: url::Url::parse(&format!(
                     "{idp_base_url}/.well-known/openid-configuration"
                 ))
@@ -264,12 +264,13 @@ async fn full_flow_through_real_caddy() {
         },
     );
     let db_dir = tempfile::tempdir().unwrap();
-    let cfg = forward_auth::config::Config {
-        global: forward_auth::config::Global {
+    let cfg = authgate::config::Config {
+        global: authgate::config::Global {
             cookie_signing_key: "caddy-test-cookie-signing-key-32-bytes!!".to_string(),
             refresh_token_encryption_key: "caddy-test-refresh-key-32-bytes-minimum!".to_string(),
             sqlite_path: db_dir.path().join("sessions.db"),
             session_ttl_fallback: Duration::from_secs(3600),
+            session_max_age: Duration::from_secs(24 * 3600),
             otel_endpoint: None,
             listen_addr: "127.0.0.1:0".parse().unwrap(),
         },
@@ -277,10 +278,10 @@ async fn full_flow_through_real_caddy() {
         hosts,
         fallback: None,
     };
-    let state = forward_auth::build_state(cfg)
+    let state = authgate::build_state(cfg)
         .await
         .expect("build_state against mock IdP");
-    let auth_app = forward_auth::server::build_router(state);
+    let auth_app = authgate::server::build_router(state);
     let auth_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let auth_port = auth_listener.local_addr().unwrap().port();
     tokio::spawn(async move {
@@ -310,7 +311,7 @@ async fn full_flow_through_real_caddy() {
 
 			@denied status 401
 			handle_response @denied {{
-				redir * https://auth.test.local/login?rd={{scheme}}://{{host}}{{uri}} 302
+				redir * {{http.reverse_proxy.header.X-Login-Url}} 302
 			}}
 		}}
 		reverse_proxy 127.0.0.1:{backend_port}
@@ -364,9 +365,12 @@ async fn full_flow_through_real_caddy() {
     let caddy_base = format!("http://127.0.0.1:{caddy_port}");
 
     // 1. Unauthenticated request to the app, through Caddy, is denied and
-    //    redirected to /login with rd pointing back at the original path.
+    //    redirected to /login with rd pointing back at the original URL —
+    //    query string included, `&` and all, since forward-auth builds the
+    //    login URL itself (X-Login-Url) rather than Caddy splicing {uri}
+    //    raw into a query parameter.
     let resp = client
-        .get(format!("{caddy_base}/dashboard"))
+        .get(format!("{caddy_base}/dashboard?a=1&b=2"))
         .header("host", "app.test.local")
         .send()
         .await
@@ -393,9 +397,9 @@ async fn full_flow_through_real_caddy() {
         .find(|(k, _)| k == "rd")
         .map(|(_, v)| v.to_string())
         .unwrap();
-    assert!(
-        rd.ends_with("/dashboard"),
-        "rd should point back at the originally requested path, got {rd}"
+    assert_eq!(
+        rd, "http://app.test.local/dashboard?a=1&b=2",
+        "rd should be the full original URL, query string intact"
     );
 
     // 2. Follow through /login -> mock IdP -> /callback, all reached
@@ -478,7 +482,11 @@ async fn full_flow_through_real_caddy() {
     //    verified identity forwarded via copy_headers.
     let final_path = url::Url::parse(&final_location).unwrap();
     let resp = client
-        .get(format!("{caddy_base}{}", final_path.path()))
+        .get(format!(
+            "{caddy_base}{}?{}",
+            final_path.path(),
+            final_path.query().unwrap()
+        ))
         .header("host", "app.test.local")
         .header("cookie", cookie_header(&cookies))
         .send()

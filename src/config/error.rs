@@ -116,6 +116,17 @@ pub enum ConfigError {
     IncompleteFallbackProviderOverride { field: &'static str },
 
     #[error(
+        "{scope}: `{url}` uses plain http — the OIDC client secret, \
+         authorization codes and refresh tokens travel to this provider, so \
+         it must be https (plain http is only allowed for loopback addresses \
+         in local development)"
+    )]
+    InsecureProviderUrl { scope: String, url: String },
+
+    #[error("global: `session_max_age_seconds` must be greater than zero")]
+    InvalidSessionMaxAge,
+
+    #[error(
         "global: `listen_addr` (`{value}`) is not a valid `host:port` \
          socket address: {source}"
     )]

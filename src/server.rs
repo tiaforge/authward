@@ -1,6 +1,8 @@
 use axum::Router;
-use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::extract::Request;
+use axum::http::{HeaderValue, StatusCode, header};
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 
 use crate::routes;
@@ -23,7 +25,34 @@ pub fn build_router(state: AppState) -> Router {
         .route("/logout", post(routes::logout))
         .route("/logged-out", get(routes::logged_out))
         .fallback(not_found)
+        .layer(axum::middleware::from_fn(security_headers))
         .with_state(state)
+}
+
+/// Blanket response hardening. Nothing here is ever meant to be framed
+/// (the token page shows a live credential; the dashboard names sessions),
+/// and nothing is cacheable — `/verify` answers go to Caddy, everything
+/// else is per-user HTML. A route that sets its own `Cache-Control` wins.
+async fn security_headers(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("frame-ancestors 'none'"),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    headers
+        .entry(header::CACHE_CONTROL)
+        .or_insert(HeaderValue::from_static("no-store"));
+    response
 }
 
 async fn healthz() -> &'static str {

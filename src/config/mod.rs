@@ -39,8 +39,26 @@ pub struct Global {
     pub refresh_token_encryption_key: String,
     pub sqlite_path: PathBuf,
     pub session_ttl_fallback: Duration,
+    pub session_max_age: Duration,
     pub otel_endpoint: Option<String>,
     pub listen_addr: SocketAddr,
+}
+
+/// Whether a provider-side URL may be talked to: https anywhere, or plain
+/// http only to a loopback address (a local mock/dev IdP). Applied to the
+/// configured discovery URL and to every endpoint the discovery document
+/// hands back, since those are where secrets and tokens actually go.
+pub fn is_secure_provider_url(url: &Url) -> bool {
+    match url.scheme() {
+        "https" => true,
+        "http" => match url.host() {
+            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+            Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+            None => false,
+        },
+        _ => false,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -221,6 +239,11 @@ fn resolve_global(raw: &RawConfig, path: &Path, errors: &mut Vec<ConfigError>) -
         }
     }
 
+    if raw.global.session_max_age_seconds == 0 {
+        errors.push(ConfigError::InvalidSessionMaxAge);
+        ok = false;
+    }
+
     let listen_addr = match raw.global.listen_addr.parse::<SocketAddr>() {
         Ok(addr) => Some(addr),
         Err(source) => {
@@ -242,6 +265,7 @@ fn resolve_global(raw: &RawConfig, path: &Path, errors: &mut Vec<ConfigError>) -
         refresh_token_encryption_key: refresh_token_encryption_key.unwrap(),
         sqlite_path: raw.global.sqlite_path.clone(),
         session_ttl_fallback: Duration::from_secs(raw.global.session_ttl_fallback_seconds),
+        session_max_age: Duration::from_secs(raw.global.session_max_age_seconds),
         otel_endpoint: raw.global.otel_endpoint.clone(),
         listen_addr: listen_addr.unwrap(),
     })
@@ -255,6 +279,12 @@ fn resolve_base_domain(name: &str, raw: &RawBaseDomain) -> Result<BaseDomain, Co
             source,
         }
     })?;
+    if !is_secure_provider_url(&discovery_url) {
+        return Err(ConfigError::InsecureProviderUrl {
+            scope: format!("base_domain `{name}`"),
+            url: raw.provider.discovery_url.clone(),
+        });
+    }
 
     Ok(BaseDomain {
         name: name.to_string(),
@@ -295,6 +325,12 @@ fn resolve_provider_override(raw: &RawProvider, host: &str) -> Result<Provider, 
             url: raw.discovery_url.clone(),
             source,
         })?;
+    if !is_secure_provider_url(&discovery_url) {
+        return Err(ConfigError::InsecureProviderUrl {
+            scope: format!("host `{host}`"),
+            url: raw.discovery_url.clone(),
+        });
+    }
     Ok(Provider {
         discovery_url,
         client_id: raw.client_id.clone(),
@@ -437,6 +473,12 @@ fn resolve_fallback_provider_override(raw: &RawProvider) -> Result<Provider, Con
             url: raw.discovery_url.clone(),
             source,
         })?;
+    if !is_secure_provider_url(&discovery_url) {
+        return Err(ConfigError::InsecureProviderUrl {
+            scope: "fallback".to_string(),
+            url: raw.discovery_url.clone(),
+        });
+    }
     Ok(Provider {
         discovery_url,
         client_id: raw.client_id.clone(),
@@ -542,6 +584,43 @@ refresh_token_encryption_key = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn plain_http_provider_urls_are_rejected_except_loopback() {
+        let file = write_config(
+            r#"
+[global]
+cookie_signing_key = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+refresh_token_encryption_key = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+[base_domain."example.com"]
+auth_subdomain = "auth.example.com"
+
+[base_domain."example.com".provider]
+discovery_url = "http://idp.example.com/.well-known/openid-configuration"
+client_id = "client"
+client_secret = "secret"
+"#,
+        );
+        let errors = load(file.path()).expect_err("plain-http IdP must not load");
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ConfigError::InsecureProviderUrl { .. }))
+        );
+
+        for ok in [
+            "https://idp.example.com/x",
+            "http://127.0.0.1:9000/x",
+            "http://localhost/x",
+            "http://[::1]:9000/x",
+        ] {
+            assert!(is_secure_provider_url(&Url::parse(ok).unwrap()), "{ok}");
+        }
+        for bad in ["http://idp.example.com/x", "http://10.0.0.5/x", "ftp://x/y"] {
+            assert!(!is_secure_provider_url(&Url::parse(bad).unwrap()), "{bad}");
+        }
     }
 
     #[test]

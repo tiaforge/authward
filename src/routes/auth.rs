@@ -68,6 +68,92 @@ fn error_page(status: StatusCode, title: &str, message: &str) -> Response {
     (status, ErrorPage { title, message }).into_response()
 }
 
+/// `/callback`'s error responses carry the jar so the flow cookie's
+/// removal actually reaches the browser; otherwise a failed callback
+/// leaves the (still-valid) flow state sitting there for ten minutes.
+fn error_page_clearing_flow(
+    jar: PrivateCookieJar,
+    status: StatusCode,
+    title: &str,
+    message: &str,
+) -> Response {
+    (jar, error_page(status, title, message)).into_response()
+}
+
+/// CSRF guard for the state-changing POST routes, on top of SameSite=Lax —
+/// which is no help against a compromised sibling app on the same base
+/// domain, since that's same-*site*. Browsers send `Sec-Fetch-Site` and
+/// `Origin` on cross-origin POSTs; either one with a foreign value is
+/// refused. A request with neither is a non-browser client and passes:
+/// CSRF is a browser problem. Returns the 403 to send when refused.
+fn same_origin_denial(headers: &HeaderMap, auth_subdomain: &str) -> Option<Response> {
+    let denied = || {
+        tracing::warn!("cross-origin POST to a state-changing route refused");
+        error_page(
+            StatusCode::FORBIDDEN,
+            "Request refused",
+            "This action can only be taken from the account page itself.",
+        )
+    };
+    if let Some(site) = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok())
+        && !matches!(site, "same-origin" | "none")
+    {
+        return Some(denied());
+    }
+    if let Some(origin) = headers
+        .get(axum::http::header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+    {
+        let same_origin = url::Url::parse(origin)
+            .ok()
+            .and_then(|u| u.host_str().map(|h| h.eq_ignore_ascii_case(auth_subdomain)))
+            .unwrap_or(false);
+        if !same_origin {
+            return Some(denied());
+        }
+    }
+    None
+}
+
+/// `/verify`'s 401, carrying the login URL Caddy should redirect to as
+/// `X-Login-Url`. Built here, with the original request URL properly
+/// query-encoded inside `rd` — a Caddyfile `redir ...?rd={scheme}://{host}{uri}`
+/// embeds the original URI raw, so any `&` in its query string truncates
+/// `rd`. The Caddyfile reads it back as `{http.reverse_proxy.header.X-Login-Url}`.
+fn unauthorized(
+    state: &AppState,
+    headers: &HeaderMap,
+    host: &str,
+    resolved_host: &crate::config::ResolvedHost,
+) -> Response {
+    let mut response = StatusCode::UNAUTHORIZED.into_response();
+    let Some(base_domain) = state.config.base_domains.get(&resolved_host.base_domain) else {
+        return response;
+    };
+    let proto = match headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+    {
+        Some(p) if p.eq_ignore_ascii_case("http") => "http",
+        _ => "https",
+    };
+    let uri = headers
+        .get("x-forwarded-uri")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("/");
+    let Ok(mut login) = url::Url::parse(&format!("https://{}/login", base_domain.auth_subdomain))
+    else {
+        return response;
+    };
+    login
+        .query_pairs_mut()
+        .append_pair("rd", &format!("{proto}://{host}{uri}"));
+    if let Ok(value) = HeaderValue::from_str(login.as_str()) {
+        response.headers_mut().insert("x-login-url", value);
+    }
+    response
+}
+
 /// Per-IP rate limit on `/login`/`/token` and `/callback` (Phase 9).
 /// Returns `Some(response)` when the request should be rejected; `None`
 /// means proceed. Fails open (no limiting) when the client IP can't be
@@ -274,7 +360,8 @@ pub async fn callback(
     let flow: FlowState = match serde_json::from_str(flow_cookie.value()) {
         Ok(flow) => flow,
         Err(_) => {
-            return error_page(
+            return error_page_clearing_flow(
+                jar,
                 StatusCode::BAD_REQUEST,
                 "Login expired",
                 "Please try logging in again.",
@@ -284,7 +371,8 @@ pub async fn callback(
 
     if let Some(error) = params.error {
         tracing::warn!(error, description = ?params.error_description, "identity provider returned an error");
-        return error_page(
+        return error_page_clearing_flow(
+            jar,
             StatusCode::BAD_GATEWAY,
             "Login failed",
             "The identity provider declined the login request.",
@@ -292,7 +380,8 @@ pub async fn callback(
     }
 
     let Some(returned_state) = params.state else {
-        return error_page(
+        return error_page_clearing_flow(
+            jar,
             StatusCode::BAD_REQUEST,
             "Login failed",
             "Missing state parameter.",
@@ -311,7 +400,8 @@ pub async fn callback(
         != 1
     {
         tracing::warn!("callback state mismatch — possible CSRF or stale flow cookie");
-        return error_page(
+        return error_page_clearing_flow(
+            jar,
             StatusCode::BAD_REQUEST,
             "Login failed",
             "Invalid login state.",
@@ -319,7 +409,8 @@ pub async fn callback(
     }
 
     let Some(code) = params.code else {
-        return error_page(
+        return error_page_clearing_flow(
+            jar,
             StatusCode::BAD_REQUEST,
             "Login failed",
             "Missing authorization code.",
@@ -327,7 +418,8 @@ pub async fn callback(
     };
 
     let Some(oidc_client) = state.oidc_clients.get(&flow.base_domain) else {
-        return error_page(
+        return error_page_clearing_flow(
+            jar,
             StatusCode::BAD_GATEWAY,
             "Provider unavailable",
             "Unknown provider for this login.",
@@ -338,7 +430,8 @@ pub async fn callback(
         Ok(req) => req,
         Err(err) => {
             tracing::error!(%err, "failed to build token exchange request");
-            return error_page(
+            return error_page_clearing_flow(
+                jar,
                 StatusCode::BAD_GATEWAY,
                 "Login failed",
                 "Could not contact the identity provider.",
@@ -358,7 +451,8 @@ pub async fn callback(
         Ok(response) => response,
         Err(err) => {
             tracing::error!(%err, "token exchange failed");
-            return error_page(
+            return error_page_clearing_flow(
+                jar,
                 StatusCode::BAD_GATEWAY,
                 "Login failed",
                 "The identity provider rejected the login or could not be reached.",
@@ -367,7 +461,8 @@ pub async fn callback(
     };
 
     let Some(id_token) = token_response.id_token() else {
-        return error_page(
+        return error_page_clearing_flow(
+            jar,
             StatusCode::BAD_GATEWAY,
             "Login failed",
             "The identity provider did not return an ID token.",
@@ -392,7 +487,8 @@ pub async fn callback(
         Ok(claims) => claims,
         Err(err) => {
             tracing::warn!(?err, "id_token claims verification failed");
-            return error_page(
+            return error_page_clearing_flow(
+                jar,
                 StatusCode::BAD_GATEWAY,
                 "Login failed",
                 "Could not verify the identity provider's response.",
@@ -415,7 +511,20 @@ pub async fn callback(
     }
 
     let subject = claims.subject().as_str().to_string();
-    let email = claims.email().as_ref().map(|e| e.as_str().to_string());
+    // An unverified email is whatever the user typed into their profile;
+    // forwarding it as X-Auth-Email would let them impersonate anyone at a
+    // backend that keys on email. Verified or nothing.
+    let email = match (claims.email(), claims.email_verified()) {
+        (Some(email), Some(true)) => Some(email.as_str().to_string()),
+        (Some(_), _) => {
+            tracing::debug!(
+                subject,
+                "id_token email is not marked verified; not storing it"
+            );
+            None
+        }
+        (None, _) => None,
+    };
     let claims_json = crate::oidc::decode_claims_json(&id_token.to_string()).unwrap_or_else(|err| {
         tracing::warn!(%err, "failed to decode id_token claims for group checks; treating as empty");
         serde_json::Value::Null
@@ -448,7 +557,8 @@ pub async fn callback(
     .await
     {
         tracing::error!(%err, "failed to persist session");
-        return error_page(
+        return error_page_clearing_flow(
+            jar,
             StatusCode::INTERNAL_SERVER_ERROR,
             "Login failed",
             "Could not create a session.",
@@ -501,7 +611,7 @@ pub async fn verify(
         // (Phase 5), for non-browser clients. Unavailable for this host
         // (no `resource` configured, or provider has no JWKS cache) is
         // not an error — it just means there's nothing left to try.
-        return bearer_auth(&state, &headers, resolved_host).await;
+        return bearer_auth(&state, &headers, &host, resolved_host).await;
     };
 
     let session =
@@ -510,7 +620,7 @@ pub async fn verify(
         {
             crate::session::VerifyOutcome::Valid(session) => session,
             crate::session::VerifyOutcome::Invalid => {
-                return StatusCode::UNAUTHORIZED.into_response();
+                return unauthorized(&state, &headers, &host, resolved_host);
             }
         };
 
@@ -544,20 +654,21 @@ pub async fn verify(
 async fn bearer_auth(
     state: &AppState,
     headers: &HeaderMap,
+    host: &str,
     resolved_host: &crate::config::ResolvedHost,
 ) -> Response {
     let Some(resource) = &resolved_host.resource else {
-        return StatusCode::UNAUTHORIZED.into_response();
+        return unauthorized(state, headers, host, resolved_host);
     };
     let Some(cache) = state.jwks_caches.get(&resolved_host.base_domain) else {
-        return StatusCode::UNAUTHORIZED.into_response();
+        return unauthorized(state, headers, host, resolved_host);
     };
     let Some(token) = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
     else {
-        return StatusCode::UNAUTHORIZED.into_response();
+        return unauthorized(state, headers, host, resolved_host);
     };
 
     match crate::bearer::validate(
@@ -592,12 +703,16 @@ async fn bearer_auth(
                 .get("sub")
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
-            let email = claims.get("email").and_then(|v| v.as_str());
+            // Same rule as the login path: verified email or nothing.
+            let email = claims
+                .get("email")
+                .and_then(|v| v.as_str())
+                .filter(|_| claims.get("email_verified").and_then(|v| v.as_bool()) == Some(true));
             ok_response(resolved_host, subject, email, &claims)
         }
         Err(err) => {
             tracing::info!(%err, host = ?resolved_host.host, "bearer token rejected");
-            StatusCode::UNAUTHORIZED.into_response()
+            unauthorized(state, headers, host, resolved_host)
         }
     }
 }
@@ -663,7 +778,8 @@ fn ok_response(
 
 #[derive(Deserialize)]
 pub struct RevokeParams {
-    session_id: String,
+    /// A `session::session_handle`, never a raw session ID.
+    session: String,
 }
 
 /// `/` overview page (Phase 6): who's logged in, their other active
@@ -710,7 +826,7 @@ pub async fn overview(
     let session_rows = sessions
         .iter()
         .map(|s| crate::templates::SessionRow {
-            id: s.id.clone(),
+            handle: crate::session::session_handle(&s.id),
             created_at: s.created_at.format("%Y-%m-%d %H:%M UTC").to_string(),
             user_agent: s
                 .user_agent
@@ -737,10 +853,11 @@ pub async fn overview(
     .into_response()
 }
 
-/// Logs out a *different* device (Phase 6) — deletes one session row by
-/// ID. POST-only (see the router) and scoped to the caller's own
-/// subject+base_domain, so a valid session lets you manage your own other
-/// sessions but never anyone else's, even by guessing an ID.
+/// Logs out a *different* device (Phase 6) — deletes one session row,
+/// named by its opaque handle. POST-only (see the router), same-origin
+/// only, and the handle is only ever matched against the caller's own
+/// sessions on this base domain, so a valid session lets you manage your
+/// own other sessions but never anyone else's.
 pub async fn revoke_session(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -753,23 +870,31 @@ pub async fn revoke_session(
     let Some(base_domain) = base_domain_for_auth_host(&state, &host) else {
         return StatusCode::BAD_GATEWAY.into_response();
     };
+    if let Some(response) = same_origin_denial(&headers, &base_domain.auth_subdomain) {
+        return response;
+    }
 
     let Some(session) = current_session(&state, &jar, &base_domain.name).await else {
         return redirect_to_login(&base_domain.auth_subdomain);
     };
 
-    match db::get_session(&state.db, &params.session_id).await {
-        Ok(Some(target))
-            if target.subject == session.subject && target.base_domain == session.base_domain =>
-        {
-            if let Err(err) = db::delete_session(&state.db, &params.session_id).await {
-                tracing::error!(%err, "failed to revoke session");
+    match db::list_sessions_for_subject(&state.db, &base_domain.name, &session.subject).await {
+        Ok(own_sessions) => {
+            match own_sessions
+                .iter()
+                .find(|s| crate::session::session_handle(&s.id) == params.session)
+            {
+                Some(target) => {
+                    if let Err(err) = db::delete_session(&state.db, &target.id).await {
+                        tracing::error!(%err, "failed to revoke session");
+                    }
+                }
+                None => {
+                    tracing::warn!(subject = %session.subject, "attempted to revoke a session that isn't theirs; ignoring");
+                }
             }
         }
-        Ok(_) => {
-            tracing::warn!(subject = %session.subject, "attempted to revoke a session that isn't theirs; ignoring");
-        }
-        Err(err) => tracing::error!(%err, "failed to look up session to revoke"),
+        Err(err) => tracing::error!(%err, "failed to look up sessions to revoke"),
     }
 
     Redirect::to(&format!("https://{}/", base_domain.auth_subdomain)).into_response()
@@ -825,6 +950,9 @@ pub async fn logout(
             "This host isn't configured as an auth subdomain for any base domain.",
         );
     };
+    if let Some(response) = same_origin_denial(&headers, &base_domain.auth_subdomain) {
+        return response;
+    }
 
     if let Some(cookie) = jar.get(SESSION_COOKIE_NAME)
         && let Err(err) = db::delete_session(&state.db, cookie.value()).await
