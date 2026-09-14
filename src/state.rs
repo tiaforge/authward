@@ -21,13 +21,14 @@ pub struct AppStateInner {
     pub db: SqlitePool,
     pub cookie_key: Key,
     pub refresh_cipher: RefreshTokenCipher,
-    /// Keyed by base domain name (see `config::BaseDomain::name`).
+    /// All keyed by provider key (see `config::ResolvedHost::provider_key`):
+    /// the provider's static config, its OIDC client, its JWKS cache
+    /// (refreshable independently of the client — see `jwks_cache` module
+    /// docs), and its `end_session_endpoint` (`None` when it has no
+    /// RP-Initiated Logout support).
+    pub providers: HashMap<String, crate::config::Provider>,
     pub oidc_clients: HashMap<String, DiscoveredClient>,
-    /// Keyed by base domain name too, but refreshable independently of
-    /// `oidc_clients` — see `jwks_cache` module docs (Phase 5).
     pub jwks_caches: HashMap<String, JwksCache>,
-    /// Keyed by base domain name; `None` for a provider with no
-    /// RP-Initiated Logout support (Phase 8).
     pub end_session_endpoints: HashMap<String, Option<url::Url>>,
     pub http_client: openidconnect::reqwest::Client,
     pub session_locks: SessionLocks,

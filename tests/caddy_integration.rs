@@ -247,6 +247,7 @@ async fn full_flow_through_real_caddy() {
         authgate::config::ResolvedHost {
             host: Some("app.test.local".to_string()),
             base_domain: "test.local".to_string(),
+            provider_key: "test.local".to_string(),
             provider: authgate::config::Provider {
                 discovery_url: url::Url::parse(&format!(
                     "{idp_base_url}/.well-known/openid-configuration"

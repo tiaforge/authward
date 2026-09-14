@@ -424,6 +424,7 @@ fn resolved_host(host: &str, base_domain: &str, idp_base_url: &str) -> config::R
         host: Some(host.to_string()),
         base_domain: base_domain.to_string(),
         provider: test_provider(idp_base_url),
+        provider_key: base_domain.to_string(),
         required_group: None,
         group_claim_name: "groups".to_string(),
         bypass_paths: Vec::new(),
@@ -1056,6 +1057,7 @@ async fn reaper_deletes_sessions_with_no_refresh_token_survivors() {
         &state.db,
         "reaper-test-session",
         "test.local",
+        "test.local",
         "alice",
         None,
         None,
@@ -1261,6 +1263,131 @@ async fn a_different_base_domain_does_not_accept_the_session() {
             .status(),
         reqwest::StatusCode::UNAUTHORIZED,
         "a session for one base domain must not verify against a completely different base domain, even with the same (forged) cookie"
+    );
+}
+
+/// A host-level `provider` override really does put that host on a
+/// different IdP: logins bound for it go there, a session from the base
+/// domain's default IdP isn't accepted for it (and vice versa), and
+/// logout ends the session at the IdP that created it.
+#[tokio::test]
+async fn per_host_provider_override_is_honored() {
+    let (idp_a, _count_a, _tokens_a) = spawn_mock_idp(Duration::from_secs(3600)).await;
+    let (idp_b, _count_b, _tokens_b) = spawn_mock_idp(Duration::from_secs(3600)).await;
+    let db_dir = tempfile::tempdir().unwrap();
+    let mut cfg = base_config(&db_dir.path().join("sessions.db"));
+    cfg.base_domains.insert(
+        "test.local".to_string(),
+        base_domain_block("test.local", "auth.test.local", &idp_a),
+    );
+    cfg.hosts.insert(
+        "app.test.local".to_string(),
+        resolved_host("app.test.local", "test.local", &idp_a),
+    );
+    cfg.hosts.insert(
+        "partner.test.local".to_string(),
+        config::ResolvedHost {
+            provider: test_provider(&idp_b),
+            provider_key: "host:partner.test.local".to_string(),
+            ..resolved_host("partner.test.local", "test.local", &idp_a)
+        },
+    );
+    let (app, _state) = spawn_app_with_config(cfg).await;
+    let idp_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    // Bound for the default host: the login goes to IdP A...
+    let mut browser = Browser::new();
+    let resp = browser
+        .get(
+            &app,
+            "auth.test.local",
+            &format!("/login?rd={}", urlencode("https://app.test.local/")),
+        )
+        .await;
+    assert!(
+        location(&resp).starts_with(&idp_a),
+        "a login for the default host must go to the base domain's IdP"
+    );
+    login_as(
+        &app,
+        &idp_client,
+        &mut browser,
+        "alice",
+        "https://app.test.local/",
+    )
+    .await;
+    assert_eq!(
+        browser
+            .get(&app, "app.test.local", "/verify")
+            .await
+            .status(),
+        reqwest::StatusCode::OK
+    );
+    // ...and that session is not a login at the partner host.
+    assert_eq!(
+        browser
+            .get(&app, "partner.test.local", "/verify")
+            .await
+            .status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "a session from IdP A must not be accepted by a host configured for IdP B"
+    );
+
+    // Bound for the partner host: the login goes to IdP B, and the
+    // resulting session works there but not at the default host.
+    let mut browser = Browser::new();
+    let resp = browser
+        .get(
+            &app,
+            "auth.test.local",
+            &format!("/login?rd={}", urlencode("https://partner.test.local/")),
+        )
+        .await;
+    assert!(
+        location(&resp).starts_with(&idp_b),
+        "a login for an overridden host must go to that host's IdP, got {}",
+        location(&resp)
+    );
+    login_as(
+        &app,
+        &idp_client,
+        &mut browser,
+        "bob",
+        "https://partner.test.local/",
+    )
+    .await;
+    assert_eq!(
+        browser
+            .get(&app, "partner.test.local", "/verify")
+            .await
+            .status(),
+        reqwest::StatusCode::OK
+    );
+    assert_eq!(
+        browser
+            .get(&app, "app.test.local", "/verify")
+            .await
+            .status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "a session from IdP B must not be accepted by a host on the default IdP"
+    );
+
+    // The dashboard still works for this session, and logout ends it at
+    // the IdP that created it.
+    assert_eq!(
+        browser.get(&app, "auth.test.local", "/").await.status(),
+        reqwest::StatusCode::OK
+    );
+    let resp = browser
+        .post_form(&app, "auth.test.local", "/logout", &[])
+        .await;
+    assert!(
+        location(&resp).starts_with(&format!("{idp_b}/end-session")),
+        "logout must go to the session's own IdP, got {}",
+        location(&resp)
     );
 }
 

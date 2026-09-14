@@ -50,7 +50,7 @@ is optional and inherits from the named base domain when omitted.
 | Field | Required | Default | Notes |
 |---|---|---|---|
 | `base_domain` | yes | — | Must name a configured `[base_domain."..."]`; a dangling reference is a hard config error. |
-| `provider` | no | inherited | **Not functional yet — see [Known gap](#known-gap-per-host-provider-override).** Accepted and validated (all three of `discovery_url`, `client_id`, `client_secret`, or none), but ignored at runtime; the base domain's provider is used regardless. |
+| `provider` | no | inherited | A full override (`discovery_url`, `client_id`, `client_secret`, all three or none — partial overrides are rejected rather than merged field-by-field). Puts this one host on a different OIDC client or a different IdP than its base domain's default; see [Per-host providers](#per-host-providers) for how sessions behave. |
 | `required_group` | no | none (any valid login passes) | Value the claim named by `group_claim_name` must contain. Checked after every login and every silent refresh — losing the group mid-session denies on the next refresh, not just at next login. |
 | `group_claim_name` | no | `groups` | The claim can be a JSON array of strings or a single string; anything else, or a missing claim while `required_group` is set, fails closed (denied). |
 | `bypass_paths` | no | `[]` | Exact paths (no query string, no fragment) that skip auth entirely — e.g. `/healthz` on an app that has its own. Must start with `/`; must not contain `?` or `#`. Matching is exact-path only after one round of percent-decoding; a query string or fragment appended to a protected path never matches a bypass entry. |
@@ -66,38 +66,39 @@ explicit host entry. Omit it entirely to make an unrecognized host a
 hard failure (logged, `502`) instead of silently falling back to
 something.
 
-## Known gap: per-host `provider` override
+## Per-host providers
 
-The per-host `provider` override is parsed, validated and stored on the
-resolved host config, but nothing at runtime reads it. The OIDC clients,
-JWKS caches and end-session endpoints are built once per *base domain*
-(`build_state` in `src/lib.rs`), and `/login`, `/callback`, `/token`,
-silent refresh and bearer-token validation all look them up by base
-domain. Session rows record the base domain but not the issuer.
+Every distinct provider — each base domain's default plus every host
+(or fallback) `provider` override — is discovered at startup and gets
+its own OIDC client and JWKS cache. All clients under one base domain
+share that base domain's `https://<auth_subdomain>/callback` as their
+redirect URI, so register that URI at each IdP.
 
-Consequences until this is implemented:
+A session records which provider logged it in, and a host only accepts
+sessions from *its* provider:
 
-- A host with a `provider` override authenticates against its base
-  domain's default IdP, not the one in the override — and a session
-  obtained through the default IdP is accepted for that host, because
-  session validation only checks the base domain.
-- If two IdPs ever did share a base domain, sessions are keyed by
-  `(base_domain, subject)` alone, so a `sub` collision across IdPs would
-  let one user list and revoke the other's sessions from the dashboard.
-
-Wiring it up means: per-host OIDC client / JWKS cache / end-session
-endpoint (keyed by host, falling back to the base domain's), a per-host
-redirect URI or a shared callback that dispatches on the flow cookie's
-host, an `issuer` column on session rows, and `verify_session` checking
-issuer as well as base domain. Until then, put a host that needs a
-different IdP on its own base domain.
+- `/login?rd=https://partner.example.com/...` runs the login at the
+  provider `partner.example.com` is configured with (the host named by
+  `rd`; no `rd`, or an unknown host, means the base domain's default).
+  `/token?host=...` likewise uses the target host's provider.
+- `/verify` for a host rejects a session established at any other
+  provider, even on the same base domain, and sends the browser to log
+  in at the right one. Bearer tokens are validated against the host's
+  own provider's JWKS and issuer.
+- A base domain still has one session cookie. Logging in at an
+  overridden host replaces a session from the default provider (and
+  vice versa), so a user moving between hosts on different providers is
+  bounced through `/login` each time they cross over — silently, when
+  the IdP still has its own session. Put hosts that users move between
+  constantly on the same provider.
+- The dashboard lists and revokes only sessions from the same provider
+  as the current one; the same `sub` string at two IdPs is two people.
+- `/logout` ends the session at the IdP that created it.
 
 ## Two-provider example
 
-**This example describes the intended behavior of the per-host override,
-which is not yet functional — see the known gap above.** A host can point
-at an entirely different IdP than its base domain's default by fully
-overriding `provider`:
+A host can point at an entirely different IdP than its base domain's
+default by fully overriding `provider`:
 
 ```toml
 [global]

@@ -31,6 +31,27 @@ impl Config {
     pub fn resolve_host(&self, host: &str) -> Option<&ResolvedHost> {
         self.hosts.get(host).or(self.fallback.as_ref())
     }
+
+    /// Every distinct provider to discover at startup, keyed the way
+    /// `ResolvedHost::provider_key` names it, with the base domain whose
+    /// auth subdomain serves its `/callback`: each base domain's default,
+    /// plus every host-level (and fallback) override.
+    pub fn providers(&self) -> Vec<(String, &Provider, &BaseDomain)> {
+        let mut out: Vec<(String, &Provider, &BaseDomain)> = self
+            .base_domains
+            .iter()
+            .map(|(name, bd)| (name.clone(), &bd.provider, bd))
+            .collect();
+        for host in self.hosts.values().chain(self.fallback.iter()) {
+            if self.base_domains.contains_key(&host.provider_key) {
+                continue;
+            }
+            if let Some(bd) = self.base_domains.get(&host.base_domain) {
+                out.push((host.provider_key.clone(), &host.provider, bd));
+            }
+        }
+        out
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -84,6 +105,13 @@ pub struct ResolvedHost {
     pub host: Option<String>,
     pub base_domain: String,
     pub provider: Provider,
+    /// Which discovered provider this host authenticates against: the
+    /// base domain's name when inheriting its provider, `host:<name>` for
+    /// a host-level override, `fallback` for the fallback's. Keys the
+    /// OIDC client / JWKS cache maps in `AppState`, and is recorded on
+    /// every session so a login at one provider is never accepted by a
+    /// host that uses another.
+    pub provider_key: String,
     pub required_group: Option<String>,
     pub group_claim_name: String,
     pub bypass_paths: Vec<String>,
@@ -388,10 +416,16 @@ fn resolve_host(
         return Err(errors);
     }
 
+    let provider_key = if raw.provider.is_some() {
+        format!("host:{}", host_name.to_ascii_lowercase())
+    } else {
+        base_domain_key.clone()
+    };
     Ok(ResolvedHost {
         host: Some(host_name.to_ascii_lowercase()),
         base_domain: base_domain_key,
         provider: provider.expect("provider resolved without error"),
+        provider_key,
         required_group: raw.required_group.clone(),
         group_claim_name: raw
             .group_claim_name
@@ -437,10 +471,16 @@ fn resolve_fallback(
         return Err(errors);
     }
 
+    let provider_key = if raw.provider.is_some() {
+        "fallback".to_string()
+    } else {
+        base_domain_key.clone()
+    };
     Ok(ResolvedHost {
         host: None,
         base_domain: base_domain_key,
         provider: provider.expect("provider resolved without error"),
+        provider_key,
         required_group: raw.required_group.clone(),
         group_claim_name: raw
             .group_claim_name
@@ -584,6 +624,65 @@ refresh_token_encryption_key = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn host_provider_override_gets_its_own_provider_key() {
+        let file = write_config(
+            r#"
+[global]
+cookie_signing_key = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+refresh_token_encryption_key = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+[base_domain."example.com"]
+auth_subdomain = "auth.example.com"
+
+[base_domain."example.com".provider]
+discovery_url = "https://idp-a.example.com/.well-known/openid-configuration"
+client_id = "a"
+client_secret = "secret-a"
+
+[host."app.example.com"]
+base_domain = "example.com"
+
+[host."Partner.example.com"]
+base_domain = "example.com"
+
+[host."Partner.example.com".provider]
+discovery_url = "https://idp-b.example.com/.well-known/openid-configuration"
+client_id = "b"
+client_secret = "secret-b"
+"#,
+        );
+        let cfg = load(file.path()).expect("valid config should load");
+        assert_eq!(cfg.hosts["app.example.com"].provider_key, "example.com");
+        assert_eq!(
+            cfg.hosts["partner.example.com"].provider_key,
+            "host:partner.example.com"
+        );
+
+        let mut keys: Vec<_> = cfg
+            .providers()
+            .into_iter()
+            .map(|(k, p, bd)| (k, p.client_id.clone(), bd.auth_subdomain.clone()))
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                (
+                    "example.com".to_string(),
+                    "a".to_string(),
+                    "auth.example.com".to_string()
+                ),
+                (
+                    "host:partner.example.com".to_string(),
+                    "b".to_string(),
+                    "auth.example.com".to_string()
+                ),
+            ],
+            "one provider per base domain plus one per override, each with its callback base domain"
+        );
     }
 
     #[test]

@@ -38,20 +38,26 @@ use crate::state::{AppState, AppStateInner};
 pub async fn build_state(cfg: Config) -> anyhow::Result<AppState> {
     let http_client = oidc::build_http_client()?;
 
+    let mut providers = HashMap::new();
     let mut oidc_clients = HashMap::new();
     let mut jwks_caches = HashMap::new();
     let mut end_session_endpoints = HashMap::new();
-    for (name, base_domain) in &cfg.base_domains {
+    // One discovery per distinct provider: each base domain's default plus
+    // every host-level override. All clients of a base domain share its
+    // auth subdomain's /callback as redirect URI — that's what gets
+    // registered at each IdP.
+    for (key, provider, base_domain) in cfg.providers() {
         let redirect_uri =
             RedirectUrl::new(format!("https://{}/callback", base_domain.auth_subdomain))?;
-        tracing::info!(base_domain = name, discovery_url = %base_domain.provider.discovery_url, "discovering OIDC provider");
-        let discovered = oidc::discover(&http_client, &base_domain.provider, redirect_uri).await?;
+        tracing::info!(provider_key = %key, discovery_url = %provider.discovery_url, "discovering OIDC provider");
+        let discovered = oidc::discover(&http_client, provider, redirect_uri).await?;
         jwks_caches.insert(
-            name.clone(),
+            key.clone(),
             JwksCache::new(discovered.issuer, discovered.jwks_uri, discovered.jwks),
         );
-        end_session_endpoints.insert(name.clone(), discovered.end_session_endpoint);
-        oidc_clients.insert(name.clone(), discovered.client);
+        end_session_endpoints.insert(key.clone(), discovered.end_session_endpoint);
+        oidc_clients.insert(key.clone(), discovered.client);
+        providers.insert(key, provider.clone());
     }
 
     let db = db::connect(&cfg.global.sqlite_path).await?;
@@ -66,6 +72,7 @@ pub async fn build_state(cfg: Config) -> anyhow::Result<AppState> {
         db,
         cookie_key,
         refresh_cipher,
+        providers,
         oidc_clients,
         jwks_caches,
         end_session_endpoints,

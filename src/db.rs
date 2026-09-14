@@ -30,6 +30,13 @@ fn migrator() -> Migrator {
             include_str!("../migrations/0002_session_claims.sql").into_sql_str(),
             false,
         ),
+        Migration::new(
+            3,
+            "session_provider".into(),
+            MigrationType::ReversibleUp,
+            include_str!("../migrations/0003_session_provider.sql").into_sql_str(),
+            false,
+        ),
     ];
     Migrator::with_migrations(migrations)
 }
@@ -58,6 +65,10 @@ pub async fn connect(path: &Path) -> anyhow::Result<SqlitePool> {
 pub struct Session {
     pub id: String,
     pub base_domain: String,
+    /// The provider that authenticated this session (see
+    /// `config::ResolvedHost::provider_key`); a host using a different
+    /// provider must not accept it.
+    pub provider_key: String,
     pub subject: String,
     pub email: Option<String>,
     pub refresh_token: Option<(Vec<u8>, Vec<u8>)>, // (nonce, ciphertext)
@@ -99,6 +110,7 @@ pub async fn create_session(
     pool: &SqlitePool,
     id: &str,
     base_domain: &str,
+    provider_key: &str,
     subject: &str,
     email: Option<&str>,
     refresh_token: Option<(Vec<u8>, Vec<u8>)>,
@@ -112,12 +124,13 @@ pub async fn create_session(
     };
     sqlx::query(
         "INSERT INTO sessions \
-         (id, base_domain, subject, email, refresh_token_nonce, refresh_token_ciphertext, \
-          expires_at, created_at, user_agent, claims_json) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         (id, base_domain, provider_key, subject, email, refresh_token_nonce, \
+          refresh_token_ciphertext, expires_at, created_at, user_agent, claims_json) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(id)
     .bind(base_domain)
+    .bind(provider_key)
     .bind(subject)
     .bind(email)
     .bind(nonce)
@@ -131,8 +144,8 @@ pub async fn create_session(
     Ok(())
 }
 
-const SESSION_COLUMNS: &str = "id, base_domain, subject, email, refresh_token_nonce, refresh_token_ciphertext, \
-     expires_at, created_at, user_agent, claims_json";
+const SESSION_COLUMNS: &str = "id, base_domain, provider_key, subject, email, refresh_token_nonce, \
+     refresh_token_ciphertext, expires_at, created_at, user_agent, claims_json";
 
 fn session_from_row(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<Session> {
     let nonce: Option<Vec<u8>> = row.try_get("refresh_token_nonce")?;
@@ -142,10 +155,20 @@ fn session_from_row(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<Session> {
         _ => None,
     };
     let claims_json: String = row.try_get("claims_json")?;
+    let base_domain: String = row.try_get("base_domain")?;
+    // Rows from before migration 3 have no provider recorded; they could
+    // only have come from the base domain's default provider.
+    let provider_key: String = row.try_get("provider_key")?;
+    let provider_key = if provider_key.is_empty() {
+        base_domain.clone()
+    } else {
+        provider_key
+    };
 
     Ok(Session {
         id: row.try_get("id")?,
-        base_domain: row.try_get("base_domain")?,
+        base_domain,
+        provider_key,
         subject: row.try_get("subject")?,
         email: row.try_get("email")?,
         refresh_token,
@@ -171,19 +194,26 @@ pub async fn get_session(pool: &SqlitePool, id: &str) -> anyhow::Result<Option<S
     row.as_ref().map(session_from_row).transpose()
 }
 
-/// Every session belonging to `subject` on `base_domain`, newest first —
-/// the overview page's device list (Phase 6). Deliberately scoped to one
-/// base domain: sessions on a different base domain are a different
-/// login even for the same subject string (no SSO across base domains).
+/// Every session belonging to `subject` at `provider_key` on
+/// `base_domain`, newest first — the overview page's device list (Phase
+/// 6). Deliberately scoped to one base domain *and* one provider: the
+/// same subject string at a different provider is a different person as
+/// far as anyone can tell, and must never see or revoke these.
 pub async fn list_sessions_for_subject(
     pool: &SqlitePool,
     base_domain: &str,
+    provider_key: &str,
     subject: &str,
 ) -> anyhow::Result<Vec<Session>> {
     let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
-        "SELECT {SESSION_COLUMNS} FROM sessions WHERE base_domain = ? AND subject = ? ORDER BY created_at DESC"
+        "SELECT {SESSION_COLUMNS} FROM sessions \
+         WHERE base_domain = ? AND (provider_key = ? OR (provider_key = '' AND ? = base_domain)) \
+           AND subject = ? \
+         ORDER BY created_at DESC"
     )))
     .bind(base_domain)
+    .bind(provider_key)
+    .bind(provider_key)
     .bind(subject)
     .fetch_all(pool)
     .await?;

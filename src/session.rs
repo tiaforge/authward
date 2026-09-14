@@ -52,10 +52,17 @@ pub enum VerifyOutcome {
 /// `.other.com` app, but nothing stops a forged `Cookie` header from
 /// trying exactly that, so it's re-checked server-side rather than
 /// trusted implicitly.
+///
+/// `expected_provider_key` is the provider the *host* being accessed
+/// authenticates against; a session established at a different provider
+/// (a host-level override) is not a login there, whatever the base
+/// domain. `None` accepts any provider — for the dashboard routes, which
+/// belong to the base domain as a whole.
 pub async fn verify_session(
     state: &AppState,
     session_id: &str,
     expected_base_domain: &str,
+    expected_provider_key: Option<&str>,
 ) -> VerifyOutcome {
     let session = match db::get_session(&state.db, session_id).await {
         Ok(Some(session)) => session,
@@ -67,6 +74,12 @@ pub async fn verify_session(
     };
     if session.base_domain != expected_base_domain {
         tracing::warn!(session_id = %log_id(session_id), session_base_domain = %session.base_domain, expected_base_domain, "session presented against the wrong base domain");
+        return VerifyOutcome::Invalid;
+    }
+    if let Some(expected) = expected_provider_key
+        && session.provider_key != expected
+    {
+        tracing::info!(session_id = %log_id(session_id), session_provider = %session.provider_key, expected_provider = expected, "session was established at a different provider than this host uses");
         return VerifyOutcome::Invalid;
     }
     if session.is_past_max_age(state.config.global.session_max_age) {
@@ -96,7 +109,9 @@ pub async fn verify_session(
                     return VerifyOutcome::Invalid;
                 }
             };
-            if session.base_domain != expected_base_domain {
+            if session.base_domain != expected_base_domain
+                || expected_provider_key.is_some_and(|e| session.provider_key != e)
+            {
                 return VerifyOutcome::Invalid;
             }
             if !session.is_expired() {
@@ -108,8 +123,8 @@ pub async fn verify_session(
 }
 
 async fn refresh(state: &AppState, mut session: Session) -> VerifyOutcome {
-    let Some(oidc_client) = state.oidc_clients.get(&session.base_domain) else {
-        tracing::warn!(session_id = %log_id(&session.id), base_domain = %session.base_domain, "no OIDC client for session's base domain; clearing session");
+    let Some(oidc_client) = state.oidc_clients.get(&session.provider_key) else {
+        tracing::warn!(session_id = %log_id(&session.id), provider_key = %session.provider_key, "no OIDC client for session's provider; clearing session");
         clear(state, &session.id).await;
         return VerifyOutcome::Invalid;
     };

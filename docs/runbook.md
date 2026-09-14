@@ -59,13 +59,15 @@ Two shapes, depending on scope:
   the common case and needs no special handling — base domains are
   already fully independent.
 - **One host on an existing base domain, but a different IdP than that
-  base domain's default** — **not currently functional; do not rely on
-  it.** The per-host `provider` override is accepted by the config loader
-  but never used at runtime: login, refresh and bearer-token validation
-  all use the base domain's provider (see the known gap in
-  [config-reference.md](config-reference.md#known-gap-per-host-provider-override)).
-  Until that's wired up, a host that needs a different IdP must live on
-  its own base domain.
+  base domain's default** (e.g. a partner's app that authenticates
+  against the partner's own IdP while staying under your domain's
+  single-sign-on umbrella for everything else): give that one
+  `[host."..."]` block a full `provider` override — see
+  [config-reference.md](config-reference.md)'s two-provider example and
+  its "Per-host providers" section for how sessions behave across the
+  two. All three provider fields (`discovery_url`, `client_id`,
+  `client_secret`) must be set together; a partial override is a config
+  error, not a merge.
 
 Either way: register the new OIDC client at that provider with a
 redirect URI of `https://<that base domain's auth_subdomain>/callback`

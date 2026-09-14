@@ -59,6 +59,11 @@ struct FlowState {
     pkce_verifier: String,
     rd: String,
     base_domain: String,
+    /// Which provider this login runs against (see
+    /// `config::ResolvedHost::provider_key`) — the host named by `rd`'s,
+    /// or the `/token` target host's, falling back to the base domain's
+    /// default. Recorded on the resulting session.
+    provider_key: String,
     /// Set only for a `/token` flow (Phase 5): on success, `/callback`
     /// displays the access token once instead of creating a session.
     resource: Option<String>,
@@ -194,7 +199,26 @@ pub async fn login(
     Query(params): Query<LoginParams>,
     jar: PrivateCookieJar,
 ) -> Response {
-    start_authorization(&state, &headers, jar, params.rd, None).await
+    start_authorization(&state, &headers, jar, params.rd, None, None).await
+}
+
+/// The provider a `/login` should run against: whichever the host in the
+/// (already validated, same-base-domain) `rd` uses, so a redirect from a
+/// host with a provider override logs in at *that* IdP. Anything else —
+/// no `rd`, an unconfigured host, the auth subdomain itself — is the base
+/// domain's default.
+fn provider_key_for_redirect(
+    state: &AppState,
+    rd: &str,
+    base_domain: &crate::config::BaseDomain,
+) -> String {
+    url::Url::parse(rd)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+        .and_then(|host| state.config.resolve_host(&host))
+        .filter(|resolved| resolved.base_domain == base_domain.name)
+        .map(|resolved| resolved.provider_key.clone())
+        .unwrap_or_else(|| base_domain.name.clone())
 }
 
 /// `/token` helper (Phase 5): authenticates the user exactly like `/login`,
@@ -244,7 +268,15 @@ pub async fn token(
         );
     };
 
-    start_authorization(&state, &headers, jar, None, Some(resource)).await
+    start_authorization(
+        &state,
+        &headers,
+        jar,
+        None,
+        Some(resource),
+        Some(target_host.provider_key.clone()),
+    )
+    .await
 }
 
 /// Shared by `/login` and `/token`: resolves the auth subdomain to its
@@ -257,6 +289,7 @@ async fn start_authorization(
     jar: PrivateCookieJar,
     rd: Option<String>,
     resource: Option<String>,
+    provider_key: Option<String>,
 ) -> Response {
     if let Some(response) = rate_limit_check(state, headers) {
         return response;
@@ -276,18 +309,21 @@ async fn start_authorization(
             "This host isn't configured as an auth subdomain for any base domain.",
         );
     };
-    let Some(oidc_client) = state.oidc_clients.get(&base_domain.name) else {
+
+    let rd = rd
+        .as_deref()
+        .and_then(|rd| validate_redirect_target(rd, &base_domain.name))
+        .unwrap_or_else(|| format!("https://{}/", base_domain.auth_subdomain));
+
+    let provider_key =
+        provider_key.unwrap_or_else(|| provider_key_for_redirect(state, &rd, base_domain));
+    let Some(oidc_client) = state.oidc_clients.get(&provider_key) else {
         return error_page(
             StatusCode::BAD_GATEWAY,
             "Provider unavailable",
             "The identity provider for this domain could not be reached at startup.",
         );
     };
-
-    let rd = rd
-        .as_deref()
-        .and_then(|rd| validate_redirect_target(rd, &base_domain.name))
-        .unwrap_or_else(|| format!("https://{}/", base_domain.auth_subdomain));
 
     let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
 
@@ -313,6 +349,7 @@ async fn start_authorization(
         pkce_verifier: pkce_verifier.secret().clone(),
         rd,
         base_domain: base_domain.name.clone(),
+        provider_key,
         resource,
     };
     let flow_json = match serde_json::to_string(&flow) {
@@ -417,7 +454,7 @@ pub async fn callback(
         );
     };
 
-    let Some(oidc_client) = state.oidc_clients.get(&flow.base_domain) else {
+    let Some(oidc_client) = state.oidc_clients.get(&flow.provider_key) else {
         return error_page_clearing_flow(
             jar,
             StatusCode::BAD_GATEWAY,
@@ -547,6 +584,7 @@ pub async fn callback(
         &state.db,
         &session_id,
         &flow.base_domain,
+        &flow.provider_key,
         &subject,
         email.as_deref(),
         refresh_token,
@@ -565,7 +603,12 @@ pub async fn callback(
         );
     }
 
-    tracing::info!(subject, base_domain = flow.base_domain, "login succeeded");
+    tracing::info!(
+        subject,
+        base_domain = flow.base_domain,
+        provider_key = flow.provider_key,
+        "login succeeded"
+    );
 
     let session_cookie = Cookie::build((SESSION_COOKIE_NAME, session_id))
         .domain(format!(".{}", flow.base_domain))
@@ -614,15 +657,19 @@ pub async fn verify(
         return bearer_auth(&state, &headers, &host, resolved_host).await;
     };
 
-    let session =
-        match crate::session::verify_session(&state, cookie.value(), &resolved_host.base_domain)
-            .await
-        {
-            crate::session::VerifyOutcome::Valid(session) => session,
-            crate::session::VerifyOutcome::Invalid => {
-                return unauthorized(&state, &headers, &host, resolved_host);
-            }
-        };
+    let session = match crate::session::verify_session(
+        &state,
+        cookie.value(),
+        &resolved_host.base_domain,
+        Some(&resolved_host.provider_key),
+    )
+    .await
+    {
+        crate::session::VerifyOutcome::Valid(session) => session,
+        crate::session::VerifyOutcome::Invalid => {
+            return unauthorized(&state, &headers, &host, resolved_host);
+        }
+    };
 
     // Group-membership authorization (Phase 4): no `required_group`
     // configured on this host means no check, any valid login passes.
@@ -660,7 +707,7 @@ async fn bearer_auth(
     let Some(resource) = &resolved_host.resource else {
         return unauthorized(state, headers, host, resolved_host);
     };
-    let Some(cache) = state.jwks_caches.get(&resolved_host.base_domain) else {
+    let Some(cache) = state.jwks_caches.get(&resolved_host.provider_key) else {
         return unauthorized(state, headers, host, resolved_host);
     };
     let Some(token) = headers
@@ -810,18 +857,24 @@ pub async fn overview(
         return redirect_to_login(&base_domain.auth_subdomain);
     };
 
-    let sessions =
-        match db::list_sessions_for_subject(&state.db, &base_domain.name, &session.subject).await {
-            Ok(sessions) => sessions,
-            Err(err) => {
-                tracing::error!(%err, "failed to list sessions for dashboard");
-                return error_page(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Error",
-                    "Could not load your sessions.",
-                );
-            }
-        };
+    let sessions = match db::list_sessions_for_subject(
+        &state.db,
+        &base_domain.name,
+        &session.provider_key,
+        &session.subject,
+    )
+    .await
+    {
+        Ok(sessions) => sessions,
+        Err(err) => {
+            tracing::error!(%err, "failed to list sessions for dashboard");
+            return error_page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Error",
+                "Could not load your sessions.",
+            );
+        }
+    };
 
     let session_rows = sessions
         .iter()
@@ -878,7 +931,14 @@ pub async fn revoke_session(
         return redirect_to_login(&base_domain.auth_subdomain);
     };
 
-    match db::list_sessions_for_subject(&state.db, &base_domain.name, &session.subject).await {
+    match db::list_sessions_for_subject(
+        &state.db,
+        &base_domain.name,
+        &session.provider_key,
+        &session.subject,
+    )
+    .await
+    {
         Ok(own_sessions) => {
             match own_sessions
                 .iter()
@@ -913,7 +973,7 @@ async fn current_session(
     base_domain: &str,
 ) -> Option<crate::db::Session> {
     let cookie = jar.get(SESSION_COOKIE_NAME)?;
-    match crate::session::verify_session(state, cookie.value(), base_domain).await {
+    match crate::session::verify_session(state, cookie.value(), base_domain, None).await {
         crate::session::VerifyOutcome::Valid(session) => Some(session),
         crate::session::VerifyOutcome::Invalid => None,
     }
@@ -954,10 +1014,19 @@ pub async fn logout(
         return response;
     }
 
-    if let Some(cookie) = jar.get(SESSION_COOKIE_NAME)
-        && let Err(err) = db::delete_session(&state.db, cookie.value()).await
-    {
-        tracing::error!(%err, "failed to delete session on logout");
+    // The IdP to log out of is the one that logged this session in — read
+    // before deleting. No session (or a foreign one) means the base
+    // domain's default, which is where a stray browser most likely was.
+    let mut provider_key = base_domain.name.clone();
+    if let Some(cookie) = jar.get(SESSION_COOKIE_NAME) {
+        if let Ok(Some(session)) = db::get_session(&state.db, cookie.value()).await
+            && session.base_domain == base_domain.name
+        {
+            provider_key = session.provider_key;
+        }
+        if let Err(err) = db::delete_session(&state.db, cookie.value()).await {
+            tracing::error!(%err, "failed to delete session on logout");
+        }
     }
 
     // Must match the Domain/Path the session cookie was originally set
@@ -979,11 +1048,14 @@ pub async fn logout(
         .and_then(|rd| validate_redirect_target(rd, &base_domain.name))
         .unwrap_or(local_logged_out_url);
 
-    let redirect_url = match state.end_session_endpoints.get(&base_domain.name) {
-        Some(Some(end_session_endpoint)) => {
+    let redirect_url = match (
+        state.end_session_endpoints.get(&provider_key),
+        state.providers.get(&provider_key),
+    ) {
+        (Some(Some(end_session_endpoint)), Some(provider)) => {
             let mut url = end_session_endpoint.clone();
             url.query_pairs_mut()
-                .append_pair("client_id", &base_domain.provider.client_id)
+                .append_pair("client_id", &provider.client_id)
                 .append_pair("post_logout_redirect_uri", &post_logout_target);
             url.to_string()
         }
