@@ -2,23 +2,29 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
   <title>API token</title>
-  <style>
-    body { font-family: system-ui, sans-serif; max-width: 36rem; margin: 4rem auto; color: #1a1a1a; padding: 0 1rem; }
-    h1 { font-size: 1.25rem; }
-    textarea {
-      width: 100%; box-sizing: border-box; font-family: ui-monospace, monospace; font-size: 0.85rem;
-      padding: 0.5rem; margin-top: 0.5rem; resize: vertical;
-    }
-    button { margin-top: 0.5rem; padding: 0.4rem 0.8rem; }
-    .warning { color: #7a1f1f; }
-  </style>
+  {% include "_style.html" %}
 </head>
 <body>
-  <h1>API token for {{ resource }}</h1>
-  <p class="warning">This token is shown once and is not stored anywhere — copy it now. Reloading this page will request a new one.</p>
-  <textarea id="token" rows="6" readonly>{{ access_token }}</textarea>
-  <br>
-  <button type="button" onclick="navigator.clipboard.writeText(document.getElementById('token').value)">Copy to clipboard</button>
+  <main class="narrow">
+    <header>
+      <div class="brand">authgate</div>
+      <a class="back" href="/">&larr; Account</a>
+    </header>
+
+    <section class="card identity">
+      <div>
+        <p class="label">API token for</p>
+        <h1><code>{{ resource }}</code></h1>
+        <p class="notice">This token is shown once and is not stored anywhere &mdash; copy it now. Reloading this page will request a new one.</p>
+        <textarea id="token" rows="6" readonly>{{ access_token }}</textarea>
+        <div class="toolbar">
+          <button class="primary" type="button" onclick="navigator.clipboard.writeText(document.getElementById('token').value)">Copy to clipboard</button>
+        </div>
+      </div>
+    </section>
+  </main>
 </body>
 </html>
