@@ -45,9 +45,16 @@ async fn security_headers(request: Request, next: Next) -> Response {
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
     );
+    // `same-origin`, not `no-referrer`: the Fetch standard makes a browser
+    // send `Origin: null` on a non-GET form navigation from a page whose
+    // referrer policy is `no-referrer`, so the dashboard's own Log out /
+    // revoke buttons would trip `same_origin_denial`'s CSRF check. With
+    // `same-origin` the Origin is real for same-origin POSTs and `null`
+    // only for cross-origin ones (which the guard refuses), while the
+    // Referer still never leaves this origin.
     headers.insert(
         header::REFERRER_POLICY,
-        HeaderValue::from_static("no-referrer"),
+        HeaderValue::from_static("same-origin"),
     );
     headers
         .entry(header::CACHE_CONTROL)

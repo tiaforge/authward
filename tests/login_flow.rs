@@ -2709,6 +2709,9 @@ async fn html_responses_carry_security_headers() {
         "frame-ancestors 'none'"
     );
     assert_eq!(h.get("x-content-type-options").unwrap(), "nosniff");
+    // Must not be `no-referrer`: that makes browsers send `Origin: null`
+    // on the dashboard's own form POSTs, which the CSRF guard refuses.
+    assert_eq!(h.get("referrer-policy").unwrap(), "same-origin");
     assert_eq!(h.get("cache-control").unwrap(), "no-store");
 }
 
@@ -2939,6 +2942,10 @@ async fn state_changing_posts_refuse_cross_origin_browsers() {
 
     // A sibling app on the same base domain is same-*site* (SameSite=Lax
     // sends the cookie) but not same-origin: refused, session untouched.
+    // `Origin: null` is what a browser sends for a cross-origin form POST
+    // under our `Referrer-Policy: same-origin` (and, under `no-referrer`,
+    // for *every* form POST — see `security_headers`), so it must be
+    // refused too.
     for headers in [
         &[("origin", "https://evil.test.local")][..],
         &[("sec-fetch-site", "same-site")][..],
