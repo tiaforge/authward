@@ -44,12 +44,21 @@ app.example.com {
 		# verbatim to the client. That's exactly what we want for a 403
 		# (authgate's own "not authorized" page) and a 502 (its
 		# "misconfigured host" page), but a 401 ("not authenticated")
-		# needs to become a redirect to /login instead. authgate's
-		# 401 carries the exact login URL to use in X-Login-Url, with the
-		# original request URL query-encoded inside `rd` — don't rebuild
-		# it here as `...?rd={scheme}://{host}{uri}`: {uri} goes in raw,
-		# so an `&` in the original query string truncates rd.
-		@denied status 401
+		# on a GET needs to become a redirect to /login instead.
+		# authgate's 401 carries the exact login URL to use in
+		# X-Login-Url, with the original request URL query-encoded
+		# inside `rd` — don't rebuild it here as
+		# `...?rd={scheme}://{host}{uri}`: {uri} goes in raw, so an `&`
+		# in the original query string truncates rd.
+		#
+		# Match on the header, not just the status: a 401 for a POST
+		# (or any other non-GET) deliberately has no X-Login-Url, and
+		# is a "session expired, please resubmit" page to relay as-is —
+		# redirecting it would turn the POST into a GET of the same URL.
+		@denied {
+			status 401
+			header X-Login-Url *
+		}
 		handle_response @denied {
 			redir * {http.reverse_proxy.header.X-Login-Url} 302
 		}

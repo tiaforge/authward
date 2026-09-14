@@ -92,6 +92,26 @@ WantedBy=multi-user.target
 Run it as a dedicated non-root user that owns its config and database
 directory — nothing here needs root.
 
+### Login rate limiting
+
+`/login`, `/token` and `/callback` share a per-client-IP token bucket:
+a burst of 20 requests, refilling at 20 per minute. One login costs two
+(the `/login` redirect and the `/callback`), so a single address gets
+about 10 logins a minute sustained, plus the initial burst. IPv6
+clients are keyed per /64, since one subscriber typically holds a whole
+/64. There is no per-account lockout — the limit throttles a source
+address, never a user, so it can't be turned into a targeted lockout.
+
+The thresholds aren't configurable. They're generous for a household or
+a small team, but an office behind a single NAT address logging in en
+masse at the same minute can hit them and see "Too many requests" for a
+few seconds; `/verify` — every request to an already-signed-in app — is
+never rate limited, so existing sessions are unaffected. The client
+address comes from the last hop of `X-Forwarded-For`, i.e. what Caddy
+itself observed; a second proxy layer or CDN in front of Caddy would
+collapse everyone behind it into one bucket unless Caddy is configured
+to trust that layer's forwarded address.
+
 ## Caddy
 
 See [`deploy/Caddyfile`](../deploy/Caddyfile) for a fully-commented
@@ -106,6 +126,15 @@ request URL query-encoded inside `rd`); use
 `redir * {http.reverse_proxy.header.X-Login-Url} 302` rather than
 splicing `{uri}` into a query string yourself, which breaks on any `&`
 in the original request.
+
+Match that `handle_response` on *both* the 401 status and the presence
+of `X-Login-Url`, as the reference file does. Only a GET (or HEAD) can
+be replayed by sending the browser through login and back; a POST, PUT
+or DELETE whose session expired would come out of that redirect chain
+as a bodiless GET of its action URL. For those authgate answers a 401
+*without* `X-Login-Url` and a plain "session expired, please go back
+and resubmit" page, which Caddy relays as-is. The submitted body is not
+buffered or replayed — that's an accepted limitation.
 
 One more trust-boundary note: the session cookie is scoped to
 `Domain=.<base_domain>` — that's what makes single sign-on across the

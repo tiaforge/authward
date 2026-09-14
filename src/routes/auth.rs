@@ -120,8 +120,8 @@ fn same_origin_denial(headers: &HeaderMap, auth_subdomain: &str) -> Option<Respo
     None
 }
 
-/// `/verify`'s 401, carrying the login URL Caddy should redirect to as
-/// `X-Login-Url`. Built here, with the original request URL properly
+/// `/verify`'s 401. For a GET it carries the login URL Caddy should
+/// redirect to as `X-Login-Url`, built here with the original request URL properly
 /// query-encoded inside `rd` — a Caddyfile `redir ...?rd={scheme}://{host}{uri}`
 /// embeds the original URI raw, so any `&` in its query string truncates
 /// `rd`. The Caddyfile reads it back as `{http.reverse_proxy.header.X-Login-Url}`.
@@ -131,6 +131,27 @@ fn unauthorized(
     host: &str,
     resolved_host: &crate::config::ResolvedHost,
 ) -> Response {
+    // Only a GET (or HEAD) can be replayed by redirecting the browser
+    // through login and back: the redirect chain ends in a GET of the
+    // original URL, so a POST/PUT/DELETE whose session expired would
+    // reach the app as a bodiless GET of its action URL. Per the plan's
+    // locked-in decision, that case gets a plain "please resubmit" page
+    // instead — a 401 *without* `X-Login-Url`, which the Caddyfile's
+    // `@denied` matcher requires before it redirects, so Caddy relays
+    // this page as-is. Caddy sets `X-Forwarded-Method`; without it
+    // (direct calls, tests) the request is assumed to be a GET.
+    let method = headers
+        .get("x-forwarded-method")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("GET");
+    if !(method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("HEAD")) {
+        return error_page(
+            StatusCode::UNAUTHORIZED,
+            "Session expired",
+            "Your session expired before this request was submitted. Go back, sign in again if prompted, and resubmit.",
+        );
+    }
+
     let mut response = StatusCode::UNAUTHORIZED.into_response();
     let Some(base_domain) = state.config.base_domains.get(&resolved_host.base_domain) else {
         return response;

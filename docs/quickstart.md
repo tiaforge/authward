@@ -73,8 +73,9 @@ optional fields.
 Add both site blocks from [`deploy/Caddyfile`](../deploy/Caddyfile) to
 your Caddy config — one for the auth subdomain (plain reverse proxy) and
 one per protected app (`forward_auth` + the `handle_response` block that
-turns a 401 into a redirect to `/login`). Adjust the hostnames and
-backend addresses, then reload Caddy.
+turns a 401 on a GET into a redirect to `/login`, plus the `header_up`
+lines that keep the session cookie away from the backend). Adjust the
+hostnames and backend addresses, then reload Caddy.
 
 ## 5. Start authgate
 

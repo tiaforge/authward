@@ -2527,6 +2527,47 @@ async fn verify_401_carries_a_properly_encoded_login_url() {
 }
 
 #[tokio::test]
+async fn verify_401_for_a_non_get_is_a_resubmit_page_without_a_login_url() {
+    let (idp_base_url, _count, _tokens) = spawn_mock_idp(Duration::from_secs(3600)).await;
+    let db_dir = tempfile::tempdir().unwrap();
+    let (app, _state) = spawn_app(&idp_base_url, &db_dir.path().join("sessions.db")).await;
+    let client = reqwest::Client::new();
+
+    for method in ["POST", "PUT", "DELETE", "PATCH"] {
+        let resp = client
+            .get(format!("{app}/verify"))
+            .header("host", "app.test.local")
+            .header("x-forwarded-method", method)
+            .header("x-forwarded-uri", "/submit")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED, "{method}");
+        assert!(
+            resp.headers().get("x-login-url").is_none(),
+            "{method}: a non-GET must not be redirected through login"
+        );
+        assert!(resp.text().await.unwrap().contains("Session expired"));
+    }
+
+    for method in ["GET", "HEAD", "get"] {
+        let resp = client
+            .get(format!("{app}/verify"))
+            .header("host", "app.test.local")
+            .header("x-forwarded-method", method)
+            .header("x-forwarded-uri", "/page")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED, "{method}");
+        assert!(
+            resp.headers().get("x-login-url").is_some(),
+            "{method}: a GET/HEAD is redirected through login"
+        );
+    }
+}
+
+#[tokio::test]
 async fn html_responses_carry_security_headers() {
     let (idp_base_url, _count, _tokens) = spawn_mock_idp(Duration::from_secs(3600)).await;
     let db_dir = tempfile::tempdir().unwrap();

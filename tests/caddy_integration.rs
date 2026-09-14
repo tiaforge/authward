@@ -315,7 +315,10 @@ async fn full_flow_through_real_caddy() {
 			uri /verify
 			copy_headers X-Auth-User X-Auth-Email
 
-			@denied status 401
+			@denied {{
+				status 401
+				header X-Login-Url *
+			}}
 			handle_response @denied {{
 				redir * {{http.reverse_proxy.header.X-Login-Url}} 302
 			}}
@@ -530,6 +533,33 @@ async fn full_flow_through_real_caddy() {
         backend_hits.load(Ordering::SeqCst),
         1,
         "the backend should have been reached exactly once, only after authentication succeeded"
+    );
+
+    // 4. A non-GET without a session is not redirected through login
+    //    (which would replay it as a GET): Caddy relays authgate's own
+    //    "session expired, please resubmit" 401 page instead.
+    let resp = client
+        .post(format!("{caddy_base}/submit"))
+        .header("host", "app.test.local")
+        .body("field=value")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "a POST with no session must not be redirected"
+    );
+    assert!(resp.headers().get("location").is_none());
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("Session expired"),
+        "expected the resubmit page, got: {body}"
+    );
+    assert_eq!(
+        backend_hits.load(Ordering::SeqCst),
+        1,
+        "the unauthenticated POST must never reach the backend"
     );
 
     let _ = caddy.kill();
