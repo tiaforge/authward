@@ -1,19 +1,19 @@
-# Reference Caddyfile for forward-auth (Phase 10).
+# Reference Caddyfile for authgate (Phase 10).
 #
 # Requires Caddy v2.11.2 or newer. Caddy 2.10.0 through 2.11.1 have
 # GHSA-7r4p-vjf4-gxv4: `copy_headers` leaves a client-supplied header in
 # place when the auth response doesn't carry that header, so a client
-# could inject its own X-Auth-User. forward-auth defends in depth by
+# could inject its own X-Auth-User. authgate defends in depth by
 # always sending all three X-Auth-* headers (empty when there's nothing
 # to forward) on every 200, but run a patched Caddy regardless.
 # Verified against Caddy v2.11.4.
 #
 # Two site blocks per base domain: one for the auth subdomain itself
-# (reverse-proxied straight to forward-auth, no forward_auth wrapper —
+# (reverse-proxied straight to authgate, no forward_auth wrapper —
 # it hosts /login, /callback, /logout, /healthz, / directly), and one
 # per protected app (forward_auth in front of the real backend).
 #
-# IMPORTANT — trust boundary: forward-auth trusts X-Forwarded-Host and,
+# IMPORTANT — trust boundary: authgate trusts X-Forwarded-Host and,
 # when forward_identity_headers is enabled for a host, forwards
 # X-Auth-User/X-Auth-Email/X-Auth-Groups based on it. Both this Caddy
 # instance and every backend app it proxies to MUST be unreachable
@@ -34,7 +34,7 @@ app.example.com {
 
 		# Copies the verified identity onto the backend request. Keep
 		# this line even for hosts with forward_identity_headers = false:
-		# forward-auth sends the headers empty in that case, and copying
+		# authgate sends the headers empty in that case, and copying
 		# them is what overwrites (rather than passes through) any
 		# X-Auth-* header the client sent.
 		copy_headers X-Auth-User X-Auth-Email X-Auth-Groups
@@ -42,9 +42,9 @@ app.example.com {
 		# forward_auth does NOT redirect on a non-2xx response by
 		# default — it aborts and relays the auth response's status/body
 		# verbatim to the client. That's exactly what we want for a 403
-		# (forward-auth's own "not authorized" page) and a 502 (its
+		# (authgate's own "not authorized" page) and a 502 (its
 		# "misconfigured host" page), but a 401 ("not authenticated")
-		# needs to become a redirect to /login instead. forward-auth's
+		# needs to become a redirect to /login instead. authgate's
 		# 401 carries the exact login URL to use in X-Login-Url, with the
 		# original request URL query-encoded inside `rd` — don't rebuild
 		# it here as `...?rd={scheme}://{host}{uri}`: {uri} goes in raw,

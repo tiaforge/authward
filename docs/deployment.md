@@ -2,17 +2,17 @@
 
 ## What you're deploying
 
-A single Rust binary (`forward-auth`) plus one TOML config file and one
+A single Rust binary (`authgate`) plus one TOML config file and one
 SQLite database file. No external services required — not even the
 database is separate. This is deliberate: see the plan's locked-in
 "single instance, no HA requirement" decision. There's no clustering
-story and no shared session state; if you need forward-auth on more than
+story and no shared session state; if you need authgate on more than
 one machine, run one instance per deployment, each with its own config
 and SQLite file.
 
 ## The trust boundary — read this first
 
-forward-auth trusts three things unconditionally, because they're only
+authgate trusts three things unconditionally, because they're only
 supposed to be set by a proxy it trusts, not by end clients:
 
 - `X-Forwarded-Host` (falls back to `Host`) — which host config to apply
@@ -20,13 +20,13 @@ supposed to be set by a proxy it trusts, not by end clients:
 - `X-Forwarded-For` (last hop only) — the client IP used for rate limiting
 
 And on the way out, when a host has `forward_identity_headers = true`,
-forward-auth's `/verify` response carries `X-Auth-User` /
+authgate's `/verify` response carries `X-Auth-User` /
 `X-Auth-Email` / `X-Auth-Groups`, which Caddy's `copy_headers` then
 overwrites onto the request forwarded to the backend app.
 
 None of this is safe unless **both** of the following hold:
 
-1. **forward-auth itself is unreachable except through Caddy.** Bind it
+1. **authgate itself is unreachable except through Caddy.** Bind it
    to `127.0.0.1` (the default) or a private network address, never
    `0.0.0.0` on a host with a public interface, and never put it behind
    a second proxy that doesn't strip/overwrite these headers.
@@ -41,21 +41,21 @@ In practice: put Caddy and every backend app on an internal network with
 no other route in (a dedicated Docker network, a private VPC, or
 loopback-only binds on a single host), and don't rely on the backend app
 itself to defend against a spoofed identity header — it has no way to
-tell forward-auth's header apart from a client's.
+tell authgate's header apart from a client's.
 
 ## Files on disk
 
 | File | Contents | Permissions |
 |---|---|---|
-| the config file | OIDC client secrets, and (unless you use the env-var overrides below) the cookie-signing and refresh-token-encryption keys | must be `0600` — forward-auth refuses to start if key material lives in a config file that's group/other-readable |
-| the SQLite database (`sqlite_path`, default `forward-auth.db`) | session rows: subject, email, encrypted refresh token, expiry, raw ID token claims | chmod'd to `0600` automatically at startup |
+| the config file | OIDC client secrets, and (unless you use the env-var overrides below) the cookie-signing and refresh-token-encryption keys | must be `0600` — authgate refuses to start if key material lives in a config file that's group/other-readable |
+| the SQLite database (`sqlite_path`, default `authgate.db`) | session rows: subject, email, encrypted refresh token, expiry, raw ID token claims | chmod'd to `0600` automatically at startup |
 
-As a second layer, forward-auth sets `umask 0o077` for its own process
+As a second layer, authgate sets `umask 0o077` for its own process
 at startup, so any file it creates defaults to owner-only permissions
 even if a call site forgot to `chmod` explicitly.
 
 Secrets can also come from the environment instead of the file:
-`FORWARD_AUTH_COOKIE_KEY` and `FORWARD_AUTH_REFRESH_KEY` take precedence
+`AUTHGATE_COOKIE_KEY` and `AUTHGATE_REFRESH_KEY` take precedence
 over the config file's `cookie_signing_key` / `refresh_token_encryption_key`
 when set — useful for a secrets manager or container orchestrator that
 injects env vars rather than files.
@@ -63,7 +63,7 @@ injects env vars rather than files.
 ## Running it
 
 ```sh
-forward-auth --config /etc/forward-auth/config.toml
+authgate --config /etc/authgate/config.toml
 ```
 
 There's no daemonization built in — run it under systemd, a container
@@ -76,14 +76,14 @@ A minimal systemd unit:
 
 ```ini
 [Unit]
-Description=forward-auth
+Description=authgate
 After=network.target
 
 [Service]
-ExecStart=/usr/local/bin/forward-auth --config /etc/forward-auth/config.toml
+ExecStart=/usr/local/bin/authgate --config /etc/authgate/config.toml
 Restart=on-failure
-User=forward-auth
-WorkingDirectory=/var/lib/forward-auth
+User=authgate
+WorkingDirectory=/var/lib/authgate
 
 [Install]
 WantedBy=multi-user.target
@@ -100,7 +100,7 @@ reference (validated with `caddy adapt`). The shape is: one plain
 block per protected app with an explicit `handle_response` for the 401
 case — `forward_auth` does not redirect on non-2xx by default, it relays
 the response verbatim, so without that block a denied request would show
-forward-auth's raw 401 instead of sending the user to `/login`. The 401
+authgate's raw 401 instead of sending the user to `/login`. The 401
 carries the login URL to redirect to in `X-Login-Url` (with the original
 request URL query-encoded inside `rd`); use
 `redir * {http.reverse_proxy.header.X-Login-Url} 302` rather than
@@ -110,7 +110,7 @@ in the original request.
 One more trust-boundary note: the session cookie is scoped to
 `Domain=.<base_domain>` — that's what makes single sign-on across the
 apps work — so every subdomain under a base domain is *same-site* as far
-as the browser is concerned. forward-auth's own state-changing routes
+as the browser is concerned. authgate's own state-changing routes
 (`/logout`, `/sessions/revoke`) additionally check `Origin` /
 `Sec-Fetch-Site` so a compromised sibling app can't drive them, but a
 sibling app can still *set* a cookie for the whole base domain. Only put
@@ -120,8 +120,8 @@ apps under one base domain that you'd trust with each other's sessions.
 [GHSA-7r4p-vjf4-gxv4](https://github.com/caddyserver/caddy/security/advisories/GHSA-7r4p-vjf4-gxv4):
 `copy_headers` only overwrites a client-supplied header when the auth
 response includes that header, so a request that arrived with its own
-`X-Auth-User` would reach the backend with it intact whenever forward-auth
-had nothing to forward. forward-auth defends in depth by sending all three
+`X-Auth-User` would reach the backend with it intact whenever authgate
+had nothing to forward. authgate defends in depth by sending all three
 `X-Auth-*` headers on every successful `/verify` — empty when the host has
 `forward_identity_headers = false`, on bypass paths, or when a claim is
 absent — so the overwrite always happens. Run a patched Caddy anyway, and

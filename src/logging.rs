@@ -26,11 +26,7 @@ pub fn init(otel_endpoint: Option<&str>) -> Option<SdkLoggerProvider> {
             .expect("failed to build OTLP log exporter");
 
         SdkLoggerProvider::builder()
-            .with_resource(
-                Resource::builder()
-                    .with_service_name("forward-auth")
-                    .build(),
-            )
+            .with_resource(Resource::builder().with_service_name("authgate").build())
             .with_batch_exporter(exporter)
             .build()
     });

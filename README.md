@@ -1,4 +1,4 @@
-# forward-auth
+# authgate
 
 A small Rust + Axum service that adds OIDC login in front of apps that
 don't speak OIDC themselves, via Caddy's `forward_auth` directive. Built
@@ -8,7 +8,7 @@ external dependencies to run.
 
 Start here:
 
-- **[Quickstart](docs/quickstart.md)** — `forward-auth init` walked
+- **[Quickstart](docs/quickstart.md)** — `authgate init` walked
   through end to end, get something running before reading the rest.
 - **[Deployment guide](docs/deployment.md)** — the binary, the config
   file, the trust-boundary requirement, and the Caddy setup.
@@ -20,7 +20,7 @@ Start here:
 - **[API tokens](docs/api-tokens.md)** — resource-scoped bearer tokens
   for non-browser clients (CLIs, scripts), worked through on pocket-id.
 
-See [`forward-auth-plan.md`](forward-auth-plan.md) for the full design
+See [`authgate-plan.md`](authgate-plan.md) for the full design
 rationale and locked-in decisions this implementation follows, and
 [`examples/config.toml`](examples/config.toml) /
 [`deploy/Caddyfile`](deploy/Caddyfile) for copy-and-edit starting points.

@@ -54,7 +54,7 @@ impl Default for RawGlobal {
 }
 
 fn default_sqlite_path() -> PathBuf {
-    PathBuf::from("forward-auth.db")
+    PathBuf::from("authgate.db")
 }
 
 fn default_session_ttl_fallback_seconds() -> u64 {

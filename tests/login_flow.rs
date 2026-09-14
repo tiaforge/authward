@@ -39,7 +39,7 @@ use openidconnect::{
 use serde::Deserialize;
 use serde_json::json;
 
-const CLIENT_ID: &str = "forward-auth-test-client";
+const CLIENT_ID: &str = "authgate-test-client";
 /// Per the OIDC Core spec, HS256/384/512 ID token signatures are verified
 /// using the UTF-8 bytes of the client_secret directly as the HMAC key —
 /// there's no published JWKS entry for it (publishing a symmetric signing
@@ -684,7 +684,7 @@ async fn login_as_with(
         "expected /callback to redirect somewhere"
     );
     assert!(
-        browser.cookies.contains_key("fa_session"),
+        browser.cookies.contains_key("authgate_session"),
         "expected a session cookie after login"
     );
     location(&resp)
@@ -811,9 +811,12 @@ async fn concurrent_logins_do_not_cross_contaminate() {
     assert_eq!(location(&alice_resp), "https://app.test.local/a");
 
     // Both end up with distinct, valid sessions of their own.
-    assert!(alice.cookies.contains_key("fa_session"));
-    assert!(bob.cookies.contains_key("fa_session"));
-    assert_ne!(alice.cookies["fa_session"], bob.cookies["fa_session"]);
+    assert!(alice.cookies.contains_key("authgate_session"));
+    assert!(bob.cookies.contains_key("authgate_session"));
+    assert_ne!(
+        alice.cookies["authgate_session"],
+        bob.cookies["authgate_session"]
+    );
 
     assert_eq!(
         alice.get(&app, "app.test.local", "/verify").await.status(),
@@ -916,7 +919,7 @@ async fn silent_refresh_extends_an_expired_session() {
         .await,
         "https://app.test.local/dashboard"
     );
-    let session_cookie_before = browser.cookies["fa_session"].clone();
+    let session_cookie_before = browser.cookies["authgate_session"].clone();
 
     assert_eq!(
         browser
@@ -945,7 +948,7 @@ async fn silent_refresh_extends_an_expired_session() {
 
     // Same session identity throughout — refresh updates the existing
     // row/cookie rather than minting a new session.
-    assert_eq!(browser.cookies["fa_session"], session_cookie_before);
+    assert_eq!(browser.cookies["authgate_session"], session_cookie_before);
 }
 
 #[tokio::test]
@@ -1015,7 +1018,7 @@ async fn concurrent_verify_requests_collapse_into_one_refresh() {
         .await,
         "https://app.test.local/dashboard"
     );
-    let cookie_header = format!("fa_session={}", browser.cookies["fa_session"]);
+    let cookie_header = format!("authgate_session={}", browser.cookies["authgate_session"]);
 
     tokio::time::sleep(ttl + Duration::from_millis(500)).await;
 
@@ -1103,7 +1106,7 @@ async fn reaper_does_not_delete_a_session_mid_refresh() {
         .await,
         "https://app.test.local/dashboard"
     );
-    let cookie_header = format!("fa_session={}", browser.cookies["fa_session"]);
+    let cookie_header = format!("authgate_session={}", browser.cookies["authgate_session"]);
 
     tokio::time::sleep(ttl + Duration::from_millis(500)).await;
 
@@ -1931,7 +1934,7 @@ async fn token_helper_scopes_the_request_to_the_selected_hosts_resource() {
         "the /token callback should render the token page directly, not redirect"
     );
     assert!(
-        !browser.cookies.contains_key("fa_session"),
+        !browser.cookies.contains_key("authgate_session"),
         "a /token flow must not create a browser session"
     );
 
@@ -2047,7 +2050,7 @@ async fn revoking_a_different_session_only_invalidates_that_one() {
     let html = dashboard.text().await.unwrap();
     for (name, browser) in [("A", &browser_a), ("B", &browser_b)] {
         assert!(
-            !html.contains(&browser.cookies["fa_session"]),
+            !html.contains(&browser.cookies["authgate_session"]),
             "dashboard leaked browser {name}'s raw session ID"
         );
     }
@@ -2397,7 +2400,7 @@ async fn spoofed_identity_header_on_the_request_is_ignored() {
         .header("host", "app.test.local")
         .header(
             "cookie",
-            format!("fa_session={}", browser.cookies["fa_session"]),
+            format!("authgate_session={}", browser.cookies["authgate_session"]),
         )
         .header("x-auth-user", "root")
         .send()

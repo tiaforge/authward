@@ -18,10 +18,10 @@ plan), not an oversight. Rotating either one:
   to `/login`), so this also amounts to a full logout, just discovered
   session-by-session at each one's next refresh instead of all at once.
 
-**Procedure**: generate two new random values (32+ bytes; `forward-auth
+**Procedure**: generate two new random values (32+ bytes; `authgate
 init`'s own key generation — 32 random bytes, hex-encoded — is a fine
 reference for the shape, though you don't need to re-run the wizard
-itself), set them via `FORWARD_AUTH_COOKIE_KEY` / `FORWARD_AUTH_REFRESH_KEY`
+itself), set them via `AUTHGATE_COOKIE_KEY` / `AUTHGATE_REFRESH_KEY`
 (or in the config file, keeping it `chmod 600`), and restart the
 service. Do this during a maintenance window if a mass forced re-login is
 disruptive for your users. There's nothing to migrate in SQLite —
@@ -40,10 +40,10 @@ schedule is one less thing to track.
    Minimally just `base_domain = "..."` inherits everything.
 2. Add a Caddy `forward_auth` site block for it, modeled on
    [`deploy/Caddyfile`](../deploy/Caddyfile)'s `app.example.com` example.
-3. Reload both Caddy and forward-auth. Order doesn't matter — forward-auth
+3. Reload both Caddy and authgate. Order doesn't matter — authgate
    rejects a request for an unconfigured host with a `502` rather than
    crashing, so a brief window where Caddy knows about the host before
-   forward-auth's config is reloaded just produces `502`s, not confusion.
+   authgate's config is reloaded just produces `502`s, not confusion.
 
 No IdP-side change needed unless the new host also needs its own OIDC
 client (see "adding a second provider" below) or its own resource for
@@ -86,12 +86,12 @@ useless as a cookie.
 
 | What you're chasing | Look for | Key fields |
 |---|---|---|
-| Denied at `/verify` for a browser session | `"session presented against the wrong base domain"`, `"no OIDC client for session's base domain; clearing session"`, `"denied: missing required group"` | `session_id`, `subject`, `host`, `required_group` |
+| Denied at `/verify` for a browser session | `"session presented against the wrong base domain"`, `"session was established at a different provider than this host uses"`, `"session past its absolute max age; clearing"`, `"no OIDC client for session's provider; clearing session"`, `"denied: missing required group"` | `session_id`, `subject`, `host`, `required_group`, `session_provider` / `expected_provider` |
 | Denied at `/verify` for a bearer token | `"bearer token rejected"` (validation failure — bad signature, wrong audience, expired, missing scope), `"bearer token denied: missing required group"` | `err`, `host`, `required_group` |
 | Silent refresh failing | `"refresh failed; clearing session"`, `"failed to decrypt stored refresh token"`, `"refreshed id_token failed verification; clearing session"` | `session_id`, `err` |
 | CSRF / stale flow cookie at `/callback` | `"callback state mismatch — possible CSRF or stale flow cookie"` | (no session_id yet at this point — it's pre-login) |
 | IdP returned an error at `/callback` | `"identity provider returned an error"` | `error`, `description` |
-| Config problem at startup | printed to stderr, not through the logger — `forward-auth: N config error(s) found in <path>` followed by every error | — |
+| Config problem at startup | printed to stderr, not through the logger — `authgate: N config error(s) found in <path>` followed by every error | — |
 | JWKS refresh failing (bearer validation may start failing if this persists) | `"periodic JWKS refresh failed"` | `base_domain`, `err` |
 | Rate limited | `"rate limit exceeded on login/callback"` | `ip` |
 | Reaper activity (informational, not a failure) | `"reaper: swept expired sessions"` | `reaped` (count) |
@@ -105,7 +105,7 @@ not include a port).
 
 ## Revoking API access
 
-There is no per-token revoke on forward-auth's side by design (see
+There is no per-token revoke on authgate's side by design (see
 [api-tokens.md](api-tokens.md)) — validation is stateless, and nothing
 about a specific issued token is tracked here. To cut off access:
 
@@ -116,13 +116,13 @@ about a specific issued token is tracked here. To cut off access:
   check your IdP's default access-token TTL for that resource).
 - To force an immediate cut, shorten the resource's access-token TTL at
   the IdP (if supported) rather than trying to intervene from
-  forward-auth's side.
+  authgate's side.
 
 Disabling a **user** at the IdP takes effect at that user's next silent
 refresh — i.e. within one access-token lifetime (`expires_in`, typically
-minutes to an hour) — when the IdP refuses the refresh and forward-auth
+minutes to an hour) — when the IdP refuses the refresh and authgate
 clears the session. There is no back-channel logout, so if you need it
-faster, shorten the access-token TTL at the IdP for forward-auth's
+faster, shorten the access-token TTL at the IdP for authgate's
 client. `session_max_age_seconds` (default 24h) is the hard upper bound
 on any session regardless of what the IdP does.
 
@@ -134,4 +134,4 @@ domain — never anyone else's, even by guessing a session ID. `/logout`
 (also POST-only) ends the current session and, when the provider
 supports RP-Initiated Logout, sends the browser to the IdP's own
 `end_session_endpoint` too so the IdP-side session ends as well, not
-just forward-auth's.
+just authgate's.

@@ -1,8 +1,8 @@
 # Quickstart
 
-This walks through getting forward-auth running end to end with one IdP
+This walks through getting authgate running end to end with one IdP
 (pocket-id, but any OIDC provider works the same way) and two apps on one
-base domain, using `forward-auth init` rather than hand-editing TOML.
+base domain, using `authgate init` rather than hand-editing TOML.
 Read this before the [config reference](config-reference.md) — the goal
 here is a working setup, not full coverage of every field.
 
@@ -16,7 +16,7 @@ here is a working setup, not full coverage of every field.
 - Caddy in front of both this service and the apps it protects, on a
   network where nothing but Caddy can reach either — see
   [deployment.md](deployment.md) for why this matters.
-- The `forward-auth` binary built (`cargo build --release`) or otherwise
+- The `authgate` binary built (`cargo build --release`) or otherwise
   available on the host that will run it.
 
 ## 1. Register the OIDC client at your IdP
@@ -32,7 +32,7 @@ Note the client ID and client secret — the wizard will ask for them next.
 ## 2. Run the wizard
 
 ```sh
-forward-auth init
+authgate init
 ```
 
 It prompts for:
@@ -76,10 +76,10 @@ one per protected app (`forward_auth` + the `handle_response` block that
 turns a 401 into a redirect to `/login`). Adjust the hostnames and
 backend addresses, then reload Caddy.
 
-## 5. Start forward-auth
+## 5. Start authgate
 
 ```sh
-forward-auth --config config.toml
+authgate --config config.toml
 ```
 
 It listens on `127.0.0.1:8080` by default (see `listen_addr` in

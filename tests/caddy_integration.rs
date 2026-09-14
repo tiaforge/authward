@@ -1,8 +1,8 @@
 //! End-to-end test of the actual Caddy integration (Phase 10): a real
 //! `caddy` binary, configured the way the reference Caddyfile documents,
-//! sitting in front of a real forward-auth instance and a trivial
+//! sitting in front of a real authgate instance and a trivial
 //! backend app. Confirms the parts that can't be verified by testing
-//! forward-auth alone: that `forward_auth` + `handle_response` really
+//! authgate alone: that `forward_auth` + `handle_response` really
 //! does redirect an unauthenticated request to `/login`, that
 //! `copy_headers` really does carry identity headers onto the backend
 //! request, and that the full round trip (denied -> login -> callback ->
@@ -29,7 +29,7 @@ use openidconnect::core::{CoreHmacKey, CoreJsonWebKey, CoreJwsSigningAlgorithm};
 use serde::Deserialize;
 use serde_json::json;
 
-const CLIENT_ID: &str = "forward-auth-test-client";
+const CLIENT_ID: &str = "authgate-test-client";
 const CLIENT_SECRET: &str = "caddy-integration-test-secret";
 
 fn caddy_bin() -> String {
@@ -222,9 +222,9 @@ async fn full_flow_through_real_caddy() {
     let idp_base_url = spawn_mock_idp().await;
     let (backend_port, backend_hits) = spawn_backend_app().await;
 
-    // --- forward-auth itself, via the same in-process construction the
+    // --- authgate itself, via the same in-process construction the
     // rest of the suite uses, so this test only adds the Caddy layer on
-    // top rather than re-testing forward-auth's own logic.
+    // top rather than re-testing authgate's own logic.
     let mut base_domains = std::collections::HashMap::new();
     base_domains.insert(
         "test.local".to_string(),
@@ -321,7 +321,7 @@ async fn full_flow_through_real_caddy() {
 "#
     );
     let mut caddyfile_path = std::env::temp_dir();
-    caddyfile_path.push(format!("forward-auth-test-caddyfile-{caddy_port}"));
+    caddyfile_path.push(format!("authgate-test-caddyfile-{caddy_port}"));
     std::fs::write(&caddyfile_path, &caddyfile).unwrap();
 
     let mut caddy = Command::new(caddy_bin())
@@ -367,7 +367,7 @@ async fn full_flow_through_real_caddy() {
 
     // 1. Unauthenticated request to the app, through Caddy, is denied and
     //    redirected to /login with rd pointing back at the original URL —
-    //    query string included, `&` and all, since forward-auth builds the
+    //    query string included, `&` and all, since authgate builds the
     //    login URL itself (X-Login-Url) rather than Caddy splicing {uri}
     //    raw into a query parameter.
     let resp = client

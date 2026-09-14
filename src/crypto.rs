@@ -2,7 +2,7 @@
 //!
 //! The two secrets in `[global]` (cookie-signing key, refresh-token
 //! encryption key) are operator-supplied strings of arbitrary length —
-//! typically 32 random bytes hex-encoded by `forward-auth init`, but not
+//! typically 32 random bytes hex-encoded by `authgate init`, but not
 //! guaranteed to be. Both are run through a KDF before use as raw key
 //! material, rather than assuming a particular length/encoding.
 

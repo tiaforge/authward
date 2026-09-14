@@ -14,11 +14,7 @@ const JWKS_REFRESH_INTERVAL: Duration = Duration::from_secs(900);
 const RATE_LIMIT_PRUNE_INTERVAL: Duration = Duration::from_secs(600);
 
 #[derive(Parser)]
-#[command(
-    name = "forward-auth",
-    version,
-    about = "Forward-auth OIDC login service"
-)]
+#[command(name = "authgate", version, about = "Authgate OIDC login service")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -71,7 +67,7 @@ async fn run_server(config_path: &Path) -> anyhow::Result<()> {
         Ok(cfg) => cfg,
         Err(errors) => {
             eprintln!(
-                "forward-auth: {} config error(s) found in {}:\n",
+                "authgate: {} config error(s) found in {}:\n",
                 errors.len(),
                 config_path.display()
             );

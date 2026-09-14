@@ -1,17 +1,17 @@
 # Minimal, complete worked example: one pocket-id instance, two apps on one
 # base domain. Copy this to config.toml and edit the marked values — or run
-# `forward-auth init` to generate an equivalent file interactively.
+# `authgate init` to generate an equivalent file interactively.
 #
 # `cookie_signing_key` and `refresh_token_encryption_key` below are
 # placeholders. Generate real ones (32 random bytes, hex-encoded) and either
 # paste them in here (then `chmod 600` this file) or set them via the
-# FORWARD_AUTH_COOKIE_KEY / FORWARD_AUTH_REFRESH_KEY environment variables
+# AUTHGATE_COOKIE_KEY / AUTHGATE_REFRESH_KEY environment variables
 # instead, which take precedence when set.
 
 [global]
 cookie_signing_key = "REPLACE_WITH_32_RANDOM_BYTES_HEX_1111111111111111111111"
 refresh_token_encryption_key = "REPLACE_WITH_32_RANDOM_BYTES_HEX_2222222222222222222222"
-sqlite_path = "forward-auth.db"
+sqlite_path = "authgate.db"
 session_ttl_fallback_seconds = 3600
 listen_addr = "127.0.0.1:8080"
 # otel_endpoint = "http://localhost:4317"
@@ -24,7 +24,7 @@ auth_subdomain = "auth.example.com"
 
 [base_domain."example.com".provider]
 discovery_url = "https://idp.example.com/.well-known/openid-configuration"
-client_id = "forward-auth"
+client_id = "authgate"
 client_secret = "REPLACE_WITH_YOUR_OIDC_CLIENT_SECRET"
 
 # A host with no overrides at all: inherits the base domain's provider,

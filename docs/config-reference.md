@@ -2,7 +2,7 @@
 
 The config file is TOML with four kinds of block: `[global]`, one or
 more `[base_domain."..."]`, one or more `[host."..."]`, and an optional
-`[fallback]`. On any problem, forward-auth reports **every** error it
+`[fallback]`. On any problem, authgate reports **every** error it
 finds in one run, not just the first — fix them all at once rather than
 one at a time.
 
@@ -15,18 +15,18 @@ time, and matched against the (also-lowercased) incoming `Host` /
 
 | Field | Required | Default | Notes |
 |---|---|---|---|
-| `cookie_signing_key` | yes, unless `FORWARD_AUTH_COOKIE_KEY` is set | — | Signs/encrypts the session and flow cookies. Any string; treat it as a secret. Must differ from `refresh_token_encryption_key`. |
-| `refresh_token_encryption_key` | yes, unless `FORWARD_AUTH_REFRESH_KEY` is set | — | Encrypts refresh tokens at rest in SQLite. Must differ from `cookie_signing_key`. |
-| `sqlite_path` | no | `forward-auth.db` | Path to the session database. Created if missing; chmod'd to `0600`. |
+| `cookie_signing_key` | yes, unless `AUTHGATE_COOKIE_KEY` is set | — | Signs/encrypts the session and flow cookies. Any string; treat it as a secret. Must differ from `refresh_token_encryption_key`. |
+| `refresh_token_encryption_key` | yes, unless `AUTHGATE_REFRESH_KEY` is set | — | Encrypts refresh tokens at rest in SQLite. Must differ from `cookie_signing_key`. |
+| `sqlite_path` | no | `authgate.db` | Path to the session database. Created if missing; chmod'd to `0600`. |
 | `session_ttl_fallback_seconds` | no | `3600` | Used only when the IdP's token response doesn't include an explicit `expires_in`. |
 | `session_max_age_seconds` | no | `86400` (24h) | Absolute lifetime of a browser session from login, regardless of how many silent refreshes succeed. Bounds how long a stolen session cookie stays usable. Must be > 0. |
 | `otel_endpoint` | no | unset | OTLP/gRPC endpoint for log export, e.g. `http://localhost:4317`. Logs always also go to stdout as JSON regardless. |
 | `listen_addr` | no | `127.0.0.1:8080` | Must stay unreachable except from Caddy — see [deployment.md](deployment.md). |
 
 If either key is set in the config file itself (not via env var), the
-file must not be group- or other-readable — forward-auth checks this at
+file must not be group- or other-readable — authgate checks this at
 startup and refuses to start otherwise. Prefer the env vars
-(`FORWARD_AUTH_COOKIE_KEY` / `FORWARD_AUTH_REFRESH_KEY`) when your
+(`AUTHGATE_COOKIE_KEY` / `AUTHGATE_REFRESH_KEY`) when your
 deployment already has a secrets-injection mechanism.
 
 ## `[base_domain."<name>"]`
@@ -110,7 +110,7 @@ auth_subdomain = "auth.example.com"
 
 [base_domain."example.com".provider]
 discovery_url = "https://idp-a.example.com/.well-known/openid-configuration"
-client_id = "forward-auth"
+client_id = "authgate"
 client_secret = "..."
 
 # Inherits idp-a above.
@@ -125,7 +125,7 @@ base_domain = "example.com"
 
 [host."partner-app.example.com".provider]
 discovery_url = "https://idp-b.example.com/.well-known/openid-configuration"
-client_id = "forward-auth-partner"
+client_id = "authgate-partner"
 client_secret = "..."
 ```
 
