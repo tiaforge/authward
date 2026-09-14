@@ -277,7 +277,10 @@ pub async fn update_session_after_refresh(
 ///
 /// The reaper still has to re-check each candidate under its per-session
 /// lock before deleting, since one may be mid-refresh (see
-/// `locks::SessionLocks`).
+/// `locks::SessionLocks`). That re-check is also what makes the
+/// comparisons here safely inclusive: timestamps are stored as whole
+/// seconds, so a strict `<` could miss a row for up to a second after
+/// `Session::is_expired` / `is_past_max_age` already say it's dead.
 pub async fn list_expired_session_ids(
     pool: &SqlitePool,
     now: DateTime<Utc>,
@@ -285,7 +288,7 @@ pub async fn list_expired_session_ids(
 ) -> anyhow::Result<Vec<String>> {
     let rows = sqlx::query(
         "SELECT id FROM sessions \
-         WHERE (expires_at < ? AND refresh_token_ciphertext IS NULL) OR created_at < ?",
+         WHERE (expires_at <= ? AND refresh_token_ciphertext IS NULL) OR created_at <= ?",
     )
     .bind(now.timestamp())
     .bind(max_age_cutoff.timestamp())
