@@ -57,7 +57,9 @@ Two shapes, depending on scope:
   own users): add a new `[base_domain."other.com"]` block with its own
   `auth_subdomain` and `provider`, then hosts under it as usual. This is
   the common case and needs no special handling — base domains are
-  already fully independent.
+  already fully independent. That independence includes the overview
+  page and `/token`: `https://auth.other.com/` lists and issues tokens
+  for `other.com` hosts only, and won't show them on `auth.example.com`.
 - **One host on an existing base domain, but a different IdP than that
   base domain's default** (e.g. a partner's app that authenticates
   against the partner's own IdP while staying under your domain's

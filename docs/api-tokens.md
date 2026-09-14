@@ -63,6 +63,14 @@ If the host has no `resource` configured, `/token?host=...` returns a
 400 rather than silently falling back to a session — this is a
 config-completeness check, not a runtime fallback.
 
+`/token` and the overview page are scoped to one base domain: the auth
+subdomain you visit only lists, and only issues tokens for, hosts whose
+`base_domain` is the one that auth subdomain belongs to. A host under a
+second base domain shows up on *that* domain's overview page, and its
+token URL is `https://<that domain's auth_subdomain>/token?host=...`.
+Asking `auth.example.com` for a token for a host on `other.com` returns
+a 400 ("Wrong auth domain").
+
 ## 4. Call the API
 
 ```sh

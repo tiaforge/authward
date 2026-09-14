@@ -37,7 +37,7 @@ single sign-on across every host on it.
 
 | Field | Required | Notes |
 |---|---|---|
-| `auth_subdomain` | yes | The host that serves `/login`, `/callback`, `/logout`, `/`, `/healthz` for this base domain. Point Caddy's plain `reverse_proxy` block at this host. |
+| `auth_subdomain` | yes | The host that serves `/login`, `/callback`, `/logout`, `/`, `/token`, `/healthz` for this base domain. Point Caddy's plain `reverse_proxy` block at this host. The overview page and `/token` here only cover hosts whose `base_domain` is this one — each base domain has its own dashboard. |
 | `provider.discovery_url` | yes | The IdP's `.well-known/openid-configuration` URL. Must be `https` — plain `http` is only accepted for loopback addresses (`127.0.0.1`, `localhost`, `::1`), and the same rule is applied at startup to every endpoint the discovery document advertises, since the client secret and tokens go to those. |
 | `provider.client_id` | yes | |
 | `provider.client_secret` | yes | Treat as a secret. |

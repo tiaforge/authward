@@ -93,7 +93,9 @@ Visit `https://app.example.com/` in a browser. You should be redirected
 to your IdP, log in, and land back on the app with a session cookie set.
 Visiting `https://auth.example.com/` shows the overview page (who's
 logged in, other active sessions, links to request an API token for any
-host with a `resource` configured).
+host with a `resource` configured). The page is per base domain: it only
+lists hosts under `example.com`. Hosts under a second base domain appear
+on that domain's own auth subdomain.
 
 If something doesn't work, see the [runbook](runbook.md)'s "reading logs"
 section — every request that's denied or errors logs a structured reason.
