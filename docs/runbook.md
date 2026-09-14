@@ -26,8 +26,8 @@ itself), set them via `AUTHGATE_COOKIE_KEY` / `AUTHGATE_REFRESH_KEY`
 service. Do this during a maintenance window if a mass forced re-login is
 disruptive for your users. There's nothing to migrate in SQLite —
 old session rows simply become permanently unreachable garbage; the
-background reaper will eventually clean them up once their `expires_at`
-passes, or delete the database file entirely if you'd rather not wait.
+background reaper will clean them up once they pass `session_max_age`,
+or delete the database file entirely if you'd rather not wait.
 
 Rotate both keys at the same time if you rotate either — there's no
 reason to leave the other one stale, and keeping them on the same

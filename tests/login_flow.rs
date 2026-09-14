@@ -1082,6 +1082,100 @@ async fn reaper_deletes_sessions_with_no_refresh_token_survivors() {
 }
 
 #[tokio::test]
+async fn reaper_leaves_an_idle_session_that_can_still_refresh() {
+    // A session whose access token has expired but which holds a refresh
+    // token is idle, not dead: the next request silently refreshes it.
+    // The reaper must not turn "idle for one access-token lifetime" into
+    // a forced re-login.
+    let ttl = Duration::from_secs(1);
+    let (idp_base_url, refresh_grant_count, _refresh_tokens) = spawn_mock_idp(ttl).await;
+    let db_dir = tempfile::tempdir().unwrap();
+    let (app, state) = spawn_app(&idp_base_url, &db_dir.path().join("sessions.db")).await;
+    let idp_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    let mut browser = Browser::new();
+    login_as(
+        &app,
+        &idp_client,
+        &mut browser,
+        "alice",
+        "https://app.test.local/",
+    )
+    .await;
+    let cookie_header = format!("authgate_session={}", browser.cookies["authgate_session"]);
+
+    tokio::time::sleep(ttl + Duration::from_millis(500)).await;
+    authgate::session::reap_expired_sessions(&state).await;
+
+    assert_eq!(
+        raw_verify(&app, &cookie_header).await,
+        reqwest::StatusCode::OK,
+        "an expired-but-refreshable session must survive the reaper"
+    );
+    assert_eq!(
+        refresh_grant_count.load(Ordering::SeqCst),
+        1,
+        "and be silently refreshed on its next use"
+    );
+}
+
+#[tokio::test]
+async fn reaper_deletes_a_session_past_max_age_even_with_a_refresh_token() {
+    let (idp_base_url, _count, _tokens) = spawn_mock_idp(Duration::from_secs(3600)).await;
+    let db_dir = tempfile::tempdir().unwrap();
+    let mut cfg = base_config(&db_dir.path().join("sessions.db"));
+    cfg.global.session_max_age = Duration::from_secs(1);
+    cfg.base_domains.insert(
+        "test.local".to_string(),
+        base_domain_block("test.local", "auth.test.local", &idp_base_url),
+    );
+    cfg.hosts.insert(
+        "app.test.local".to_string(),
+        resolved_host("app.test.local", "test.local", &idp_base_url),
+    );
+    let (app, state) = spawn_app_with_config(cfg).await;
+    let idp_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    let mut browser = Browser::new();
+    login_as(
+        &app,
+        &idp_client,
+        &mut browser,
+        "alice",
+        "https://app.test.local/",
+    )
+    .await;
+    // The cookie carries the session ID encrypted, so find the row by
+    // subject instead.
+    let rows =
+        authgate::db::list_sessions_for_subject(&state.db, "test.local", "test.local", "alice")
+            .await
+            .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(
+        rows[0].refresh_token.is_some(),
+        "mock IdP issues refresh tokens"
+    );
+
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    authgate::session::reap_expired_sessions(&state).await;
+
+    assert!(
+        authgate::db::get_session(&state.db, &rows[0].id)
+            .await
+            .unwrap()
+            .is_none(),
+        "past session_max_age the row is dead regardless of its refresh token"
+    );
+}
+
+#[tokio::test]
 async fn reaper_does_not_delete_a_session_mid_refresh() {
     let ttl = Duration::from_secs(1);
     let refresh_delay = Duration::from_millis(3000);

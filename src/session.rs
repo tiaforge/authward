@@ -261,12 +261,14 @@ async fn clear(state: &AppState, session_id: &str) {
 }
 
 /// One sweep of the expired-session reaper (Phase 2): for every session
-/// whose access/ID token expired before `now`, re-checks it under its
-/// per-session lock (so it can't race an in-flight refresh — a
-/// concurrent refresh either finishes first, in which case the re-check
-/// here sees the pushed-forward expiry and skips it, or starts after,
-/// in which case it waits for the reaper to finish with that row first)
-/// and deletes it if it's genuinely still expired.
+/// that can no longer become valid — past `session_max_age`, or with an
+/// expired access/ID token and no refresh token to renew it (see
+/// `db::list_expired_session_ids`) — re-checks it under its per-session
+/// lock (so it can't race an in-flight refresh — a concurrent refresh
+/// either finishes first, in which case the re-check here sees the
+/// pushed-forward expiry and skips it, or starts after, in which case it
+/// waits for the reaper to finish with that row first) and deletes it if
+/// it's genuinely still dead.
 pub async fn reap_expired_sessions(state: &AppState) {
     let now = Utc::now();
     let max_age = state.config.global.session_max_age;
@@ -286,7 +288,8 @@ pub async fn reap_expired_sessions(state: &AppState) {
             .with_lock(&id, || async {
                 match db::get_session(&state.db, &id).await {
                     Ok(Some(session))
-                        if session.is_expired() || session.is_past_max_age(max_age) =>
+                        if session.is_past_max_age(max_age)
+                            || (session.is_expired() && session.refresh_token.is_none()) =>
                     {
                         clear(state, &id).await;
                         true

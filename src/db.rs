@@ -266,21 +266,31 @@ pub async fn update_session_after_refresh(
     Ok(())
 }
 
-/// Session IDs whose access/ID token portion has already expired as of
-/// `now`, or that were created before `max_age_cutoff` — candidates for
-/// the reaper (Phase 2). The reaper still has to re-check each one under
-/// its per-session lock before deleting, since a candidate may be
-/// mid-refresh (see `locks::SessionLocks`).
+/// Session IDs that can never become valid again: created before
+/// `max_age_cutoff`, or with an access/ID token expired as of `now` *and*
+/// no refresh token to renew it with — candidates for the reaper (Phase
+/// 2). An expired session that still holds a refresh token is left alone:
+/// the next request for it triggers a silent refresh, and only the IdP
+/// can say whether that refresh token is still good. Deleting such rows
+/// here would end every session after one access-token lifetime of
+/// inactivity, well short of the documented `session_max_age`.
+///
+/// The reaper still has to re-check each candidate under its per-session
+/// lock before deleting, since one may be mid-refresh (see
+/// `locks::SessionLocks`).
 pub async fn list_expired_session_ids(
     pool: &SqlitePool,
     now: DateTime<Utc>,
     max_age_cutoff: DateTime<Utc>,
 ) -> anyhow::Result<Vec<String>> {
-    let rows = sqlx::query("SELECT id FROM sessions WHERE expires_at < ? OR created_at < ?")
-        .bind(now.timestamp())
-        .bind(max_age_cutoff.timestamp())
-        .fetch_all(pool)
-        .await?;
+    let rows = sqlx::query(
+        "SELECT id FROM sessions \
+         WHERE (expires_at < ? AND refresh_token_ciphertext IS NULL) OR created_at < ?",
+    )
+    .bind(now.timestamp())
+    .bind(max_age_cutoff.timestamp())
+    .fetch_all(pool)
+    .await?;
     rows.iter()
         .map(|row| row.try_get::<String, _>("id").map_err(Into::into))
         .collect()
