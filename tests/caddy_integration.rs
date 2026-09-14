@@ -198,7 +198,12 @@ async fn spawn_backend_app() -> (u16, Arc<AtomicUsize>) {
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("")
                 .to_string();
-            format!("backend ok path={uri} x-auth-user={user}")
+            let cookie = headers
+                .get("cookie")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            format!("backend ok path={uri} x-auth-user={user} cookie=[{cookie}]")
         }
     };
     let app = Router::new().fallback(get(handler));
@@ -315,7 +320,10 @@ async fn full_flow_through_real_caddy() {
 				redir * {{http.reverse_proxy.header.X-Login-Url}} 302
 			}}
 		}}
-		reverse_proxy 127.0.0.1:{backend_port}
+		reverse_proxy 127.0.0.1:{backend_port} {{
+			header_up Cookie ";\s*authgate_session=[^;]*" ""
+			header_up Cookie "^authgate_session=[^;]*;?\s*" ""
+		}}
 	}}
 }}
 "#
@@ -489,7 +497,7 @@ async fn full_flow_through_real_caddy() {
             final_path.query().unwrap()
         ))
         .header("host", "app.test.local")
-        .header("cookie", cookie_header(&cookies))
+        .header("cookie", format!("{}; other=1", cookie_header(&cookies)))
         .send()
         .await
         .unwrap();
@@ -500,6 +508,24 @@ async fn full_flow_through_real_caddy() {
         "expected the backend to see the forwarded identity header, got: {body}"
     );
     assert!(body.contains("path=/dashboard"));
+    // The reference Caddyfile's `header_up Cookie` rewrites strip
+    // authgate's own session cookie before the backend sees it, leaving
+    // any other cookies intact. (The hand-rolled jar above also relays
+    // the emptied `authgate_flow=` removal cookie, which a real browser
+    // would have dropped; it's harmless and not what's under test.)
+    let forwarded_cookie = body
+        .split("cookie=[")
+        .nth(1)
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or_else(|| panic!("backend echo lacks a cookie field: {body}"));
+    assert!(
+        !forwarded_cookie.contains("authgate_session"),
+        "the session cookie must be stripped before reaching the backend, got: {body}"
+    );
+    assert!(
+        forwarded_cookie.contains("other=1"),
+        "unrelated cookies must survive the strip, got: {body}"
+    );
     assert_eq!(
         backend_hits.load(Ordering::SeqCst),
         1,

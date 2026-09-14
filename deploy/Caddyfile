@@ -55,5 +55,16 @@ app.example.com {
 		}
 	}
 
-	reverse_proxy localhost:9000
+	reverse_proxy localhost:9000 {
+		# Strip authgate's session cookie before the request reaches the
+		# backend. The cookie is Domain=.example.com so the browser sends
+		# it to every app under the base domain, and a backend that sees
+		# it could replay it as a single sign-on session against every
+		# sibling app. No backend ever needs it: identity arrives in the
+		# X-Auth-* headers above. The two patterns cover the cookie in
+		# the middle/end and at the start of the Cookie header; other
+		# cookies pass through untouched.
+		header_up Cookie ";\s*authgate_session=[^;]*" ""
+		header_up Cookie "^authgate_session=[^;]*;?\s*" ""
+	}
 }

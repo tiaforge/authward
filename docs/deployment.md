@@ -116,6 +116,26 @@ as the browser is concerned. authgate's own state-changing routes
 sibling app can still *set* a cookie for the whole base domain. Only put
 apps under one base domain that you'd trust with each other's sessions.
 
+The same domain scoping means the browser sends `authgate_session` to
+every app under the base domain, and `forward_auth` passes the original
+request — cookie included — on to the backend. A backend that logs,
+leaks, or is compromised could therefore replay that cookie as a
+single-sign-on session against every sibling app. No backend ever needs
+the cookie (identity arrives in the `X-Auth-*` headers), so the
+reference Caddyfile strips it with two `header_up Cookie` rewrites on
+each app's `reverse_proxy`:
+
+```caddyfile
+reverse_proxy localhost:9000 {
+	header_up Cookie ";\s*authgate_session=[^;]*" ""
+	header_up Cookie "^authgate_session=[^;]*;?\s*" ""
+}
+```
+
+The first pattern removes the cookie from the middle or end of the
+`Cookie` header, the second from the start; other cookies pass through
+untouched. Keep both lines on every app block.
+
 **Requires Caddy v2.11.2 or newer.** Caddy 2.10.0 through 2.11.1 carry
 [GHSA-7r4p-vjf4-gxv4](https://github.com/caddyserver/caddy/security/advisories/GHSA-7r4p-vjf4-gxv4):
 `copy_headers` only overwrites a client-supplied header when the auth
