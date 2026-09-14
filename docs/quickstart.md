@@ -1,8 +1,8 @@
 # Quickstart
 
-This walks through getting authgate running end to end with one IdP
+This walks through getting doorward running end to end with one IdP
 (pocket-id, but any OIDC provider works the same way) and two apps on one
-base domain, using `authgate init` rather than hand-editing TOML.
+base domain, using `doorward init` rather than hand-editing TOML.
 Read this before the [config reference](config-reference.md) — the goal
 here is a working setup, not full coverage of every field.
 
@@ -16,7 +16,7 @@ here is a working setup, not full coverage of every field.
 - Caddy in front of both this service and the apps it protects, on a
   network where nothing but Caddy can reach either — see
   [deployment.md](deployment.md) for why this matters.
-- The `authgate` binary built (`cargo build --release`) or otherwise
+- The `doorward` binary built (`cargo build --release`) or otherwise
   available on the host that will run it.
 
 ## 1. Register the OIDC client at your IdP
@@ -32,7 +32,7 @@ Note the client ID and client secret — the wizard will ask for them next.
 ## 2. Run the wizard
 
 ```sh
-authgate init
+doorward init
 ```
 
 It prompts for:
@@ -77,10 +77,10 @@ turns a 401 on a GET into a redirect to `/login`, plus the `header_up`
 lines that keep the session cookie away from the backend). Adjust the
 hostnames and backend addresses, then reload Caddy.
 
-## 5. Start authgate
+## 5. Start doorward
 
 ```sh
-authgate --config config.toml
+doorward --config config.toml
 ```
 
 It listens on `127.0.0.1:8080` by default (see `listen_addr` in

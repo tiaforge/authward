@@ -1,9 +1,9 @@
 # Worked example: resource-scoped API tokens
 
-authgate lets a non-browser client (a CLI, a script, a cron job) call
+doorward lets a non-browser client (a CLI, a script, a cron job) call
 a protected app with `Authorization: Bearer <token>` instead of a
 session cookie. There's no token store or issuance logic on our side —
-the IdP issues and can revoke the token; authgate only validates it
+the IdP issues and can revoke the token; doorward only validates it
 locally against the IdP's published JWKS (RFC 8707 "Resource Indicators"
 + RFC 9068's JWT access token profile). This only works if your IdP
 supports scoping an access token to a resource identifier — pocket-id's
@@ -21,11 +21,11 @@ with:
 - optionally, one or more **scopes** the resource accepts, e.g. `read`,
   `admin`
 
-Whatever OIDC client authgate uses for that host (its base domain's
+Whatever OIDC client doorward uses for that host (its base domain's
 default, or a per-host `provider` override) needs to be allowed to
 request tokens for this resource.
 
-## 2. Wire it into authgate's config
+## 2. Wire it into doorward's config
 
 Add `resource` (and optionally `required_scope`) to the host:
 
@@ -37,12 +37,12 @@ required_scope = "read"   # omit if any scope from the resource is acceptable
 ```
 
 That's the whole config change. No restart-order dependency — reload
-authgate after editing.
+doorward after editing.
 
 ## 3. Get a token
 
 There's no end-user "generate key" button at most IdPs for this flow —
-authgate's own `/token` endpoint acts as the OIDC client on the
+doorward's own `/token` endpoint acts as the OIDC client on the
 user's behalf:
 
 ```
@@ -50,13 +50,13 @@ https://auth.example.com/token?host=app.example.com
 ```
 
 Visiting it always starts a fresh authorization request to the IdP (it
-doesn't check for an existing authgate session cookie first) with
+doesn't check for an existing doorward session cookie first) with
 `resource=https://app.example.com/api` added, then shows the resulting
 access token once on a plain confirmation page (sent with
 `Cache-Control: no-store`). If you already have an active session at the
 IdP itself, it may skip straight past the login prompt — that's the
-IdP's own SSO behavior, not something authgate controls. Copy the
-token — authgate doesn't store it and can't show it again; re-visit
+IdP's own SSO behavior, not something doorward controls. Copy the
+token — doorward doesn't store it and can't show it again; re-visit
 `/token` to get a new one.
 
 If the host has no `resource` configured, `/token?host=...` returns a
@@ -69,7 +69,7 @@ config-completeness check, not a runtime fallback.
 curl -H "Authorization: Bearer $TOKEN" https://app.example.com/api/...
 ```
 
-authgate's `/verify` (which Caddy's `forward_auth` calls for every
+doorward's `/verify` (which Caddy's `forward_auth` calls for every
 request) checks for a valid session cookie first; if there is none — no
 cookie, or one whose session has since been logged out, revoked, or
 expired — it tries the `Authorization` header as a bearer token (the
@@ -93,10 +93,10 @@ logged with the reason — see the [runbook](runbook.md).
 
 ## Revocation
 
-There's no per-token revoke on authgate's side — the plan's accepted
+There's no per-token revoke on doorward's side — the plan's accepted
 tradeoff for not needing a token store at all. To cut off API access,
 disable the client (or its permission on that resource) at the IdP. The
 next validation attempt fails at signature/audience time as soon as the
 IdP stops recognizing it, or immediately if the IdP itself checks token
-status server-side; either way, authgate has nothing to clean up on
+status server-side; either way, doorward has nothing to clean up on
 its end.

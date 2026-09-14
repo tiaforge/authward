@@ -2,17 +2,17 @@
 
 ## What you're deploying
 
-A single Rust binary (`authgate`) plus one TOML config file and one
+A single Rust binary (`doorward`) plus one TOML config file and one
 SQLite database file. No external services required — not even the
 database is separate. This is deliberate: see the plan's locked-in
 "single instance, no HA requirement" decision. There's no clustering
-story and no shared session state; if you need authgate on more than
+story and no shared session state; if you need doorward on more than
 one machine, run one instance per deployment, each with its own config
 and SQLite file.
 
 ## The trust boundary — read this first
 
-authgate trusts three things unconditionally, because they're only
+doorward trusts three things unconditionally, because they're only
 supposed to be set by a proxy it trusts, not by end clients:
 
 - `X-Forwarded-Host` (falls back to `Host`) — which host config to apply
@@ -20,13 +20,13 @@ supposed to be set by a proxy it trusts, not by end clients:
 - `X-Forwarded-For` (last hop only) — the client IP used for rate limiting
 
 And on the way out, when a host has `forward_identity_headers = true`,
-authgate's `/verify` response carries `X-Auth-User` /
+doorward's `/verify` response carries `X-Auth-User` /
 `X-Auth-Email` / `X-Auth-Groups`, which Caddy's `copy_headers` then
 overwrites onto the request forwarded to the backend app.
 
 None of this is safe unless **both** of the following hold:
 
-1. **authgate itself is unreachable except through Caddy.** Bind it
+1. **doorward itself is unreachable except through Caddy.** Bind it
    to `127.0.0.1` (the default) or a private network address, never
    `0.0.0.0` on a host with a public interface, and never put it behind
    a second proxy that doesn't strip/overwrite these headers.
@@ -41,21 +41,21 @@ In practice: put Caddy and every backend app on an internal network with
 no other route in (a dedicated Docker network, a private VPC, or
 loopback-only binds on a single host), and don't rely on the backend app
 itself to defend against a spoofed identity header — it has no way to
-tell authgate's header apart from a client's.
+tell doorward's header apart from a client's.
 
 ## Files on disk
 
 | File | Contents | Permissions |
 |---|---|---|
-| the config file | OIDC client secrets, and (unless you use the env-var overrides below) the cookie-signing and refresh-token-encryption keys | must be `0600` — authgate refuses to start if key material lives in a config file that's group/other-readable |
-| the SQLite database (`sqlite_path`, default `authgate.db`) | session rows: subject, email, encrypted refresh token, expiry, raw ID token claims | chmod'd to `0600` automatically at startup |
+| the config file | OIDC client secrets, and (unless you use the env-var overrides below) the cookie-signing and refresh-token-encryption keys | must be `0600` — doorward refuses to start if key material lives in a config file that's group/other-readable |
+| the SQLite database (`sqlite_path`, default `doorward.db`) | session rows: subject, email, encrypted refresh token, expiry, raw ID token claims | chmod'd to `0600` automatically at startup |
 
-As a second layer, authgate sets `umask 0o077` for its own process
+As a second layer, doorward sets `umask 0o077` for its own process
 at startup, so any file it creates defaults to owner-only permissions
 even if a call site forgot to `chmod` explicitly.
 
 Secrets can also come from the environment instead of the file:
-`AUTHGATE_COOKIE_KEY` and `AUTHGATE_REFRESH_KEY` take precedence
+`DOORWARD_COOKIE_KEY` and `DOORWARD_REFRESH_KEY` take precedence
 over the config file's `cookie_signing_key` / `refresh_token_encryption_key`
 when set — useful for a secrets manager or container orchestrator that
 injects env vars rather than files.
@@ -63,7 +63,7 @@ injects env vars rather than files.
 ## Running it
 
 ```sh
-authgate --config /etc/authgate/config.toml
+doorward --config /etc/doorward/config.toml
 ```
 
 There's no daemonization built in — run it under systemd, a container
@@ -76,14 +76,14 @@ A minimal systemd unit:
 
 ```ini
 [Unit]
-Description=authgate
+Description=doorward
 After=network.target
 
 [Service]
-ExecStart=/usr/local/bin/authgate --config /etc/authgate/config.toml
+ExecStart=/usr/local/bin/doorward --config /etc/doorward/config.toml
 Restart=on-failure
-User=authgate
-WorkingDirectory=/var/lib/authgate
+User=doorward
+WorkingDirectory=/var/lib/doorward
 
 [Install]
 WantedBy=multi-user.target
@@ -101,7 +101,7 @@ background every 30 seconds; its hosts answer with a "Provider
 unavailable" page at `/login` (and a plain 401 for bearer tokens) until
 the retry succeeds, while every other provider's hosts serve normally.
 So a restart during one IdP's outage doesn't take the others down with
-it. If *no* provider can be discovered, authgate refuses to start and
+it. If *no* provider can be discovered, doorward refuses to start and
 prints every failure — with nothing to serve, a config mistake is the
 likelier explanation than an outage, and a crash-loop under systemd's
 `Restart=on-failure` is the right way to keep trying.
@@ -134,7 +134,7 @@ reference (validated with `caddy adapt`). The shape is: one plain
 block per protected app with an explicit `handle_response` for the 401
 case — `forward_auth` does not redirect on non-2xx by default, it relays
 the response verbatim, so without that block a denied request would show
-authgate's raw 401 instead of sending the user to `/login`. The 401
+doorward's raw 401 instead of sending the user to `/login`. The 401
 carries the login URL to redirect to in `X-Login-Url` (with the original
 request URL query-encoded inside `rd`); use
 `redir * {http.reverse_proxy.header.X-Login-Url} 302` rather than
@@ -145,7 +145,7 @@ Match that `handle_response` on *both* the 401 status and the presence
 of `X-Login-Url`, as the reference file does. Only a GET (or HEAD) can
 be replayed by sending the browser through login and back; a POST, PUT
 or DELETE whose session expired would come out of that redirect chain
-as a bodiless GET of its action URL. For those authgate answers a 401
+as a bodiless GET of its action URL. For those doorward answers a 401
 *without* `X-Login-Url` and a plain "session expired, please go back
 and resubmit" page, which Caddy relays as-is. The submitted body is not
 buffered or replayed — that's an accepted limitation.
@@ -153,13 +153,13 @@ buffered or replayed — that's an accepted limitation.
 One more trust-boundary note: the session cookie is scoped to
 `Domain=.<base_domain>` — that's what makes single sign-on across the
 apps work — so every subdomain under a base domain is *same-site* as far
-as the browser is concerned. authgate's own state-changing routes
+as the browser is concerned. doorward's own state-changing routes
 (`/logout`, `/sessions/revoke`) additionally check `Origin` /
 `Sec-Fetch-Site` so a compromised sibling app can't drive them, but a
 sibling app can still *set* a cookie for the whole base domain. Only put
 apps under one base domain that you'd trust with each other's sessions.
 
-The same domain scoping means the browser sends `authgate_session` to
+The same domain scoping means the browser sends `doorward_session` to
 every app under the base domain, and `forward_auth` passes the original
 request — cookie included — on to the backend. A backend that logs,
 leaks, or is compromised could therefore replay that cookie as a
@@ -170,8 +170,8 @@ each app's `reverse_proxy`:
 
 ```caddyfile
 reverse_proxy localhost:9000 {
-	header_up Cookie ";\s*authgate_session=[^;]*" ""
-	header_up Cookie "^authgate_session=[^;]*;?\s*" ""
+	header_up Cookie ";\s*doorward_session=[^;]*" ""
+	header_up Cookie "^doorward_session=[^;]*;?\s*" ""
 }
 ```
 
@@ -183,8 +183,8 @@ untouched. Keep both lines on every app block.
 [GHSA-7r4p-vjf4-gxv4](https://github.com/caddyserver/caddy/security/advisories/GHSA-7r4p-vjf4-gxv4):
 `copy_headers` only overwrites a client-supplied header when the auth
 response includes that header, so a request that arrived with its own
-`X-Auth-User` would reach the backend with it intact whenever authgate
-had nothing to forward. authgate defends in depth by sending all three
+`X-Auth-User` would reach the backend with it intact whenever doorward
+had nothing to forward. doorward defends in depth by sending all three
 `X-Auth-*` headers on every successful `/verify` — empty when the host has
 `forward_identity_headers = false`, on bypass paths, or when a claim is
 absent — so the overwrite always happens. Run a patched Caddy anyway, and

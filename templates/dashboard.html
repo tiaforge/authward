@@ -2,51 +2,159 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
   <title>Account</title>
   <style>
-    body { font-family: system-ui, sans-serif; max-width: 40rem; margin: 3rem auto; color: #1a1a1a; padding: 0 1rem; }
-    h1 { font-size: 1.25rem; }
-    h2 { font-size: 1rem; margin-top: 2rem; }
+    :root {
+      color-scheme: light dark;
+      --bg: #f4f6f8;
+      --surface: #ffffff;
+      --text: #14202b;
+      --muted: #5b6b7a;
+      --border: #e2e7ec;
+      --accent: #1a9c78;
+      --accent-2: #2e7fd1;
+      --accent-text: #ffffff;
+      --danger: #b23a3a;
+      --shadow: 0 1px 2px rgba(20, 32, 43, 0.06), 0 8px 24px rgba(20, 32, 43, 0.06);
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0f1720;
+        --surface: #172230;
+        --text: #e6edf3;
+        --muted: #93a3b3;
+        --border: #263442;
+        --accent: #2fd39c;
+        --accent-2: #5aa8ff;
+        --accent-text: #0b1620;
+        --danger: #ff7b7b;
+        --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px rgba(0, 0, 0, 0.35);
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      font-size: 15px;
+      line-height: 1.5;
+      color: var(--text);
+      background:
+        radial-gradient(60rem 30rem at 50% -12rem, color-mix(in srgb, var(--accent) 22%, transparent), transparent 70%),
+        var(--bg);
+    }
+    main { max-width: 44rem; margin: 0 auto; padding: 3rem 1.25rem 4rem; }
+    header {
+      display: flex; align-items: center; justify-content: space-between;
+      gap: 1rem; margin-bottom: 1.5rem;
+    }
+    .brand { font-weight: 700; letter-spacing: 0.02em; font-size: 1.05rem; color: var(--accent); }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      box-shadow: var(--shadow);
+      padding: 1.25rem 1.5rem;
+      margin-bottom: 1.25rem;
+    }
+    .card.identity {
+      border-top: 3px solid var(--accent);
+      display: flex; align-items: center; justify-content: space-between; gap: 1rem; flex-wrap: wrap;
+    }
+    .label { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin: 0 0 0.25rem; }
+    h1 { font-size: 1.35rem; margin: 0; font-weight: 650; word-break: break-word; }
+    .email { color: var(--muted); margin: 0.15rem 0 0; }
+    h2 { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin: 0 0 0.75rem; font-weight: 600; }
     table { width: 100%; border-collapse: collapse; }
-    th, td { text-align: left; padding: 0.4rem 0.5rem; border-bottom: 1px solid #ddd; font-size: 0.9rem; }
-    .current { font-weight: 600; }
+    th { text-align: left; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); font-weight: 600; padding: 0 0.5rem 0.5rem 0; }
+    td { padding: 0.6rem 0.5rem 0.6rem 0; border-top: 1px solid var(--border); font-size: 0.9rem; vertical-align: middle; }
+    td.when { white-space: nowrap; }
+    td.ua { color: var(--muted); word-break: break-word; }
+    td.actions { text-align: right; white-space: nowrap; }
+    .badge {
+      display: inline-block; font-size: 0.7rem; font-weight: 600; padding: 0.1rem 0.5rem; margin-left: 0.4rem;
+      border-radius: 999px; background: color-mix(in srgb, var(--accent) 18%, transparent); color: var(--accent);
+    }
+    button {
+      font: inherit; font-size: 0.875rem; font-weight: 600; cursor: pointer;
+      border-radius: 8px; padding: 0.45rem 0.9rem; border: 1px solid var(--border);
+      background: var(--surface); color: var(--text);
+      transition: background 0.15s, border-color 0.15s, transform 0.05s;
+    }
+    button:hover { border-color: var(--accent); }
+    button:active { transform: translateY(1px); }
+    button.primary {
+      background: var(--accent);
+      color: var(--accent-text); border: none;
+    }
+    button.primary:hover { filter: brightness(1.08); }
+    button.link {
+      background: none; border: none; padding: 0; border-radius: 4px;
+      color: var(--danger); font-weight: 500; text-decoration: underline; text-underline-offset: 0.2em;
+    }
     form.inline { display: inline; }
-    button.link { background: none; border: none; color: #1a4fd6; text-decoration: underline; cursor: pointer; padding: 0; font-size: 0.9rem; }
-    ul.tokens { padding-left: 1.2rem; }
+    ul.tokens { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.5rem; }
+    ul.tokens a {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 0.65rem 0.9rem; border: 1px solid var(--border); border-radius: 8px;
+      color: var(--text); text-decoration: none; transition: border-color 0.15s, background 0.15s;
+    }
+    ul.tokens a:hover { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 6%, transparent); }
+    ul.tokens a code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.85rem; }
+    ul.tokens a span { color: var(--accent); font-size: 0.85rem; font-weight: 600; }
+    a:focus-visible, button:focus-visible { outline: 2px solid var(--accent-2); outline-offset: 2px; }
   </style>
 </head>
 <body>
-  <h1>Signed in as {{ subject }}{% if let Some(email) = email %} ({{ email }}){% endif %}</h1>
-  <form method="post" action="/logout">
-    <button type="submit">Log out</button>
-  </form>
+  <main>
+    <header>
+      <div class="brand">doorward</div>
+      <form method="post" action="/logout">
+        <button class="primary" type="submit">Log out</button>
+      </form>
+    </header>
 
-  <h2>Active sessions</h2>
-  <table>
-    <tr><th>Signed in</th><th>Device</th><th></th></tr>
-    {% for session in sessions %}
-    <tr class="{% if session.is_current %}current{% endif %}">
-      <td>{{ session.created_at }}</td>
-      <td>{{ session.user_agent }}{% if session.is_current %} (this device){% endif %}</td>
-      <td>
-        {% if !session.is_current %}
-        <form class="inline" method="post" action="/sessions/revoke">
-          <input type="hidden" name="session" value="{{ session.handle }}">
-          <button class="link" type="submit">Log out this device</button>
-        </form>
-        {% endif %}
-      </td>
-    </tr>
-    {% endfor %}
-  </table>
+    <section class="card identity">
+      <div>
+        <p class="label">Signed in as</p>
+        <h1>{{ subject }}</h1>
+        {% if let Some(email) = email %}<p class="email">{{ email }}</p>{% endif %}
+      </div>
+    </section>
 
-  {% if !token_hosts.is_empty() %}
-  <h2>API tokens</h2>
-  <ul class="tokens">
-    {% for host in token_hosts %}
-    <li><a href="/token?host={{ host }}">Get a token for {{ host }}</a></li>
-    {% endfor %}
-  </ul>
-  {% endif %}
+    <section class="card">
+      <h2>Active sessions</h2>
+      <table>
+        <tr><th>Signed in</th><th>Device</th><th></th></tr>
+        {% for session in sessions %}
+        <tr>
+          <td class="when">{{ session.created_at }}</td>
+          <td class="ua">{{ session.user_agent }}{% if session.is_current %}<span class="badge">this device</span>{% endif %}</td>
+          <td class="actions">
+            {% if !session.is_current %}
+            <form class="inline" method="post" action="/sessions/revoke">
+              <input type="hidden" name="session" value="{{ session.handle }}">
+              <button class="link" type="submit">Log out this device</button>
+            </form>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </table>
+    </section>
+
+    {% if !token_hosts.is_empty() %}
+    <section class="card">
+      <h2>API tokens</h2>
+      <ul class="tokens">
+        {% for host in token_hosts %}
+        <li><a href="/token?host={{ host }}"><code>{{ host }}</code><span>Get a token &rarr;</span></a></li>
+        {% endfor %}
+      </ul>
+    </section>
+    {% endif %}
+  </main>
 </body>
 </html>

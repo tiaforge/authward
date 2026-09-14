@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use authgate::{config, logging, server};
+use doorward::{config, logging, server};
 use clap::{Parser, Subcommand};
 
 /// How often the expired-session reaper sweeps SQLite (Phase 2/9).
@@ -17,7 +17,7 @@ const RATE_LIMIT_PRUNE_INTERVAL: Duration = Duration::from_secs(600);
 const DISCOVERY_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Parser)]
-#[command(name = "authgate", version, about = "Authgate OIDC login service")]
+#[command(name = "doorward", version, about = "Doorward OIDC login service")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -60,7 +60,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Command::Init { output }) => authgate::cli::init::run(&output),
+        Some(Command::Init { output }) => doorward::cli::init::run(&output),
         None => run_server(&cli.config).await,
     }
 }
@@ -70,7 +70,7 @@ async fn run_server(config_path: &Path) -> anyhow::Result<()> {
         Ok(cfg) => cfg,
         Err(errors) => {
             eprintln!(
-                "authgate: {} config error(s) found in {}:\n",
+                "doorward: {} config error(s) found in {}:\n",
                 errors.len(),
                 config_path.display()
             );
@@ -91,12 +91,12 @@ async fn run_server(config_path: &Path) -> anyhow::Result<()> {
     );
 
     let listen_addr = cfg.global.listen_addr;
-    let state = authgate::build_state(cfg).await?;
+    let state = doorward::build_state(cfg).await?;
 
-    authgate::session::spawn_reaper(state.clone(), REAPER_INTERVAL);
-    authgate::jwks_cache::spawn_periodic_refresh(state.clone(), JWKS_REFRESH_INTERVAL);
-    authgate::ratelimit::spawn_periodic_prune(state.clone(), RATE_LIMIT_PRUNE_INTERVAL);
-    authgate::spawn_discovery_retry(state.clone(), DISCOVERY_RETRY_INTERVAL);
+    doorward::session::spawn_reaper(state.clone(), REAPER_INTERVAL);
+    doorward::jwks_cache::spawn_periodic_refresh(state.clone(), JWKS_REFRESH_INTERVAL);
+    doorward::ratelimit::spawn_periodic_prune(state.clone(), RATE_LIMIT_PRUNE_INTERVAL);
+    doorward::spawn_discovery_retry(state.clone(), DISCOVERY_RETRY_INTERVAL);
 
     let app = server::build_router(state);
     let listener = tokio::net::TcpListener::bind(listen_addr).await?;
