@@ -18,10 +18,10 @@ plan), not an oversight. Rotating either one:
   to `/login`), so this also amounts to a full logout, just discovered
   session-by-session at each one's next refresh instead of all at once.
 
-**Procedure**: generate two new random values (32+ bytes; `doorward
+**Procedure**: generate two new random values (32+ bytes; `authward
 init`'s own key generation — 32 random bytes, hex-encoded — is a fine
 reference for the shape, though you don't need to re-run the wizard
-itself), set them via `DOORWARD_COOKIE_KEY` / `DOORWARD_REFRESH_KEY`
+itself), set them via `AUTHWARD_COOKIE_KEY` / `AUTHWARD_REFRESH_KEY`
 (or in the config file, keeping it `chmod 600`), and restart the
 service. Do this during a maintenance window if a mass forced re-login is
 disruptive for your users. There's nothing to migrate in SQLite —
@@ -40,10 +40,10 @@ schedule is one less thing to track.
    Minimally just `base_domain = "..."` inherits everything.
 2. Add a Caddy `forward_auth` site block for it, modeled on
    [`deploy/Caddyfile`](../deploy/Caddyfile)'s `app.example.com` example.
-3. Reload both Caddy and doorward. Order doesn't matter — doorward
+3. Reload both Caddy and authward. Order doesn't matter — authward
    rejects a request for an unconfigured host with a `502` rather than
    crashing, so a brief window where Caddy knows about the host before
-   doorward's config is reloaded just produces `502`s, not confusion.
+   authward's config is reloaded just produces `502`s, not confusion.
 
 No IdP-side change needed unless the new host also needs its own OIDC
 client (see "adding a second provider" below) or its own resource for
@@ -91,7 +91,7 @@ useless as a cookie.
 | Silent refresh failing | `"refresh failed; clearing session"`, `"failed to decrypt stored refresh token"`, `"refreshed id_token failed verification; clearing session"` | `session_id`, `err` |
 | CSRF / stale flow cookie at `/callback` | `"callback state mismatch — possible CSRF or stale flow cookie"` | (no session_id yet at this point — it's pre-login) |
 | IdP returned an error at `/callback` | `"identity provider returned an error"` | `error`, `description` |
-| Config problem at startup | printed to stderr, not through the logger — `doorward: N config error(s) found in <path>` followed by every error | — |
+| Config problem at startup | printed to stderr, not through the logger — `authward: N config error(s) found in <path>` followed by every error | — |
 | IdP unreachable at startup (its hosts show "Provider unavailable" until this clears) | `"OIDC provider discovery failed; will retry in the background"`, then `"OIDC provider discovery still failing"` every 30s, and `"OIDC provider discovered after earlier failure; now serving"` once it recovers. If no provider at all was reachable the process exits instead, with `no OIDC provider could be discovered` on stderr. | `provider_key`, `discovery_url`, `err` |
 | Login refused because its provider is still undiscovered | `"login refused: provider not yet discovered"` | `provider_key` |
 | JWKS refresh failing (bearer validation may start failing if this persists) | `"periodic JWKS refresh failed"` | `provider_key`, `err` |
@@ -107,7 +107,7 @@ not include a port).
 
 ## Revoking API access
 
-There is no per-token revoke on doorward's side by design (see
+There is no per-token revoke on authward's side by design (see
 [api-tokens.md](api-tokens.md)) — validation is stateless, and nothing
 about a specific issued token is tracked here. To cut off access:
 
@@ -118,13 +118,13 @@ about a specific issued token is tracked here. To cut off access:
   check your IdP's default access-token TTL for that resource).
 - To force an immediate cut, shorten the resource's access-token TTL at
   the IdP (if supported) rather than trying to intervene from
-  doorward's side.
+  authward's side.
 
 Disabling a **user** at the IdP takes effect at that user's next silent
 refresh — i.e. within one access-token lifetime (`expires_in`, typically
-minutes to an hour) — when the IdP refuses the refresh and doorward
+minutes to an hour) — when the IdP refuses the refresh and authward
 clears the session. There is no back-channel logout, so if you need it
-faster, shorten the access-token TTL at the IdP for doorward's
+faster, shorten the access-token TTL at the IdP for authward's
 client. `session_max_age_seconds` (default 24h) is the hard upper bound
 on any session regardless of what the IdP does.
 
@@ -136,4 +136,4 @@ domain — never anyone else's, even by guessing a session ID. `/logout`
 (also POST-only) ends the current session and, when the provider
 supports RP-Initiated Logout, sends the browser to the IdP's own
 `end_session_endpoint` too so the IdP-side session ends as well, not
-just doorward's.
+just authward's.

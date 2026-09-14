@@ -1,8 +1,8 @@
 //! End-to-end test of the actual Caddy integration (Phase 10): a real
 //! `caddy` binary, configured the way the reference Caddyfile documents,
-//! sitting in front of a real doorward instance and a trivial
+//! sitting in front of a real authward instance and a trivial
 //! backend app. Confirms the parts that can't be verified by testing
-//! doorward alone: that `forward_auth` + `handle_response` really
+//! authward alone: that `forward_auth` + `handle_response` really
 //! does redirect an unauthenticated request to `/login`, that
 //! `copy_headers` really does carry identity headers onto the backend
 //! request, and that the full round trip (denied -> login -> callback ->
@@ -29,7 +29,7 @@ use openidconnect::core::{CoreHmacKey, CoreJsonWebKey, CoreJwsSigningAlgorithm};
 use serde::Deserialize;
 use serde_json::json;
 
-const CLIENT_ID: &str = "doorward-test-client";
+const CLIENT_ID: &str = "authward-test-client";
 const CLIENT_SECRET: &str = "caddy-integration-test-secret";
 
 fn caddy_bin() -> String {
@@ -108,7 +108,7 @@ async fn spawn_mock_idp() -> String {
         move |Query(params): Query<AuthorizeParams>| {
             let idp = idp.clone();
             async move {
-                let code = doorward::crypto::random_hex(16);
+                let code = authward::crypto::random_hex(16);
                 idp.pending
                     .lock()
                     .unwrap()
@@ -227,16 +227,16 @@ async fn full_flow_through_real_caddy() {
     let idp_base_url = spawn_mock_idp().await;
     let (backend_port, backend_hits) = spawn_backend_app().await;
 
-    // --- doorward itself, via the same in-process construction the
+    // --- authward itself, via the same in-process construction the
     // rest of the suite uses, so this test only adds the Caddy layer on
-    // top rather than re-testing doorward's own logic.
+    // top rather than re-testing authward's own logic.
     let mut base_domains = std::collections::HashMap::new();
     base_domains.insert(
         "test.local".to_string(),
-        doorward::config::BaseDomain {
+        authward::config::BaseDomain {
             name: "test.local".to_string(),
             auth_subdomain: "auth.test.local".to_string(),
-            provider: doorward::config::Provider {
+            provider: authward::config::Provider {
                 discovery_url: url::Url::parse(&format!(
                     "{idp_base_url}/.well-known/openid-configuration"
                 ))
@@ -249,11 +249,11 @@ async fn full_flow_through_real_caddy() {
     let mut hosts = std::collections::HashMap::new();
     hosts.insert(
         "app.test.local".to_string(),
-        doorward::config::ResolvedHost {
+        authward::config::ResolvedHost {
             host: Some("app.test.local".to_string()),
             base_domain: "test.local".to_string(),
             provider_key: "test.local".to_string(),
-            provider: doorward::config::Provider {
+            provider: authward::config::Provider {
                 discovery_url: url::Url::parse(&format!(
                     "{idp_base_url}/.well-known/openid-configuration"
                 ))
@@ -270,8 +270,8 @@ async fn full_flow_through_real_caddy() {
         },
     );
     let db_dir = tempfile::tempdir().unwrap();
-    let cfg = doorward::config::Config {
-        global: doorward::config::Global {
+    let cfg = authward::config::Config {
+        global: authward::config::Global {
             cookie_signing_key: "caddy-test-cookie-signing-key-32-bytes!!".to_string(),
             refresh_token_encryption_key: "caddy-test-refresh-key-32-bytes-minimum!".to_string(),
             sqlite_path: db_dir.path().join("sessions.db"),
@@ -284,10 +284,10 @@ async fn full_flow_through_real_caddy() {
         hosts,
         fallback: None,
     };
-    let state = doorward::build_state(cfg)
+    let state = authward::build_state(cfg)
         .await
         .expect("build_state against mock IdP");
-    let auth_app = doorward::server::build_router(state);
+    let auth_app = authward::server::build_router(state);
     let auth_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let auth_port = auth_listener.local_addr().unwrap().port();
     tokio::spawn(async move {
@@ -324,15 +324,15 @@ async fn full_flow_through_real_caddy() {
 			}}
 		}}
 		reverse_proxy 127.0.0.1:{backend_port} {{
-			header_up Cookie ";\s*doorward_session=[^;]*" ""
-			header_up Cookie "^doorward_session=[^;]*;?\s*" ""
+			header_up Cookie ";\s*authward_session=[^;]*" ""
+			header_up Cookie "^authward_session=[^;]*;?\s*" ""
 		}}
 	}}
 }}
 "#
     );
     let mut caddyfile_path = std::env::temp_dir();
-    caddyfile_path.push(format!("doorward-test-caddyfile-{caddy_port}"));
+    caddyfile_path.push(format!("authward-test-caddyfile-{caddy_port}"));
     std::fs::write(&caddyfile_path, &caddyfile).unwrap();
 
     let mut caddy = Command::new(caddy_bin())
@@ -378,7 +378,7 @@ async fn full_flow_through_real_caddy() {
 
     // 1. Unauthenticated request to the app, through Caddy, is denied and
     //    redirected to /login with rd pointing back at the original URL —
-    //    query string included, `&` and all, since doorward builds the
+    //    query string included, `&` and all, since authward builds the
     //    login URL itself (X-Login-Url) rather than Caddy splicing {uri}
     //    raw into a query parameter.
     let resp = client
@@ -512,9 +512,9 @@ async fn full_flow_through_real_caddy() {
     );
     assert!(body.contains("path=/dashboard"));
     // The reference Caddyfile's `header_up Cookie` rewrites strip
-    // doorward's own session cookie before the backend sees it, leaving
+    // authward's own session cookie before the backend sees it, leaving
     // any other cookies intact. (The hand-rolled jar above also relays
-    // the emptied `doorward_flow=` removal cookie, which a real browser
+    // the emptied `authward_flow=` removal cookie, which a real browser
     // would have dropped; it's harmless and not what's under test.)
     let forwarded_cookie = body
         .split("cookie=[")
@@ -522,7 +522,7 @@ async fn full_flow_through_real_caddy() {
         .and_then(|rest| rest.strip_suffix(']'))
         .unwrap_or_else(|| panic!("backend echo lacks a cookie field: {body}"));
     assert!(
-        !forwarded_cookie.contains("doorward_session"),
+        !forwarded_cookie.contains("authward_session"),
         "the session cookie must be stripped before reaching the backend, got: {body}"
     );
     assert!(
@@ -536,7 +536,7 @@ async fn full_flow_through_real_caddy() {
     );
 
     // 4. A non-GET without a session is not redirected through login
-    //    (which would replay it as a GET): Caddy relays doorward's own
+    //    (which would replay it as a GET): Caddy relays authward's own
     //    "session expired, please resubmit" 401 page instead.
     let resp = client
         .post(format!("{caddy_base}/submit"))

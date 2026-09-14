@@ -1,19 +1,19 @@
-# Reference Caddyfile for doorward (Phase 10).
+# Reference Caddyfile for authward (Phase 10).
 #
 # Requires Caddy v2.11.2 or newer. Caddy 2.10.0 through 2.11.1 have
 # GHSA-7r4p-vjf4-gxv4: `copy_headers` leaves a client-supplied header in
 # place when the auth response doesn't carry that header, so a client
-# could inject its own X-Auth-User. doorward defends in depth by
+# could inject its own X-Auth-User. authward defends in depth by
 # always sending all three X-Auth-* headers (empty when there's nothing
 # to forward) on every 200, but run a patched Caddy regardless.
 # Verified against Caddy v2.11.4.
 #
 # Two site blocks per base domain: one for the auth subdomain itself
-# (reverse-proxied straight to doorward, no forward_auth wrapper —
+# (reverse-proxied straight to authward, no forward_auth wrapper —
 # it hosts /login, /callback, /logout, /healthz, / directly), and one
 # per protected app (forward_auth in front of the real backend).
 #
-# IMPORTANT — trust boundary: doorward trusts X-Forwarded-Host and,
+# IMPORTANT — trust boundary: authward trusts X-Forwarded-Host and,
 # when forward_identity_headers is enabled for a host, forwards
 # X-Auth-User/X-Auth-Email/X-Auth-Groups based on it. Both this Caddy
 # instance and every backend app it proxies to MUST be unreachable
@@ -34,7 +34,7 @@ app.example.com {
 
 		# Copies the verified identity onto the backend request. Keep
 		# this line even for hosts with forward_identity_headers = false:
-		# doorward sends the headers empty in that case, and copying
+		# authward sends the headers empty in that case, and copying
 		# them is what overwrites (rather than passes through) any
 		# X-Auth-* header the client sent.
 		copy_headers X-Auth-User X-Auth-Email X-Auth-Groups
@@ -42,10 +42,10 @@ app.example.com {
 		# forward_auth does NOT redirect on a non-2xx response by
 		# default — it aborts and relays the auth response's status/body
 		# verbatim to the client. That's exactly what we want for a 403
-		# (doorward's own "not authorized" page) and a 502 (its
+		# (authward's own "not authorized" page) and a 502 (its
 		# "misconfigured host" page), but a 401 ("not authenticated")
 		# on a GET needs to become a redirect to /login instead.
-		# doorward's 401 carries the exact login URL to use in
+		# authward's 401 carries the exact login URL to use in
 		# X-Login-Url, with the original request URL query-encoded
 		# inside `rd` — don't rebuild it here as
 		# `...?rd={scheme}://{host}{uri}`: {uri} goes in raw, so an `&`
@@ -65,7 +65,7 @@ app.example.com {
 	}
 
 	reverse_proxy localhost:9000 {
-		# Strip doorward's session cookie before the request reaches the
+		# Strip authward's session cookie before the request reaches the
 		# backend. The cookie is Domain=.example.com so the browser sends
 		# it to every app under the base domain, and a backend that sees
 		# it could replay it as a single sign-on session against every
@@ -73,7 +73,7 @@ app.example.com {
 		# X-Auth-* headers above. The two patterns cover the cookie in
 		# the middle/end and at the start of the Cookie header; other
 		# cookies pass through untouched.
-		header_up Cookie ";\s*doorward_session=[^;]*" ""
-		header_up Cookie "^doorward_session=[^;]*;?\s*" ""
+		header_up Cookie ";\s*authward_session=[^;]*" ""
+		header_up Cookie "^authward_session=[^;]*;?\s*" ""
 	}
 }

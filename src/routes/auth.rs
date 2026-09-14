@@ -29,8 +29,8 @@ use crate::redirect::validate_redirect_target;
 use crate::state::AppState;
 use crate::templates::ErrorPage;
 
-const SESSION_COOKIE_NAME: &str = "doorward_session";
-const FLOW_COOKIE_NAME: &str = "doorward_flow";
+const SESSION_COOKIE_NAME: &str = "authward_session";
+const FLOW_COOKIE_NAME: &str = "authward_flow";
 const FLOW_COOKIE_MAX_AGE_MINUTES: i64 = 10;
 
 #[derive(Deserialize)]

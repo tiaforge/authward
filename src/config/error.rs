@@ -64,13 +64,13 @@ pub enum ConfigError {
 
     #[error(
         "global: `cookie_signing_key` is not set — provide it in `[global]` \
-         or via the `DOORWARD_COOKIE_KEY` environment variable"
+         or via the `AUTHWARD_COOKIE_KEY` environment variable"
     )]
     MissingCookieSigningKey,
 
     #[error(
         "global: `refresh_token_encryption_key` is not set — provide it in \
-         `[global]` or via the `DOORWARD_REFRESH_KEY` environment variable"
+         `[global]` or via the `AUTHWARD_REFRESH_KEY` environment variable"
     )]
     MissingRefreshKey,
 
@@ -83,7 +83,7 @@ pub enum ConfigError {
 
     #[error(
         "global: `{name}` is {len} bytes long but must be at least {min} — use \
-         random data (32 random bytes hex-encoded, as `doorward init` \
+         random data (32 random bytes hex-encoded, as `authward init` \
          generates), never a passphrase"
     )]
     KeyTooShort {

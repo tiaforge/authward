@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use doorward::config;
+use authward::config;
 use axum::extract::{Form, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
@@ -39,7 +39,7 @@ use openidconnect::{
 use serde::Deserialize;
 use serde_json::json;
 
-const CLIENT_ID: &str = "doorward-test-client";
+const CLIENT_ID: &str = "authward-test-client";
 /// Per the OIDC Core spec, HS256/384/512 ID token signatures are verified
 /// using the UTF-8 bytes of the client_secret directly as the HMAC key —
 /// there's no published JWKS entry for it (publishing a symmetric signing
@@ -147,7 +147,7 @@ async fn authorize(
     State(idp): State<MockIdp>,
     Query(params): Query<AuthorizeParams>,
 ) -> impl IntoResponse {
-    let code = doorward::crypto::random_hex(16);
+    let code = authward::crypto::random_hex(16);
     let subject = params
         .login_hint
         .unwrap_or_else(|| "default-user".to_string());
@@ -253,7 +253,7 @@ async fn token(State(idp): State<MockIdp>, Form(params): Form<TokenParams>) -> R
                 .remove(&code)
                 .expect("mock IdP received a code it never issued");
             let nonce = pending.nonce.clone();
-            let refresh_token = doorward::crypto::random_hex(16);
+            let refresh_token = authward::crypto::random_hex(16);
             Json(issue_tokens(&idp, pending, Some(nonce), refresh_token)).into_response()
         }
         "refresh_token" => {
@@ -273,7 +273,7 @@ async fn token(State(idp): State<MockIdp>, Form(params): Form<TokenParams>) -> R
                 )
                     .into_response();
             };
-            let new_refresh_token = doorward::crypto::random_hex(16);
+            let new_refresh_token = authward::crypto::random_hex(16);
             Json(issue_tokens(&idp, identity, None, new_refresh_token)).into_response()
         }
         other => (
@@ -332,7 +332,7 @@ async fn spawn_mock_idp_full(
 }
 
 /// `spawn_mock_idp_full` on a caller-supplied listener — for tests that
-/// need the IdP to appear at an address doorward already knows about
+/// need the IdP to appear at an address authward already knows about
 /// (a provider that was down at startup).
 async fn spawn_mock_idp_on(
     listener: tokio::net::TcpListener,
@@ -457,11 +457,11 @@ fn resolved_host(host: &str, base_domain: &str, idp_base_url: &str) -> config::R
     }
 }
 
-async fn spawn_app_with_config(cfg: config::Config) -> (String, doorward::state::AppState) {
-    let state = doorward::build_state(cfg)
+async fn spawn_app_with_config(cfg: config::Config) -> (String, authward::state::AppState) {
+    let state = authward::build_state(cfg)
         .await
         .expect("build_state against mock IdP");
-    let app = doorward::server::build_router(state.clone());
+    let app = authward::server::build_router(state.clone());
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -492,7 +492,7 @@ fn base_config(db_path: &std::path::Path) -> config::Config {
 async fn spawn_app(
     idp_base_url: &str,
     db_path: &std::path::Path,
-) -> (String, doorward::state::AppState) {
+) -> (String, authward::state::AppState) {
     let mut cfg = base_config(db_path);
     cfg.base_domains.insert(
         "test.local".to_string(),
@@ -707,7 +707,7 @@ async fn login_as_with(
         "expected /callback to redirect somewhere"
     );
     assert!(
-        browser.cookies.contains_key("doorward_session"),
+        browser.cookies.contains_key("authward_session"),
         "expected a session cookie after login"
     );
     location(&resp)
@@ -834,11 +834,11 @@ async fn concurrent_logins_do_not_cross_contaminate() {
     assert_eq!(location(&alice_resp), "https://app.test.local/a");
 
     // Both end up with distinct, valid sessions of their own.
-    assert!(alice.cookies.contains_key("doorward_session"));
-    assert!(bob.cookies.contains_key("doorward_session"));
+    assert!(alice.cookies.contains_key("authward_session"));
+    assert!(bob.cookies.contains_key("authward_session"));
     assert_ne!(
-        alice.cookies["doorward_session"],
-        bob.cookies["doorward_session"]
+        alice.cookies["authward_session"],
+        bob.cookies["authward_session"]
     );
 
     assert_eq!(
@@ -942,7 +942,7 @@ async fn silent_refresh_extends_an_expired_session() {
         .await,
         "https://app.test.local/dashboard"
     );
-    let session_cookie_before = browser.cookies["doorward_session"].clone();
+    let session_cookie_before = browser.cookies["authward_session"].clone();
 
     assert_eq!(
         browser
@@ -971,7 +971,7 @@ async fn silent_refresh_extends_an_expired_session() {
 
     // Same session identity throughout — refresh updates the existing
     // row/cookie rather than minting a new session.
-    assert_eq!(browser.cookies["doorward_session"], session_cookie_before);
+    assert_eq!(browser.cookies["authward_session"], session_cookie_before);
 }
 
 #[tokio::test]
@@ -1041,7 +1041,7 @@ async fn concurrent_verify_requests_collapse_into_one_refresh() {
         .await,
         "https://app.test.local/dashboard"
     );
-    let cookie_header = format!("doorward_session={}", browser.cookies["doorward_session"]);
+    let cookie_header = format!("authward_session={}", browser.cookies["authward_session"]);
 
     tokio::time::sleep(ttl + Duration::from_millis(500)).await;
 
@@ -1079,7 +1079,7 @@ async fn reaper_deletes_sessions_with_no_refresh_token_survivors() {
     let db_dir = tempfile::tempdir().unwrap();
     let (_app, state) = spawn_app(&idp_base_url, &db_dir.path().join("sessions.db")).await;
 
-    doorward::db::create_session(
+    authward::db::create_session(
         &state.db,
         "reaper-test-session",
         "test.local",
@@ -1094,10 +1094,10 @@ async fn reaper_deletes_sessions_with_no_refresh_token_survivors() {
     .await
     .unwrap();
 
-    doorward::session::reap_expired_sessions(&state).await;
+    authward::session::reap_expired_sessions(&state).await;
 
     assert!(
-        doorward::db::get_session(&state.db, "reaper-test-session")
+        authward::db::get_session(&state.db, "reaper-test-session")
             .await
             .unwrap()
             .is_none()
@@ -1128,10 +1128,10 @@ async fn reaper_leaves_an_idle_session_that_can_still_refresh() {
         "https://app.test.local/",
     )
     .await;
-    let cookie_header = format!("doorward_session={}", browser.cookies["doorward_session"]);
+    let cookie_header = format!("authward_session={}", browser.cookies["authward_session"]);
 
     tokio::time::sleep(ttl + Duration::from_millis(500)).await;
-    doorward::session::reap_expired_sessions(&state).await;
+    authward::session::reap_expired_sessions(&state).await;
 
     assert_eq!(
         raw_verify(&app, &cookie_header).await,
@@ -1177,7 +1177,7 @@ async fn reaper_deletes_a_session_past_max_age_even_with_a_refresh_token() {
     // The cookie carries the session ID encrypted, so find the row by
     // subject instead.
     let rows =
-        doorward::db::list_sessions_for_subject(&state.db, "test.local", "test.local", "alice")
+        authward::db::list_sessions_for_subject(&state.db, "test.local", "test.local", "alice")
             .await
             .unwrap();
     assert_eq!(rows.len(), 1);
@@ -1187,10 +1187,10 @@ async fn reaper_deletes_a_session_past_max_age_even_with_a_refresh_token() {
     );
 
     tokio::time::sleep(Duration::from_millis(1500)).await;
-    doorward::session::reap_expired_sessions(&state).await;
+    authward::session::reap_expired_sessions(&state).await;
 
     assert!(
-        doorward::db::get_session(&state.db, &rows[0].id)
+        authward::db::get_session(&state.db, &rows[0].id)
             .await
             .unwrap()
             .is_none(),
@@ -1223,7 +1223,7 @@ async fn reaper_does_not_delete_a_session_mid_refresh() {
         .await,
         "https://app.test.local/dashboard"
     );
-    let cookie_header = format!("doorward_session={}", browser.cookies["doorward_session"]);
+    let cookie_header = format!("authward_session={}", browser.cookies["authward_session"]);
 
     tokio::time::sleep(ttl + Duration::from_millis(500)).await;
 
@@ -1245,7 +1245,7 @@ async fn reaper_does_not_delete_a_session_mid_refresh() {
     // delete the row out from under it: it can only proceed past the
     // per-session lock once the refresh releases it, at which point the
     // row's expiry has already been pushed into the future.
-    doorward::session::reap_expired_sessions(&state).await;
+    authward::session::reap_expired_sessions(&state).await;
 
     assert_eq!(
         verify_task.await.unwrap(),
@@ -1528,7 +1528,7 @@ async fn startup_fails_when_no_provider_can_be_discovered() {
         "test.local".to_string(),
         base_domain_block("test.local", "auth.test.local", &format!("http://{dead}")),
     );
-    let err = doorward::build_state(cfg)
+    let err = authward::build_state(cfg)
         .await
         .err()
         .expect("startup must fail when the only provider is unreachable");
@@ -1599,11 +1599,11 @@ async fn a_down_provider_does_not_block_startup_and_is_picked_up_later() {
         reqwest::StatusCode::UNAUTHORIZED
     );
 
-    // IdP B comes up at the address doorward was configured with; the
+    // IdP B comes up at the address authward was configured with; the
     // retry loop's body picks it up and partner logins start working.
     let listener = tokio::net::TcpListener::bind(dead).await.unwrap();
     let _idp_b = spawn_mock_idp_on(listener, Duration::from_secs(3600), Duration::ZERO, true).await;
-    assert_eq!(doorward::discover_missing_providers(&state).await, 0);
+    assert_eq!(authward::discover_missing_providers(&state).await, 0);
 
     let resp = browser.get(&app, "auth.test.local", &partner_login).await;
     assert_eq!(resp.status(), reqwest::StatusCode::SEE_OTHER);
@@ -1947,13 +1947,13 @@ async fn bearer_token_is_tried_when_the_session_cookie_is_stale_and_scheme_is_ca
     )
     .await;
     let rows =
-        doorward::db::list_sessions_for_subject(&state.db, "test.local", "test.local", "alice")
+        authward::db::list_sessions_for_subject(&state.db, "test.local", "test.local", "alice")
             .await
             .unwrap();
-    doorward::db::delete_session(&state.db, &rows[0].id)
+    authward::db::delete_session(&state.db, &rows[0].id)
         .await
         .unwrap();
-    let stale_cookie = format!("doorward_session={}", browser.cookies["doorward_session"]);
+    let stale_cookie = format!("authward_session={}", browser.cookies["authward_session"]);
 
     let token = build_access_token(
         &hmac_key.lock().unwrap(),
@@ -2241,7 +2241,7 @@ async fn token_helper_scopes_the_request_to_the_selected_hosts_resource() {
         "the /token callback should render the token page directly, not redirect"
     );
     assert!(
-        !browser.cookies.contains_key("doorward_session"),
+        !browser.cookies.contains_key("authward_session"),
         "a /token flow must not create a browser session"
     );
 
@@ -2357,7 +2357,7 @@ async fn revoking_a_different_session_only_invalidates_that_one() {
     let html = dashboard.text().await.unwrap();
     for (name, browser) in [("A", &browser_a), ("B", &browser_b)] {
         assert!(
-            !html.contains(&browser.cookies["doorward_session"]),
+            !html.contains(&browser.cookies["authward_session"]),
             "dashboard leaked browser {name}'s raw session ID"
         );
     }
@@ -2751,7 +2751,7 @@ async fn spoofed_identity_header_on_the_request_is_ignored() {
         .header("host", "app.test.local")
         .header(
             "cookie",
-            format!("doorward_session={}", browser.cookies["doorward_session"]),
+            format!("authward_session={}", browser.cookies["authward_session"]),
         )
         .header("x-auth-user", "root")
         .send()

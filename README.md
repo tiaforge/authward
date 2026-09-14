@@ -1,4 +1,4 @@
-# doorward
+# authward
 
 A small Rust + Axum service that adds OIDC login in front of apps that
 don't speak OIDC themselves, via Caddy's `forward_auth` directive. Built
@@ -8,7 +8,7 @@ external dependencies to run.
 
 Start here:
 
-- **[Quickstart](docs/quickstart.md)** — `doorward init` walked
+- **[Quickstart](docs/quickstart.md)** — `authward init` walked
   through end to end, get something running before reading the rest.
 - **[Deployment guide](docs/deployment.md)** — the binary, the config
   file, the trust-boundary requirement, and the Caddy setup.

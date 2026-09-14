@@ -124,7 +124,7 @@ const DEFAULT_GROUP_CLAIM_NAME: &str = "groups";
 const MIN_KEY_BYTES: usize = 32;
 
 /// Load, resolve and validate the config file at `path`. Env vars
-/// `DOORWARD_COOKIE_KEY` / `DOORWARD_REFRESH_KEY` take precedence
+/// `AUTHWARD_COOKIE_KEY` / `AUTHWARD_REFRESH_KEY` take precedence
 /// over the corresponding `[global]` values when set.
 ///
 /// On any problem this returns every error found, not just the first, so a
@@ -205,10 +205,10 @@ fn resolve(raw: RawConfig, path: &Path) -> Result<Config, Vec<ConfigError>> {
 }
 
 fn resolve_global(raw: &RawConfig, path: &Path, errors: &mut Vec<ConfigError>) -> Option<Global> {
-    let cookie_signing_key = std::env::var("DOORWARD_COOKIE_KEY")
+    let cookie_signing_key = std::env::var("AUTHWARD_COOKIE_KEY")
         .ok()
         .or_else(|| raw.global.cookie_signing_key.clone());
-    let refresh_token_encryption_key = std::env::var("DOORWARD_REFRESH_KEY")
+    let refresh_token_encryption_key = std::env::var("AUTHWARD_REFRESH_KEY")
         .ok()
         .or_else(|| raw.global.refresh_token_encryption_key.clone());
 
