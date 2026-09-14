@@ -359,6 +359,15 @@ async fn start_authorization(
         .add_scope(Scope::new("email".to_string()))
         .add_scope(Scope::new("profile".to_string()))
         .set_pkce_challenge(pkce_challenge);
+    if runtime.supports_groups_scope {
+        // Needed for `required_group`: most IdPs (Pocket ID included) only
+        // put group membership in the token/userinfo when this scope is
+        // explicitly requested. Skipped for providers whose discovery
+        // document advertises `scopes_supported` without `groups` — some
+        // IdPs reject an `authorize` request for a scope they don't list,
+        // rather than silently ignoring it.
+        request = request.add_scope(Scope::new("groups".to_string()));
+    }
     if let Some(resource) = &resource {
         // RFC 8707 resource indicator, so the IdP scopes the issued
         // access token's audience to this specific resource.

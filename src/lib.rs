@@ -103,6 +103,7 @@ async fn discover_provider(
         client: discovered.client,
         jwks: JwksCache::new(discovered.issuer, discovered.jwks_uri, discovered.jwks),
         end_session_endpoint: discovered.end_session_endpoint,
+        supports_groups_scope: discovered.supports_groups_scope,
     })
 }
 

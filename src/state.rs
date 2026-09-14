@@ -48,6 +48,8 @@ pub struct ProviderRuntime {
     pub client: DiscoveredClient,
     pub jwks: JwksCache,
     pub end_session_endpoint: Option<url::Url>,
+    /// See `oidc::DiscoveredProvider::supports_groups_scope`.
+    pub supports_groups_scope: bool,
 }
 
 impl AppState {

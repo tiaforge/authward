@@ -56,6 +56,14 @@ pub struct DiscoveredProvider {
     /// `None` means the provider doesn't support it; logout then just
     /// clears the local session, no IdP round trip.
     pub end_session_endpoint: Option<url::Url>,
+    /// Whether the discovery document's `scopes_supported` includes
+    /// `groups` — needed for `required_group` to work against IdPs (Pocket
+    /// ID included) that only add a groups claim when the scope is
+    /// explicitly requested. `scopes_supported` is itself optional per the
+    /// discovery spec; when a provider omits it entirely we assume support,
+    /// since most implementations that omit it also don't reject unknown
+    /// scopes, and refusing to ask would silently break `required_group`.
+    pub supports_groups_scope: bool,
 }
 
 pub async fn discover(
@@ -116,6 +124,11 @@ pub async fn discover(
         );
     }
 
+    let supports_groups_scope = match metadata.scopes_supported() {
+        Some(scopes) => scopes.iter().any(|s| s.as_ref() == "groups"),
+        None => true,
+    };
+
     let issuer = metadata.issuer().clone();
     let jwks_uri = metadata.jwks_uri().clone();
     let jwks = JsonWebKeySet::fetch_async(&jwks_uri, http_client)
@@ -136,6 +149,7 @@ pub async fn discover(
         jwks_uri,
         jwks,
         end_session_endpoint,
+        supports_groups_scope,
     })
 }
 
