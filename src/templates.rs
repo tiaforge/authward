@@ -50,6 +50,9 @@ pub struct SessionRow {
 #[template(path = "dashboard.html")]
 pub struct DashboardPage<'a> {
     pub subject: &'a str,
+    /// The `name` claim from the ID token, if the provider sends one —
+    /// falls back to `subject` in the template when absent.
+    pub name: Option<&'a str>,
     pub email: Option<&'a str>,
     pub sessions: Vec<SessionRow>,
     pub token_hosts: Vec<&'a str>,

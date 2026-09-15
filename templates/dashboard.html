@@ -23,10 +23,26 @@
     <section class="card identity">
       <div>
         <p class="label">Signed in as</p>
+        {% if let Some(name) = name %}
+        <h1>{{ name }}</h1>
+        {% else %}
         <h1>{{ subject }}</h1>
+        {% endif %}
         {% if let Some(email) = email %}<p class="email">{{ email }}</p>{% endif %}
+        {% if name.is_some() %}<p class="sub">{{ subject }}</p>{% endif %}
       </div>
     </section>
+
+    {% if !token_hosts.is_empty() %}
+    <section class="card">
+      <h2>API tokens</h2>
+      <ul class="tokens">
+        {% for host in token_hosts %}
+        <li><a href="/token?host={{ host }}"><code>{{ host }}</code><span>Get a token &rarr;</span></a></li>
+        {% endfor %}
+      </ul>
+    </section>
+    {% endif %}
 
     <section class="card">
       <h2>Active sessions</h2>
@@ -48,17 +64,6 @@
         {% endfor %}
       </table>
     </section>
-
-    {% if !token_hosts.is_empty() %}
-    <section class="card">
-      <h2>API tokens</h2>
-      <ul class="tokens">
-        {% for host in token_hosts %}
-        <li><a href="/token?host={{ host }}"><code>{{ host }}</code><span>Get a token &rarr;</span></a></li>
-        {% endfor %}
-      </ul>
-    </section>
-    {% endif %}
   </main>
 </body>
 </html>

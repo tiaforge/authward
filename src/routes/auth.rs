@@ -1041,8 +1041,15 @@ pub async fn overview(
         .filter_map(|h| h.host.as_deref())
         .collect();
 
+    let name = session
+        .claims_json
+        .get("name")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+
     crate::templates::DashboardPage {
         subject: &session.subject,
+        name,
         email: session.email.as_deref(),
         sessions: session_rows,
         token_hosts,
