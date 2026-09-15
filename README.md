@@ -30,6 +30,13 @@ rationale and locked-in decisions this implementation follows, and
 [`examples/config.toml`](examples/config.toml) /
 [`deploy/Caddyfile`](deploy/Caddyfile) for copy-and-edit starting points.
 
+## Screenshots
+
+| | Light | Dark |
+| --- | --- | --- |
+| Dashboard | <img src="assets/screenshots/dashboard-light.png" alt="Dashboard in light mode: signed-in identity, API tokens, and active sessions" width="420"> | <img src="assets/screenshots/dashboard-dark.png" alt="Dashboard in dark mode: signed-in identity, API tokens, and active sessions" width="420"> |
+| API token | <img src="assets/screenshots/token-light.png" alt="One-time API token page in light mode" width="420"> | <img src="assets/screenshots/token-dark.png" alt="One-time API token page in dark mode" width="420"> |
+
 ## Building
 
 ```sh
