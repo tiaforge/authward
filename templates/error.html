@@ -4,13 +4,17 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg">
   <title>{{ title }}</title>
   {% include "_style.html" %}
 </head>
 <body>
   <main class="narrow">
     <header>
-      <div class="brand">authward</div>
+      <picture class="brand">
+        <source srcset="/brand/wordmark-dark.svg" media="(prefers-color-scheme: dark)">
+        <img src="/brand/wordmark-light.svg" alt="authward" height="60">
+      </picture>
     </header>
 
     <section class="card identity">

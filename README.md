@@ -1,4 +1,9 @@
-# authward
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/brand/authward-wordmark-dark.svg">
+    <img src="assets/brand/authward-wordmark-light.svg" alt="authward" height="60">
+  </picture>
+</p>
 
 A small Rust + Axum service that adds OIDC login in front of apps that
 don't speak OIDC themselves, via Caddy's `forward_auth` directive. Built
