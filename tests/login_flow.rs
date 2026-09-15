@@ -3099,6 +3099,72 @@ async fn bypass_path_skips_auth_entirely() {
 }
 
 #[tokio::test]
+async fn bypass_wildcard_path_skips_auth_for_everything_under_the_prefix() {
+    let (idp_base_url, _count, _tokens) = spawn_mock_idp(Duration::from_secs(3600)).await;
+    let db_dir = tempfile::tempdir().unwrap();
+    let mut cfg = base_config(&db_dir.path().join("sessions.db"));
+    add_domain(&mut cfg, "test.local", "auth.test.local", &idp_base_url);
+    let mut app_host = resolved_host("app.test.local", "test.local");
+    app_host.bypass_paths = vec!["/public/*".to_string()];
+    cfg.hosts.insert("app.test.local".to_string(), app_host);
+    let (app, _state) = spawn_app_with_config(cfg).await;
+
+    for uri in ["/public/anything", "/public/nested/thing"] {
+        let resp = reqwest::Client::new()
+            .get(format!("{app}/verify"))
+            .header("host", "app.test.local")
+            .header("x-forwarded-uri", uri)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK, "{uri} should bypass");
+        for name in ["x-auth-user", "x-auth-email", "x-auth-groups"] {
+            assert_eq!(
+                resp.headers().get(name).map(|v| v.as_bytes()),
+                Some(&b""[..]),
+                "{name} must be present and empty on a bypassed path"
+            );
+        }
+    }
+
+    for uri in ["/public", "/publicly", "/private/secret"] {
+        let resp = reqwest::Client::new()
+            .get(format!("{app}/verify"))
+            .header("host", "app.test.local")
+            .header("x-forwarded-uri", uri)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "{uri} should not bypass"
+        );
+    }
+}
+
+#[tokio::test]
+async fn bypass_wildcard_does_not_match_a_request_with_a_dot_segment() {
+    let (idp_base_url, _count, _tokens) = spawn_mock_idp(Duration::from_secs(3600)).await;
+    let db_dir = tempfile::tempdir().unwrap();
+    let mut cfg = base_config(&db_dir.path().join("sessions.db"));
+    add_domain(&mut cfg, "test.local", "auth.test.local", &idp_base_url);
+    let mut app_host = resolved_host("app.test.local", "test.local");
+    app_host.bypass_paths = vec!["/public/*".to_string()];
+    cfg.hosts.insert("app.test.local".to_string(), app_host);
+    let (app, _state) = spawn_app_with_config(cfg).await;
+
+    let resp = reqwest::Client::new()
+        .get(format!("{app}/verify"))
+        .header("host", "app.test.local")
+        .header("x-forwarded-uri", "/public/../admin")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn bypass_path_appended_as_query_string_does_not_bypass_a_protected_route() {
     let (idp_base_url, _count, _tokens) = spawn_mock_idp(Duration::from_secs(3600)).await;
     let db_dir = tempfile::tempdir().unwrap();

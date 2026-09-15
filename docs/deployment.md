@@ -18,6 +18,12 @@ supposed to be set by a proxy it trusts, not by end clients:
 - `X-Forwarded-Host` (falls back to `Host`) — which host config to apply
 - `X-Forwarded-Proto` — whether to set the `Secure` cookie flag
 - `X-Forwarded-For` (last hop only) — the client IP used for rate limiting
+- `X-Forwarded-Uri` — the original request path, checked against
+  `bypass_paths`; a match skips authentication entirely for that
+  request. If a client can reach `/verify` directly (see below), it can
+  set this header to whatever it wants — so a configured `bypass_paths`
+  entry, especially a `/*`-style wildcard covering a whole subtree, is
+  only as safe as this trust boundary actually holding.
 
 And on the way out, when a host has `forward_identity_headers = true`,
 authward's `/verify` response carries `X-Auth-User` /

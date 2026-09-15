@@ -44,5 +44,5 @@ idp = "pocketid"
 # A host that layers on the optional per-host fields.
 [host."admin.example.com"]
 required_group = "admins"
-bypass_paths = ["/healthz", "/static/logo.svg"]
+bypass_paths = ["/healthz", "/static/logo.svg", "/public/*"]
 forward_identity_headers = true

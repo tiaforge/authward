@@ -85,8 +85,9 @@ pub enum ConfigError {
     },
 
     #[error(
-        "host `{host}`: bypass path `{path}` must start with `/` (it is matched \
-         as an absolute path, not a prefix or pattern)"
+        "host `{host}`: bypass path `{path}` must start with `/` (matched as \
+         an absolute path, optionally ending in `/*` to match that path and \
+         everything under it)"
     )]
     BypassPathMustBeAbsolute { host: String, path: String },
 
@@ -96,6 +97,15 @@ pub enum ConfigError {
          those characters are stripped from the real request before matching"
     )]
     BypassPathHasQueryOrFragment { host: String, path: String },
+
+    #[error(
+        "host `{host}`: bypass path `{path}` contains `*` somewhere other than \
+         a trailing `/*` — the only supported wildcard form is a path ending \
+         in `/*`, which matches that path and everything under it (e.g. \
+         `/share/*`); `**`, a mid-path `*`, or more than one `*` are not \
+         supported"
+    )]
+    BypassPathWildcardMustBeSuffix { host: String, path: String },
 
     #[error("host `{host}`: `token_header` `{header}` can't be used: {reason}")]
     InvalidTokenHeader {

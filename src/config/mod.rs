@@ -359,6 +359,12 @@ fn validate_bypass_path(host: &str, path: &str, errors: &mut Vec<ConfigError>) {
             path: path.to_string(),
         });
     }
+    if path.contains('*') && !(path.ends_with("/*") && path.matches('*').count() == 1) {
+        errors.push(ConfigError::BypassPathWildcardMustBeSuffix {
+            host: host.to_string(),
+            path: path.to_string(),
+        });
+    }
 }
 
 /// A token header must be a syntactically valid header name, and not one
@@ -977,6 +983,46 @@ bypass_paths = ["no-slash"]
             )),
             "{errors:?}"
         );
+    }
+
+    #[test]
+    fn trailing_wildcard_bypass_path_loads_without_error() {
+        let cfg = load_str(&format!(
+            r#"{ONE_IDP}
+[domain."example.com"]
+auth_subdomain = "auth.example.com"
+
+[host."app.example.com"]
+bypass_paths = ["/share/*", "/healthz", "/*"]
+"#
+        ))
+        .expect("wildcard bypass paths should load");
+        assert_eq!(
+            cfg.hosts["app.example.com"].bypass_paths,
+            vec!["/share/*", "/healthz", "/*"]
+        );
+    }
+
+    #[test]
+    fn bypass_path_wildcard_must_be_a_trailing_slash_star() {
+        for bad in ["/share*", "/a/**", "/*/*", "/share/*/extra", "/a*/*"] {
+            let errors = load_str(&format!(
+                r#"{ONE_IDP}
+[domain."example.com"]
+auth_subdomain = "auth.example.com"
+
+[host."app.example.com"]
+bypass_paths = ["{bad}"]
+"#
+            ))
+            .expect_err(&format!("`{bad}` should be rejected"));
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| matches!(e, ConfigError::BypassPathWildcardMustBeSuffix { .. })),
+                "`{bad}`: {errors:?}"
+            );
+        }
     }
 
     #[test]
