@@ -8,50 +8,56 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use raw::{RawBaseDomain, RawConfig, RawFallback, RawHost, RawProvider};
+use openidconnect::RedirectUrl;
+use raw::{RawConfig, RawDomain, RawHost, RawHostFields, RawIdp};
 use url::Url;
 
 /// Fully resolved, ready-to-use configuration: every host's fields are
-/// already merged with its base domain's defaults, env-var key overrides are
+/// already merged with its domain's defaults, env-var key overrides are
 /// applied, and everything referenced is known to exist.
 #[derive(Debug, Clone)]
 pub struct Config {
     pub global: Global,
+    /// Every `[idp."<name>"]` block, keyed by name. This name is what
+    /// `ResolvedHost::provider_key` and session rows record.
+    pub idps: HashMap<String, Idp>,
+    /// Every `[domain."<name>"]` block, keyed by lowercased name.
     pub base_domains: HashMap<String, BaseDomain>,
+    /// Every `[host."<name>"]` block, keyed by lowercased hostname.
     pub hosts: HashMap<String, ResolvedHost>,
-    pub fallback: Option<ResolvedHost>,
 }
 
 impl Config {
-    /// Resolves a (lowercased — see `host::resolve_incoming_host`)
-    /// `X-Forwarded-Host`/`Host` value to its per-host config, falling
-    /// back to `[fallback]` when the host has no entry of its own. `None`
-    /// means neither exists, which per the plan's locked-in decision is a
-    /// hard failure (log + 502), not a silent allow or deny.
-    pub fn resolve_host(&self, host: &str) -> Option<&ResolvedHost> {
-        self.hosts.get(host).or(self.fallback.as_ref())
+    /// The configured domain a (lowercased) hostname belongs to: the
+    /// longest domain name that equals the host or is a DNS suffix of it.
+    /// Cookie `Domain=` matching is suffix-based at any depth, so this is
+    /// the only domain whose session cookie the browser would send to
+    /// that host.
+    pub fn base_domain_for_host(&self, host: &str) -> Option<&BaseDomain> {
+        self.base_domains
+            .values()
+            .filter(|bd| is_under_domain(host, &bd.name))
+            .max_by_key(|bd| bd.name.len())
     }
 
-    /// Every distinct provider to discover at startup, keyed the way
-    /// `ResolvedHost::provider_key` names it, with the base domain whose
-    /// auth subdomain serves its `/callback`: each base domain's default,
-    /// plus every host-level (and fallback) override.
-    pub fn providers(&self) -> Vec<(String, &Provider, &BaseDomain)> {
-        let mut out: Vec<(String, &Provider, &BaseDomain)> = self
-            .base_domains
-            .iter()
-            .map(|(name, bd)| (name.clone(), &bd.provider, bd))
-            .collect();
-        for host in self.hosts.values().chain(self.fallback.iter()) {
-            if self.base_domains.contains_key(&host.provider_key) {
-                continue;
-            }
-            if let Some(bd) = self.base_domains.get(&host.base_domain) {
-                out.push((host.provider_key.clone(), &host.provider, bd));
-            }
-        }
-        out
+    /// Resolves a (lowercased — see `host::resolve_incoming_host`)
+    /// `X-Forwarded-Host`/`Host` value to its per-host config: its own
+    /// `[host]` block, else the `fallback` of the domain it falls under.
+    /// `None` means neither exists, which per the plan's locked-in decision
+    /// is a hard failure (log + 502), not a silent allow or deny.
+    pub fn resolve_host(&self, host: &str) -> Option<&ResolvedHost> {
+        self.hosts
+            .get(host)
+            .or_else(|| self.base_domain_for_host(host)?.fallback.as_ref())
     }
+}
+
+/// Whether `host` is `domain` itself or somewhere beneath it.
+pub fn is_under_domain(host: &str, domain: &str) -> bool {
+    host == domain
+        || (host.len() > domain.len()
+            && host.ends_with(domain)
+            && host.as_bytes()[host.len() - domain.len() - 1] == b'.')
 }
 
 #[derive(Debug, Clone)]
@@ -82,8 +88,13 @@ pub fn is_secure_provider_url(url: &Url) -> bool {
     }
 }
 
+/// One registered OIDC client at one identity provider (an `[idp]`
+/// block). Discovered once at startup; the redirect URI is applied per
+/// request from the domain the login runs on, so one IdP can serve any
+/// number of domains as long as each domain's `/callback` is registered
+/// at the provider.
 #[derive(Debug, Clone)]
-pub struct Provider {
+pub struct Idp {
     pub discovery_url: Url,
     pub client_id: String,
     pub client_secret: String,
@@ -93,24 +104,33 @@ pub struct Provider {
 pub struct BaseDomain {
     pub name: String,
     pub auth_subdomain: String,
-    pub provider: Provider,
+    /// `https://<auth_subdomain>/callback`, validated at load so building
+    /// the per-request redirect URI can't fail.
+    pub callback_url: Url,
+    /// Name of the `[idp]` this domain's hosts use unless they override it.
+    pub idp: String,
+    /// `[domain."<name>".fallback]`: the config for any host under this
+    /// domain that has no `[host]` block. `host` is `None` on it.
+    pub fallback: Option<ResolvedHost>,
+}
+
+impl BaseDomain {
+    pub fn redirect_url(&self) -> RedirectUrl {
+        RedirectUrl::from_url(self.callback_url.clone())
+    }
 }
 
 /// A host's config after inheriting anything it didn't explicitly set from
-/// its base domain. `host` is `None` for the synthetic entry built from the
-/// `[fallback]` block, which applies to any request whose `Host` /
-/// `X-Forwarded-Host` doesn't match a configured base domain or host.
+/// its domain. `host` is `None` for the entry built from a domain's
+/// `fallback` sub-table.
 #[derive(Debug, Clone)]
 pub struct ResolvedHost {
     pub host: Option<String>,
     pub base_domain: String,
-    pub provider: Provider,
-    /// Which discovered provider this host authenticates against: the
-    /// base domain's name when inheriting its provider, `host:<name>` for
-    /// a host-level override, `fallback` for the fallback's. Keys the
-    /// OIDC client / JWKS cache maps in `AppState`, and is recorded on
-    /// every session so a login at one provider is never accepted by a
-    /// host that uses another.
+    /// Name of the `[idp]` this host authenticates against: its own `idp`
+    /// override, else its domain's. Keys the OIDC client / JWKS cache maps
+    /// in `AppState`, and is recorded on every session so a login at one
+    /// provider is never accepted by a host that uses another.
     pub provider_key: String,
     pub required_group: Option<String>,
     pub group_claim_name: String,
@@ -159,42 +179,62 @@ fn resolve(raw: RawConfig, path: &Path) -> Result<Config, Vec<ConfigError>> {
 
     let global = resolve_global(&raw, path, &mut errors);
 
-    // Host/base-domain names are lowercased once here so every downstream
+    // References are checked against what the file *declares*, not what
+    // resolved: a domain pointing at an `[idp]` whose own block has an
+    // error shouldn't also be told that block doesn't exist, and a second
+    // `[idp]` that failed must still count when deciding whether a domain
+    // may omit `idp`. Anything depending on a failed block is skipped; its
+    // own problems surface once the block is fixed.
+    let declared_idps: Vec<String> = raw.idps.keys().cloned().collect();
+    let mut idps = HashMap::new();
+    for (name, raw_idp) in &raw.idps {
+        match resolve_idp(name, raw_idp) {
+            Ok(idp) => {
+                idps.insert(name.clone(), idp);
+            }
+            Err(e) => errors.push(e),
+        }
+    }
+    let idps_ctx = IdpsCtx {
+        declared: &declared_idps,
+        resolved: &idps,
+    };
+
+    // Domain/host names are lowercased once here so every downstream
     // lookup (by `X-Forwarded-Host`, itself lowercased at ingress — see
     // `host::resolve_incoming_host`) is a plain case-sensitive match,
     // rather than repeating case-insensitive comparisons at every call
     // site (the plan's locked-in decision, closing the class of bug where
     // mixed-case hosts silently miss their config).
+    let declared_domains: Vec<String> =
+        raw.domains.keys().map(|n| n.to_ascii_lowercase()).collect();
     let mut base_domains = HashMap::new();
-    for (name, raw_bd) in &raw.base_domains {
-        match resolve_base_domain(name, raw_bd) {
-            Ok(bd) => {
-                base_domains.insert(name.to_ascii_lowercase(), bd);
+    for (name, raw_domain) in &raw.domains {
+        match resolve_domain(name, raw_domain, &idps_ctx) {
+            Ok(Some(bd)) => {
+                base_domains.insert(bd.name.clone(), bd);
             }
-            Err(e) => errors.push(e),
+            Ok(None) => {}
+            Err(mut e) => errors.append(&mut e),
         }
     }
 
     let mut hosts = HashMap::new();
     for (host_name, raw_host) in &raw.hosts {
-        match resolve_host(host_name, raw_host, &base_domains) {
-            Ok(resolved) => {
+        match resolve_host(
+            host_name,
+            raw_host,
+            &declared_domains,
+            &base_domains,
+            &idps_ctx,
+        ) {
+            Ok(Some(resolved)) => {
                 hosts.insert(host_name.to_ascii_lowercase(), resolved);
             }
+            Ok(None) => {}
             Err(mut e) => errors.append(&mut e),
         }
     }
-
-    let fallback = match &raw.fallback {
-        None => None,
-        Some(raw_fb) => match resolve_fallback(raw_fb, &base_domains) {
-            Ok(resolved) => Some(resolved),
-            Err(mut e) => {
-                errors.append(&mut e);
-                None
-            }
-        },
-    };
 
     if !errors.is_empty() {
         return Err(errors);
@@ -205,9 +245,9 @@ fn resolve(raw: RawConfig, path: &Path) -> Result<Config, Vec<ConfigError>> {
         // pushes onto `errors` and returns a placeholder on failure, so this
         // unwrap is safe here.
         global: global.expect("global resolved without error"),
+        idps,
         base_domains,
         hosts,
-        fallback,
     })
 }
 
@@ -306,73 +346,6 @@ fn resolve_global(raw: &RawConfig, path: &Path, errors: &mut Vec<ConfigError>) -
     })
 }
 
-fn resolve_base_domain(name: &str, raw: &RawBaseDomain) -> Result<BaseDomain, ConfigError> {
-    let discovery_url = Url::parse(&raw.provider.discovery_url).map_err(|source| {
-        ConfigError::InvalidDiscoveryUrl {
-            base_domain: name.to_string(),
-            url: raw.provider.discovery_url.clone(),
-            source,
-        }
-    })?;
-    if !is_secure_provider_url(&discovery_url) {
-        return Err(ConfigError::InsecureProviderUrl {
-            scope: format!("base_domain `{name}`"),
-            url: raw.provider.discovery_url.clone(),
-        });
-    }
-
-    Ok(BaseDomain {
-        name: name.to_string(),
-        auth_subdomain: raw.auth_subdomain.clone(),
-        provider: Provider {
-            discovery_url,
-            client_id: raw.provider.client_id.clone(),
-            client_secret: raw.provider.client_secret.clone(),
-        },
-    })
-}
-
-/// A host-level `provider` override table must set all three fields — see
-/// `ConfigError::IncompleteProviderOverride` for why partial overrides are
-/// rejected rather than merged field-by-field.
-fn resolve_provider_override(raw: &RawProvider, host: &str) -> Result<Provider, ConfigError> {
-    if raw.discovery_url.is_empty() {
-        return Err(ConfigError::IncompleteProviderOverride {
-            host: host.to_string(),
-            field: "discovery_url",
-        });
-    }
-    if raw.client_id.is_empty() {
-        return Err(ConfigError::IncompleteProviderOverride {
-            host: host.to_string(),
-            field: "client_id",
-        });
-    }
-    if raw.client_secret.is_empty() {
-        return Err(ConfigError::IncompleteProviderOverride {
-            host: host.to_string(),
-            field: "client_secret",
-        });
-    }
-    let discovery_url =
-        Url::parse(&raw.discovery_url).map_err(|source| ConfigError::InvalidHostDiscoveryUrl {
-            host: host.to_string(),
-            url: raw.discovery_url.clone(),
-            source,
-        })?;
-    if !is_secure_provider_url(&discovery_url) {
-        return Err(ConfigError::InsecureProviderUrl {
-            scope: format!("host `{host}`"),
-            url: raw.discovery_url.clone(),
-        });
-    }
-    Ok(Provider {
-        discovery_url,
-        client_id: raw.client_id.clone(),
-        client_secret: raw.client_secret.clone(),
-    })
-}
-
 fn validate_bypass_path(host: &str, path: &str, errors: &mut Vec<ConfigError>) {
     if !path.starts_with('/') {
         errors.push(ConfigError::BypassPathMustBeAbsolute {
@@ -418,153 +391,247 @@ fn resolve_token_header(host: &str, raw: Option<&str>, errors: &mut Vec<ConfigEr
     name
 }
 
-fn resolve_host(
-    host_name: &str,
-    raw: &RawHost,
-    base_domains: &HashMap<String, BaseDomain>,
-) -> Result<ResolvedHost, Vec<ConfigError>> {
-    let mut errors = Vec::new();
-
-    let base_domain_key = raw.base_domain.to_ascii_lowercase();
-    let base_domain = match base_domains.get(&base_domain_key) {
-        Some(bd) => Some(bd),
-        None => {
-            errors.push(ConfigError::UnknownBaseDomain {
-                host: host_name.to_string(),
-                base_domain: raw.base_domain.clone(),
-            });
-            None
-        }
-    };
-
-    let provider = match (&raw.provider, base_domain) {
-        (Some(raw_provider), _) => resolve_provider_override(raw_provider, host_name)
-            .map_err(|e| errors.push(e))
-            .ok(),
-        (None, Some(bd)) => Some(bd.provider.clone()),
-        (None, None) => None,
-    };
-
-    for path in &raw.bypass_paths {
-        validate_bypass_path(host_name, path, &mut errors);
-    }
-    let token_header = resolve_token_header(host_name, raw.token_header.as_deref(), &mut errors);
-
-    if !errors.is_empty() {
-        return Err(errors);
-    }
-
-    let provider_key = if raw.provider.is_some() {
-        format!("host:{}", host_name.to_ascii_lowercase())
-    } else {
-        base_domain_key.clone()
-    };
-    Ok(ResolvedHost {
-        host: Some(host_name.to_ascii_lowercase()),
-        base_domain: base_domain_key,
-        provider: provider.expect("provider resolved without error"),
-        provider_key,
-        required_group: raw.required_group.clone(),
-        group_claim_name: raw
-            .group_claim_name
-            .clone()
-            .unwrap_or_else(|| DEFAULT_GROUP_CLAIM_NAME.to_string()),
-        bypass_paths: raw.bypass_paths.clone(),
-        forward_identity_headers: raw.forward_identity_headers.unwrap_or(false),
-        resource: raw.resource.clone(),
-        required_scope: raw.required_scope.clone(),
-        token_header,
-    })
-}
-
-fn resolve_fallback(
-    raw: &RawFallback,
-    base_domains: &HashMap<String, BaseDomain>,
-) -> Result<ResolvedHost, Vec<ConfigError>> {
-    let mut errors = Vec::new();
-
-    let base_domain_key = raw.base_domain.to_ascii_lowercase();
-    let base_domain = match base_domains.get(&base_domain_key) {
-        Some(bd) => Some(bd),
-        None => {
-            errors.push(ConfigError::FallbackUnknownBaseDomain {
-                base_domain: raw.base_domain.clone(),
-            });
-            None
-        }
-    };
-
-    let provider = match (&raw.provider, base_domain) {
-        (Some(raw_provider), _) => resolve_fallback_provider_override(raw_provider)
-            .map_err(|e| errors.push(e))
-            .ok(),
-        (None, Some(bd)) => Some(bd.provider.clone()),
-        (None, None) => None,
-    };
-
-    for path in &raw.bypass_paths {
-        validate_bypass_path("<fallback>", path, &mut errors);
-    }
-    let token_header = resolve_token_header("<fallback>", raw.token_header.as_deref(), &mut errors);
-
-    if !errors.is_empty() {
-        return Err(errors);
-    }
-
-    let provider_key = if raw.provider.is_some() {
-        "fallback".to_string()
-    } else {
-        base_domain_key.clone()
-    };
-    Ok(ResolvedHost {
-        host: None,
-        base_domain: base_domain_key,
-        provider: provider.expect("provider resolved without error"),
-        provider_key,
-        required_group: raw.required_group.clone(),
-        group_claim_name: raw
-            .group_claim_name
-            .clone()
-            .unwrap_or_else(|| DEFAULT_GROUP_CLAIM_NAME.to_string()),
-        bypass_paths: raw.bypass_paths.clone(),
-        forward_identity_headers: raw.forward_identity_headers.unwrap_or(false),
-        resource: raw.resource.clone(),
-        required_scope: raw.required_scope.clone(),
-        token_header,
-    })
-}
-
-fn resolve_fallback_provider_override(raw: &RawProvider) -> Result<Provider, ConfigError> {
-    if raw.discovery_url.is_empty() {
-        return Err(ConfigError::IncompleteFallbackProviderOverride {
-            field: "discovery_url",
-        });
-    }
-    if raw.client_id.is_empty() {
-        return Err(ConfigError::IncompleteFallbackProviderOverride { field: "client_id" });
-    }
-    if raw.client_secret.is_empty() {
-        return Err(ConfigError::IncompleteFallbackProviderOverride {
-            field: "client_secret",
-        });
-    }
+fn resolve_idp(name: &str, raw: &RawIdp) -> Result<Idp, ConfigError> {
     let discovery_url =
-        Url::parse(&raw.discovery_url).map_err(|source| ConfigError::InvalidHostDiscoveryUrl {
-            host: "<fallback>".to_string(),
+        Url::parse(&raw.discovery_url).map_err(|source| ConfigError::InvalidDiscoveryUrl {
+            idp: name.to_string(),
             url: raw.discovery_url.clone(),
             source,
         })?;
     if !is_secure_provider_url(&discovery_url) {
         return Err(ConfigError::InsecureProviderUrl {
-            scope: "fallback".to_string(),
+            scope: format!("idp `{name}`"),
             url: raw.discovery_url.clone(),
         });
     }
-    Ok(Provider {
+    Ok(Idp {
         discovery_url,
         client_id: raw.client_id.clone(),
         client_secret: raw.client_secret.clone(),
     })
+}
+
+/// The `[idp]` blocks as seen by the blocks that reference them: every
+/// declared name (for reference checks and error messages) and the ones
+/// that actually resolved.
+struct IdpsCtx<'a> {
+    declared: &'a [String],
+    resolved: &'a HashMap<String, Idp>,
+}
+
+/// Outcome of checking an `idp = "..."` reference.
+enum IdpRef {
+    /// Names a resolved `[idp]`.
+    Ok(String),
+    /// Names a declared `[idp]` whose own block failed; the referrer is
+    /// skipped without an error of its own.
+    Broken,
+    /// Names nothing; an error was recorded.
+    Unknown,
+}
+
+/// Checks an `idp = "..."` reference (`scope` names the block it sits in,
+/// for the error message).
+fn resolve_idp_ref(
+    scope: &str,
+    idp: &str,
+    idps: &IdpsCtx,
+    errors: &mut Vec<ConfigError>,
+) -> IdpRef {
+    if idps.resolved.contains_key(idp) {
+        IdpRef::Ok(idp.to_string())
+    } else if idps.declared.iter().any(|d| d == idp) {
+        IdpRef::Broken
+    } else {
+        errors.push(ConfigError::UnknownIdp {
+            scope: scope.to_string(),
+            idp: idp.to_string(),
+            available: idps.declared.to_vec(),
+        });
+        IdpRef::Unknown
+    }
+}
+
+/// `Ok(None)` means the domain depends on an `[idp]` block that has its
+/// own error, so nothing further can be said about it yet.
+fn resolve_domain(
+    name: &str,
+    raw: &RawDomain,
+    idps: &IdpsCtx,
+) -> Result<Option<BaseDomain>, Vec<ConfigError>> {
+    let mut errors = Vec::new();
+    let name = name.to_ascii_lowercase();
+    let scope = format!("domain `{name}`");
+
+    let idp = match &raw.idp {
+        Some(idp) => resolve_idp_ref(&scope, idp, idps, &mut errors),
+        None => match idps.declared {
+            [only] => resolve_idp_ref(&scope, only, idps, &mut errors),
+            [] => {
+                errors.push(ConfigError::NoIdpDefined {
+                    domain: name.clone(),
+                });
+                IdpRef::Unknown
+            }
+            _ => {
+                errors.push(ConfigError::DomainMissingIdp {
+                    domain: name.clone(),
+                    available: idps.declared.to_vec(),
+                });
+                IdpRef::Unknown
+            }
+        },
+    };
+
+    let callback_url = match Url::parse(&format!("https://{}/callback", raw.auth_subdomain)) {
+        Ok(url)
+            if url
+                .host_str()
+                .is_some_and(|h| h.eq_ignore_ascii_case(&raw.auth_subdomain)) =>
+        {
+            Some(url)
+        }
+        _ => {
+            errors.push(ConfigError::InvalidAuthSubdomain {
+                domain: name.clone(),
+                auth_subdomain: raw.auth_subdomain.clone(),
+            });
+            None
+        }
+    };
+
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+    let (IdpRef::Ok(idp), Some(callback_url)) = (idp, callback_url) else {
+        // A broken idp reference: nothing more to say about this domain.
+        return Ok(None);
+    };
+
+    // The fallback needs the domain's default idp; resolve it against a
+    // provisional domain and attach afterwards.
+    let mut domain = BaseDomain {
+        name: name.clone(),
+        auth_subdomain: raw.auth_subdomain.clone(),
+        callback_url,
+        idp,
+        fallback: None,
+    };
+    if let Some(raw_fallback) = &raw.fallback {
+        match resolve_host_fields(&format!("*.{name}"), None, raw_fallback, &domain, idps) {
+            Ok(fallback) => domain.fallback = fallback,
+            Err(mut e) => errors.append(&mut e),
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(Some(domain))
+    } else {
+        Err(errors)
+    }
+}
+
+/// `Ok(None)` means the host's domain (or idp) block has its own error,
+/// so nothing further can be said about the host yet.
+fn resolve_host(
+    host_name: &str,
+    raw: &RawHost,
+    declared_domains: &[String],
+    base_domains: &HashMap<String, BaseDomain>,
+    idps: &IdpsCtx,
+) -> Result<Option<ResolvedHost>, Vec<ConfigError>> {
+    let host_name = host_name.to_ascii_lowercase();
+    let domain_name = match &raw.domain {
+        Some(explicit) => {
+            let key = explicit.to_ascii_lowercase();
+            if !declared_domains.contains(&key) {
+                return Err(vec![ConfigError::UnknownDomain {
+                    host: host_name,
+                    domain: explicit.clone(),
+                }]);
+            }
+            if !is_under_domain(&host_name, &key) {
+                return Err(vec![ConfigError::HostDomainMismatch {
+                    host: host_name,
+                    domain: key,
+                }]);
+            }
+            key
+        }
+        None => match declared_domains
+            .iter()
+            .filter(|name| is_under_domain(&host_name, name))
+            .max_by_key(|name| name.len())
+        {
+            Some(name) => name.clone(),
+            None => {
+                return Err(vec![ConfigError::HostNotUnderAnyDomain {
+                    host: host_name,
+                    domains: declared_domains.to_vec(),
+                }]);
+            }
+        },
+    };
+    let Some(domain) = base_domains.get(&domain_name) else {
+        return Ok(None);
+    };
+    resolve_host_fields(
+        &host_name,
+        Some(host_name.clone()),
+        &raw.fields,
+        domain,
+        idps,
+    )
+}
+
+/// Shared by `[host]` blocks and a domain's `fallback`: merges the
+/// per-host fields with the domain's defaults. `label` names the block in
+/// error messages (`app.example.com`, or `*.example.com` for a fallback).
+/// `Ok(None)` means the host's `idp` override names a block with its own
+/// error.
+fn resolve_host_fields(
+    label: &str,
+    host: Option<String>,
+    raw: &RawHostFields,
+    domain: &BaseDomain,
+    idps: &IdpsCtx,
+) -> Result<Option<ResolvedHost>, Vec<ConfigError>> {
+    let mut errors = Vec::new();
+
+    let provider_key = match &raw.idp {
+        Some(idp) => resolve_idp_ref(&format!("host `{label}`"), idp, idps, &mut errors),
+        None => IdpRef::Ok(domain.idp.clone()),
+    };
+
+    for path in &raw.bypass_paths {
+        validate_bypass_path(label, path, &mut errors);
+    }
+    let token_header = resolve_token_header(label, raw.token_header.as_deref(), &mut errors);
+
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+    let provider_key = match provider_key {
+        IdpRef::Ok(key) => key,
+        IdpRef::Broken => return Ok(None),
+        IdpRef::Unknown => unreachable!("an unknown idp reference records an error"),
+    };
+
+    Ok(Some(ResolvedHost {
+        host,
+        base_domain: domain.name.clone(),
+        provider_key,
+        required_group: raw.required_group.clone(),
+        group_claim_name: raw
+            .group_claim_name
+            .clone()
+            .unwrap_or_else(|| DEFAULT_GROUP_CLAIM_NAME.to_string()),
+        bypass_paths: raw.bypass_paths.clone(),
+        forward_identity_headers: raw.forward_identity_headers.unwrap_or(false),
+        resource: raw.resource.clone(),
+        required_scope: raw.required_scope.clone(),
+        token_header,
+    }))
 }
 
 #[cfg(test)]
@@ -584,39 +651,43 @@ mod tests {
         file
     }
 
-    const VALID_TOML: &str = r#"
+    const KEYS: &str = r#"
 [global]
 cookie_signing_key = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 refresh_token_encryption_key = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+"#;
 
-[base_domain."Example.COM"]
-auth_subdomain = "auth.example.com"
-
-[base_domain."Example.COM".provider]
+    const ONE_IDP: &str = r#"
+[idp."main"]
 discovery_url = "https://idp.example.com/.well-known/openid-configuration"
 client_id = "client"
 client_secret = "secret"
-
-[host."App.Example.COM"]
-base_domain = "Example.COM"
 "#;
 
-    #[test]
-    fn mixed_case_host_and_base_domain_keys_normalize_to_lowercase() {
-        let file = write_config(VALID_TOML);
-        let cfg = load(file.path()).expect("valid config should load");
+    fn load_str(body: &str) -> Result<Config, Vec<ConfigError>> {
+        let file = write_config(&format!("{KEYS}{body}"));
+        load(file.path())
+    }
 
-        assert!(
-            cfg.base_domains.contains_key("example.com"),
-            "base_domain key should be lowercased"
-        );
-        assert!(
-            cfg.hosts.contains_key("app.example.com"),
-            "host key should be lowercased"
-        );
+    #[test]
+    fn mixed_case_host_and_domain_keys_normalize_to_lowercase() {
+        let cfg = load_str(&format!(
+            r#"{ONE_IDP}
+[domain."Example.COM"]
+auth_subdomain = "auth.example.com"
+
+[host."App.Example.COM"]
+"#
+        ))
+        .expect("valid config should load");
+
+        assert!(cfg.base_domains.contains_key("example.com"));
+        assert!(cfg.hosts.contains_key("app.example.com"));
+        assert_eq!(cfg.hosts["app.example.com"].base_domain, "example.com");
+        assert_eq!(cfg.hosts["app.example.com"].provider_key, "main");
         assert_eq!(
-            cfg.hosts["app.example.com"].base_domain, "example.com",
-            "the base_domain reference should resolve case-insensitively too"
+            cfg.base_domains["example.com"].callback_url.as_str(),
+            "https://auth.example.com/callback"
         );
     }
 
@@ -628,32 +699,301 @@ base_domain = "Example.COM"
     }
 
     #[test]
-    fn token_header_defaults_and_rejects_reserved_or_malformed_names() {
-        let ok = write_config(
-            r#"
-[global]
-cookie_signing_key = "1111111111111111111111111111111111111111111111111111111111111111"
-refresh_token_encryption_key = "2222222222222222222222222222222222222222222222222222222222222222"
-sqlite_path = "/tmp/x.db"
-
-[base_domain."example.com"]
+    fn sole_idp_is_the_default_but_several_require_naming_one() {
+        let cfg = load_str(&format!(
+            r#"{ONE_IDP}
+[domain."example.com"]
 auth_subdomain = "auth.example.com"
+"#
+        ))
+        .expect("a single idp needs no reference");
+        assert_eq!(cfg.base_domains["example.com"].idp, "main");
 
-[base_domain."example.com".provider]
-discovery_url = "https://idp.example.com/.well-known/openid-configuration"
-client_id = "c"
+        let two = format!(
+            r#"{ONE_IDP}
+[idp."other"]
+discovery_url = "https://idp-b.example.com/.well-known/openid-configuration"
+client_id = "b"
 client_secret = "s"
+"#
+        );
+        let errors = load_str(&format!(
+            r#"{two}
+[domain."example.com"]
+auth_subdomain = "auth.example.com"
+"#
+        ))
+        .expect_err("two idps and no reference must not load");
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ConfigError::DomainMissingIdp { .. })),
+            "{errors:?}"
+        );
+
+        let cfg = load_str(&format!(
+            r#"{two}
+[domain."example.com"]
+auth_subdomain = "auth.example.com"
+idp = "other"
 
 [host."app.example.com"]
-base_domain = "example.com"
+
+[host."b.example.com"]
+idp = "main"
+"#
+        ))
+        .expect("explicit references should load");
+        assert_eq!(cfg.base_domains["example.com"].idp, "other");
+        assert_eq!(cfg.hosts["app.example.com"].provider_key, "other");
+        assert_eq!(cfg.hosts["b.example.com"].provider_key, "main");
+    }
+
+    #[test]
+    fn unknown_idp_references_and_no_idp_at_all_fail_hard() {
+        let errors = load_str(&format!(
+            r#"{ONE_IDP}
+[domain."example.com"]
+auth_subdomain = "auth.example.com"
+idp = "typo"
+
+[host."app.example.com"]
+idp = "also-typo"
+"#
+        ))
+        .expect_err("dangling idp references must not load");
+        let unknown: Vec<_> = errors
+            .iter()
+            .filter_map(|e| match e {
+                ConfigError::UnknownIdp { scope, idp, .. } => Some((scope.as_str(), idp.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            unknown.contains(&("domain `example.com`", "typo")),
+            "{errors:?}"
+        );
+        // The host can't resolve because its domain failed, so only the
+        // domain's error is reported; that's fine as long as it's there.
+
+        let errors = load_str(
+            r#"
+[domain."example.com"]
+auth_subdomain = "auth.example.com"
+"#,
+        )
+        .expect_err("a domain with no idp defined anywhere must not load");
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ConfigError::NoIdpDefined { .. })),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn host_domain_is_inferred_from_the_longest_matching_suffix() {
+        let cfg = load_str(&format!(
+            r#"{ONE_IDP}
+[domain."example.com"]
+auth_subdomain = "auth.example.com"
+
+[domain."corp.example.com"]
+auth_subdomain = "auth.corp.example.com"
+
+[host."app.example.com"]
+[host."deep.app.example.com"]
+[host."app.corp.example.com"]
+[host."example.com"]
+
+[host."wide.corp.example.com"]
+domain = "example.com"
+"#
+        ))
+        .expect("valid config should load");
+        assert_eq!(cfg.hosts["app.example.com"].base_domain, "example.com");
+        assert_eq!(cfg.hosts["deep.app.example.com"].base_domain, "example.com");
+        assert_eq!(
+            cfg.hosts["app.corp.example.com"].base_domain,
+            "corp.example.com"
+        );
+        assert_eq!(cfg.hosts["example.com"].base_domain, "example.com");
+        assert_eq!(
+            cfg.hosts["wide.corp.example.com"].base_domain, "example.com",
+            "an explicit shorter domain wins over inference"
+        );
+    }
+
+    #[test]
+    fn host_outside_every_domain_or_with_a_non_suffix_domain_fails_hard() {
+        let errors = load_str(&format!(
+            r#"{ONE_IDP}
+[domain."example.com"]
+auth_subdomain = "auth.example.com"
+
+[host."app.other.net"]
+
+[host."notexample.com"]
+
+[host."app.example.com"]
+domain = "other.net"
+
+[host."b.example.com"]
+domain = "example.com.evil"
+"#
+        ))
+        .expect_err("hosts outside their domain must not load");
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                ConfigError::HostNotUnderAnyDomain { host, .. } if host == "app.other.net"
+            )),
+            "{errors:?}"
+        );
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                ConfigError::HostNotUnderAnyDomain { host, .. } if host == "notexample.com"
+            )),
+            "a plain suffix match without the dot must not count: {errors:?}"
+        );
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                ConfigError::UnknownDomain { host, .. } if host == "app.example.com"
+            )),
+            "{errors:?}"
+        );
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                ConfigError::UnknownDomain { host, .. } if host == "b.example.com"
+            )),
+            "{errors:?}"
+        );
+
+        let errors = load_str(&format!(
+            r#"{ONE_IDP}
+[domain."example.com"]
+auth_subdomain = "auth.example.com"
+
+[domain."other.net"]
+auth_subdomain = "auth.other.net"
+
+[host."app.example.com"]
+domain = "other.net"
+"#
+        ))
+        .expect_err("an explicit domain that isn't a suffix must not load");
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ConfigError::HostDomainMismatch { .. })),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn fallback_nests_under_its_domain_and_only_covers_that_domain() {
+        let cfg = load_str(&format!(
+            r#"{ONE_IDP}
+[idp."partner"]
+discovery_url = "https://idp-b.example.com/.well-known/openid-configuration"
+client_id = "b"
+client_secret = "s"
+
+[domain."example.com"]
+auth_subdomain = "auth.example.com"
+idp = "main"
+
+[domain."example.com".fallback]
+idp = "partner"
+required_group = "users"
+
+[domain."other.net"]
+auth_subdomain = "auth.other.net"
+idp = "main"
+
+[host."admin.example.com"]
+required_group = "admins"
+"#
+        ))
+        .expect("valid config should load");
+
+        let fallback = cfg.base_domains["example.com"]
+            .fallback
+            .as_ref()
+            .expect("fallback attached to its domain");
+        assert_eq!(fallback.host, None);
+        assert_eq!(fallback.base_domain, "example.com");
+        assert_eq!(fallback.provider_key, "partner");
+        assert_eq!(fallback.required_group.as_deref(), Some("users"));
+        assert!(cfg.base_domains["other.net"].fallback.is_none());
+
+        assert_eq!(
+            cfg.resolve_host("admin.example.com")
+                .unwrap()
+                .required_group
+                .as_deref(),
+            Some("admins"),
+            "an explicit host block wins over the fallback"
+        );
+        assert_eq!(
+            cfg.resolve_host("anything.example.com")
+                .unwrap()
+                .required_group
+                .as_deref(),
+            Some("users")
+        );
+        assert_eq!(
+            cfg.resolve_host("deep.er.example.com")
+                .unwrap()
+                .provider_key,
+            "partner"
+        );
+        assert!(
+            cfg.resolve_host("unlisted.other.net").is_none(),
+            "one domain's fallback must not cover another domain's hosts"
+        );
+        assert!(cfg.resolve_host("example.net").is_none());
+    }
+
+    #[test]
+    fn fallback_errors_are_labelled_with_a_wildcard_host() {
+        let errors = load_str(&format!(
+            r#"{ONE_IDP}
+[domain."example.com"]
+auth_subdomain = "auth.example.com"
+
+[domain."example.com".fallback]
+bypass_paths = ["no-slash"]
+"#
+        ))
+        .expect_err("bad fallback fields must not load");
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                ConfigError::BypassPathMustBeAbsolute { host, .. } if host == "*.example.com"
+            )),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn token_header_defaults_and_rejects_reserved_or_malformed_names() {
+        let cfg = load_str(&format!(
+            r#"{ONE_IDP}
+[domain."example.com"]
+auth_subdomain = "auth.example.com"
+
+[host."app.example.com"]
 
 [host."api.example.com"]
-base_domain = "example.com"
 resource = "https://api.example.com/"
 token_header = "Authorization"
-"#,
-        );
-        let cfg = load(ok.path()).expect("valid token_header config should load");
+"#
+        ))
+        .expect("valid token_header config should load");
         assert_eq!(
             cfg.hosts["app.example.com"].token_header,
             DEFAULT_TOKEN_HEADER
@@ -661,27 +1001,16 @@ token_header = "Authorization"
         assert_eq!(cfg.hosts["api.example.com"].token_header, "authorization");
 
         for bad in ["Cookie", "host", "not a header", ""] {
-            let file = write_config(&format!(
-                r#"
-[global]
-cookie_signing_key = "1111111111111111111111111111111111111111111111111111111111111111"
-refresh_token_encryption_key = "2222222222222222222222222222222222222222222222222222222222222222"
-sqlite_path = "/tmp/x.db"
-
-[base_domain."example.com"]
+            let errors = load_str(&format!(
+                r#"{ONE_IDP}
+[domain."example.com"]
 auth_subdomain = "auth.example.com"
 
-[base_domain."example.com".provider]
-discovery_url = "https://idp.example.com/.well-known/openid-configuration"
-client_id = "c"
-client_secret = "s"
-
 [host."api.example.com"]
-base_domain = "example.com"
 token_header = "{bad}"
 "#
-            ));
-            let errors = load(file.path()).expect_err("bad token_header must not load");
+            ))
+            .expect_err("bad token_header must not load");
             assert!(
                 errors
                     .iter()
@@ -689,26 +1018,6 @@ token_header = "{bad}"
                 "token_header {bad:?} should be rejected, got {errors:?}"
             );
         }
-    }
-
-    #[test]
-    fn host_referencing_an_unknown_base_domain_fails_hard() {
-        let file = write_config(
-            r#"
-[global]
-cookie_signing_key = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-refresh_token_encryption_key = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-
-[host."app.example.com"]
-base_domain = "nonexistent.example.com"
-"#,
-        );
-        let errors = load(file.path()).expect_err("a dangling base_domain reference must not load");
-        assert!(
-            errors
-                .iter()
-                .any(|e| matches!(e, ConfigError::UnknownBaseDomain { .. }))
-        );
     }
 
     #[test]
@@ -732,82 +1041,16 @@ refresh_token_encryption_key = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
     }
 
     #[test]
-    fn host_provider_override_gets_its_own_provider_key() {
-        let file = write_config(
-            r#"
-[global]
-cookie_signing_key = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-refresh_token_encryption_key = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-
-[base_domain."example.com"]
-auth_subdomain = "auth.example.com"
-
-[base_domain."example.com".provider]
-discovery_url = "https://idp-a.example.com/.well-known/openid-configuration"
-client_id = "a"
-client_secret = "secret-a"
-
-[host."app.example.com"]
-base_domain = "example.com"
-
-[host."Partner.example.com"]
-base_domain = "example.com"
-
-[host."Partner.example.com".provider]
-discovery_url = "https://idp-b.example.com/.well-known/openid-configuration"
-client_id = "b"
-client_secret = "secret-b"
-"#,
-        );
-        let cfg = load(file.path()).expect("valid config should load");
-        assert_eq!(cfg.hosts["app.example.com"].provider_key, "example.com");
-        assert_eq!(
-            cfg.hosts["partner.example.com"].provider_key,
-            "host:partner.example.com"
-        );
-
-        let mut keys: Vec<_> = cfg
-            .providers()
-            .into_iter()
-            .map(|(k, p, bd)| (k, p.client_id.clone(), bd.auth_subdomain.clone()))
-            .collect();
-        keys.sort();
-        assert_eq!(
-            keys,
-            vec![
-                (
-                    "example.com".to_string(),
-                    "a".to_string(),
-                    "auth.example.com".to_string()
-                ),
-                (
-                    "host:partner.example.com".to_string(),
-                    "b".to_string(),
-                    "auth.example.com".to_string()
-                ),
-            ],
-            "one provider per base domain plus one per override, each with its callback base domain"
-        );
-    }
-
-    #[test]
     fn plain_http_provider_urls_are_rejected_except_loopback() {
-        let file = write_config(
+        let errors = load_str(
             r#"
-[global]
-cookie_signing_key = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-refresh_token_encryption_key = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-
-[base_domain."example.com"]
-auth_subdomain = "auth.example.com"
-
-[base_domain."example.com".provider]
+[idp."main"]
 discovery_url = "http://idp.example.com/.well-known/openid-configuration"
 client_id = "client"
 client_secret = "secret"
 "#,
-        );
-        let errors = load(file.path()).expect_err("plain-http IdP must not load");
+        )
+        .expect_err("plain-http IdP must not load");
         assert!(
             errors
                 .iter()
@@ -825,6 +1068,95 @@ client_secret = "secret"
         for bad in ["http://idp.example.com/x", "http://10.0.0.5/x", "ftp://x/y"] {
             assert!(!is_secure_provider_url(&Url::parse(bad).unwrap()), "{bad}");
         }
+    }
+
+    #[test]
+    fn invalid_auth_subdomain_is_a_config_error() {
+        let errors = load_str(&format!(
+            r#"{ONE_IDP}
+[domain."example.com"]
+auth_subdomain = "auth.example.com/with/path"
+"#
+        ))
+        .expect_err("an auth_subdomain that isn't a bare hostname must not load");
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ConfigError::InvalidAuthSubdomain { .. })),
+            "{errors:?}"
+        );
+    }
+
+    /// A broken `[idp]` block still counts as declared: a domain that
+    /// references it isn't told it doesn't exist, and a domain relying on
+    /// the single-idp default doesn't silently get the other one.
+    #[test]
+    fn a_broken_idp_block_neither_vanishes_nor_cascades() {
+        let errors = load_str(&format!(
+            r#"{ONE_IDP}
+[idp."broken"]
+discovery_url = "http://idp.partner.net/.well-known/openid-configuration"
+client_id = "b"
+client_secret = "s"
+
+[domain."example.com"]
+auth_subdomain = "auth.example.com"
+
+[domain."other.net"]
+auth_subdomain = "auth.other.net"
+idp = "broken"
+
+[host."app.other.net"]
+[host."api.example.com"]
+idp = "broken"
+"#
+        ))
+        .expect_err("a plain-http idp must not load");
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ConfigError::InsecureProviderUrl { .. })),
+            "{errors:?}"
+        );
+        assert!(
+            errors.iter().any(|e| matches!(
+                e,
+                ConfigError::DomainMissingIdp { domain, available }
+                    if domain == "example.com" && available.len() == 2
+            )),
+            "two idps are declared, so the default must not apply: {errors:?}"
+        );
+        assert!(
+            !errors
+                .iter()
+                .any(|e| matches!(e, ConfigError::UnknownIdp { .. })),
+            "referencing a declared-but-broken idp is not an unknown reference: {errors:?}"
+        );
+        assert!(
+            !errors.iter().any(|e| matches!(
+                e,
+                ConfigError::UnknownDomain { .. } | ConfigError::HostNotUnderAnyDomain { .. }
+            )),
+            "hosts under a domain that failed are skipped, not misreported: {errors:?}"
+        );
+    }
+
+    /// The copy-and-edit example shipped in the repo must always load.
+    #[test]
+    fn shipped_example_config_loads() {
+        let example = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/config.toml"),
+        )
+        .unwrap();
+        let file = write_config(&example);
+        let cfg = load(file.path()).unwrap_or_else(|e| panic!("examples/config.toml: {e:?}"));
+        assert_eq!(cfg.idps.len(), 1);
+        assert_eq!(cfg.base_domains["example.com"].idp, "pocketid");
+        assert_eq!(
+            cfg.hosts["admin.example.com"].required_group.as_deref(),
+            Some("admins")
+        );
+        assert_eq!(cfg.hosts["app.example.com"].provider_key, "pocketid");
     }
 
     #[test]

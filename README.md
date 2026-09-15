@@ -13,9 +13,9 @@ Start here:
 - **[Deployment guide](docs/deployment.md)** — the binary, the config
   file, the trust-boundary requirement, and the Caddy setup.
 - **[Config reference](docs/config-reference.md)** — every field on
-  `[global]`, `[base_domain]`, `[host]`, and `[fallback]`.
+  `[global]`, `[idp]`, `[domain]` (and its `fallback`), and `[host]`.
 - **[Operational runbook](docs/runbook.md)** — key rotation, adding a
-  host or provider, reading logs/traces for an auth failure, revoking
+  host, domain or IdP, reading logs/traces for an auth failure, revoking
   access.
 - **[API tokens](docs/api-tokens.md)** — resource-scoped bearer tokens
   for non-browser clients (CLIs, scripts), worked through on pocket-id.

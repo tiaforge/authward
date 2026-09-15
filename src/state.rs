@@ -21,11 +21,8 @@ pub struct AppStateInner {
     pub db: SqlitePool,
     pub cookie_key: Key,
     pub refresh_cipher: RefreshTokenCipher,
-    /// Every provider's static config, keyed by provider key (see
-    /// `config::ResolvedHost::provider_key`).
-    pub providers: HashMap<String, crate::config::Provider>,
-    /// The discovered, ready-to-use side of each provider, keyed the same
-    /// way. A provider whose IdP was unreachable at startup has no entry
+    /// The discovered, ready-to-use side of each `[idp]`, keyed by its
+    /// name (see `config::ResolvedHost::provider_key`). A provider whose IdP was unreachable at startup has no entry
     /// until the background retry (`crate::spawn_discovery_retry`)
     /// succeeds; its hosts answer "provider unavailable" in the meantime.
     /// Written only by discovery, read on every request — a `std` lock
@@ -65,7 +62,6 @@ impl AppStateInner {
         db: SqlitePool,
         cookie_key: Key,
         refresh_cipher: RefreshTokenCipher,
-        providers: HashMap<String, crate::config::Provider>,
         provider_runtimes: HashMap<String, ProviderRuntime>,
         http_client: openidconnect::reqwest::Client,
         login_rate_limiter: RateLimiter,
@@ -75,7 +71,6 @@ impl AppStateInner {
             db,
             cookie_key,
             refresh_cipher,
-            providers,
             provider_runtimes: RwLock::new(
                 provider_runtimes
                     .into_iter()

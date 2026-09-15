@@ -1,7 +1,7 @@
 //! Structures deserialized directly from the TOML config file, before
-//! inheritance/env-var resolution. Every field a host or the fallback block
-//! can omit (to inherit from its base domain, or fall back to a default) is
-//! `Option`.
+//! inheritance/env-var resolution. Every field a host, a domain's fallback
+//! or a domain can omit (to inherit from its domain, or fall back to a
+//! default) is `Option`.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -12,11 +12,12 @@ use serde::Deserialize;
 pub struct RawConfig {
     #[serde(default)]
     pub global: RawGlobal,
-    #[serde(default, rename = "base_domain")]
-    pub base_domains: HashMap<String, RawBaseDomain>,
+    #[serde(default, rename = "idp")]
+    pub idps: HashMap<String, RawIdp>,
+    #[serde(default, rename = "domain")]
+    pub domains: HashMap<String, RawDomain>,
     #[serde(default, rename = "host")]
     pub hosts: HashMap<String, RawHost>,
-    pub fallback: Option<RawFallback>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -69,46 +70,49 @@ fn default_listen_addr() -> String {
     "127.0.0.1:8080".to_string()
 }
 
+/// One `[idp."<name>"]` block: a registered OIDC client at one identity
+/// provider. Domains and hosts reference it by name.
 #[derive(Debug, Deserialize)]
-pub struct RawProvider {
+pub struct RawIdp {
     pub discovery_url: String,
     pub client_id: String,
     pub client_secret: String,
 }
 
+/// One `[domain."<name>"]` block.
 #[derive(Debug, Deserialize)]
-pub struct RawBaseDomain {
+pub struct RawDomain {
     pub auth_subdomain: String,
-    pub provider: RawProvider,
+    /// Which `[idp]` this domain's hosts authenticate against by default.
+    /// May be omitted when exactly one `[idp]` block exists.
+    pub idp: Option<String>,
+    /// `[domain."<name>".fallback]`: applies to any host under this domain
+    /// that has no `[host]` block of its own.
+    pub fallback: Option<RawHostFields>,
+}
+
+/// The per-host fields, shared by `[host."..."]` blocks and a domain's
+/// `fallback` sub-table.
+#[derive(Debug, Default, Deserialize)]
+pub struct RawHostFields {
+    /// Overrides the domain's default `[idp]` for this host only.
+    pub idp: Option<String>,
+    pub required_group: Option<String>,
+    pub group_claim_name: Option<String>,
+    #[serde(default)]
+    pub bypass_paths: Vec<String>,
+    pub forward_identity_headers: Option<bool>,
+    pub resource: Option<String>,
+    pub required_scope: Option<String>,
+    pub token_header: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct RawHost {
-    pub base_domain: String,
-    /// Full override of the base domain's provider. If present, all three
-    /// fields are required (see ConfigError::IncompleteProviderOverride) —
-    /// we don't support merging individual provider fields.
-    pub provider: Option<RawProvider>,
-    pub required_group: Option<String>,
-    pub group_claim_name: Option<String>,
-    #[serde(default)]
-    pub bypass_paths: Vec<String>,
-    pub forward_identity_headers: Option<bool>,
-    pub resource: Option<String>,
-    pub required_scope: Option<String>,
-    pub token_header: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct RawFallback {
-    pub base_domain: String,
-    pub provider: Option<RawProvider>,
-    pub required_group: Option<String>,
-    pub group_claim_name: Option<String>,
-    #[serde(default)]
-    pub bypass_paths: Vec<String>,
-    pub forward_identity_headers: Option<bool>,
-    pub resource: Option<String>,
-    pub required_scope: Option<String>,
-    pub token_header: Option<String>,
+    /// Normally inferred (the longest configured domain that is a DNS
+    /// suffix of the hostname); explicit only to pick a shorter one when
+    /// configured domains nest. Must still be a suffix of the hostname.
+    pub domain: Option<String>,
+    #[serde(flatten)]
+    pub fields: RawHostFields,
 }

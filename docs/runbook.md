@@ -35,9 +35,12 @@ schedule is one less thing to track.
 
 ## Adding a new host
 
-1. Add a `[host."new.example.com"]` block under an existing base domain
-   (see [config-reference.md](config-reference.md) for every field).
-   Minimally just `base_domain = "..."` inherits everything.
+1. Add a `[host."new.example.com"]` block (see
+   [config-reference.md](config-reference.md) for every field). Its
+   domain is inferred from the hostname, and an empty block inherits
+   everything. If the domain has a `fallback`, an unlisted host is
+   already covered and the block is only needed for host-specific
+   settings.
 2. Add a Caddy `forward_auth` site block for it, modeled on
    [`deploy/Caddyfile`](../deploy/Caddyfile)'s `app.example.com` example.
 3. Reload both Caddy and authward. Order doesn't matter — authward
@@ -49,31 +52,33 @@ No IdP-side change needed unless the new host also needs its own OIDC
 client (see "adding a second provider" below) or its own resource for
 API tokens (see [api-tokens.md](api-tokens.md)).
 
-## Adding a second provider
+## Adding a second domain or a second IdP
 
-Two shapes, depending on scope:
+- **A whole new domain** (a different top-level property with its own
+  users): add a `[domain."other.com"]` block with its own
+  `auth_subdomain`, then hosts under it as usual. It can reuse an
+  existing `[idp]` (register `https://auth.other.com/callback` as an
+  additional redirect URI of that client) or name a new one. Domains are
+  fully independent, including the overview page and `/token`:
+  `https://auth.other.com/` lists and issues tokens for `other.com`
+  hosts only, and won't show them on `auth.example.com`.
+- **A second identity provider**: add an `[idp."<name>"]` block with its
+  `discovery_url`, `client_id` and `client_secret`, then reference it.
+  Once more than one `[idp]` exists every domain must say which one it
+  uses (`idp = "..."`) — a domain that relied on the single-IdP default
+  becomes a config error listing the choices, so nothing switches IdP
+  silently.
+- **One host on an existing domain, but a different IdP than that
+  domain's default** (e.g. a partner's app that authenticates against
+  the partner's own IdP while staying under your domain's
+  single-sign-on umbrella for everything else): set `idp = "<name>"` on
+  that one `[host."..."]` block — see
+  [config-reference.md](config-reference.md)'s two-IdP example and its
+  "Per-host IdPs" section for how sessions behave across the two.
 
-- **A whole new base domain** (a different top-level property with its
-  own users): add a new `[base_domain."other.com"]` block with its own
-  `auth_subdomain` and `provider`, then hosts under it as usual. This is
-  the common case and needs no special handling — base domains are
-  already fully independent. That independence includes the overview
-  page and `/token`: `https://auth.other.com/` lists and issues tokens
-  for `other.com` hosts only, and won't show them on `auth.example.com`.
-- **One host on an existing base domain, but a different IdP than that
-  base domain's default** (e.g. a partner's app that authenticates
-  against the partner's own IdP while staying under your domain's
-  single-sign-on umbrella for everything else): give that one
-  `[host."..."]` block a full `provider` override — see
-  [config-reference.md](config-reference.md)'s two-provider example and
-  its "Per-host providers" section for how sessions behave across the
-  two. All three provider fields (`discovery_url`, `client_id`,
-  `client_secret`) must be set together; a partial override is a config
-  error, not a merge.
-
-Either way: register the new OIDC client at that provider with a
-redirect URI of `https://<that base domain's auth_subdomain>/callback`
-first, then update the config and reload.
+Either way: register the domain's `https://<auth_subdomain>/callback` as
+a redirect URI of the OIDC client at that provider first, then update
+the config and reload.
 
 ## Reading logs and OTel traces for auth failures
 
@@ -94,7 +99,7 @@ useless as a cookie.
 | CSRF / stale flow cookie at `/callback` | `"callback state mismatch — possible CSRF or stale flow cookie"` | (no session_id yet at this point — it's pre-login) |
 | IdP returned an error at `/callback` | `"identity provider returned an error"` | `error`, `description` |
 | Config problem at startup | printed to stderr, not through the logger — `authward: N config error(s) found in <path>` followed by every error | — |
-| IdP unreachable at startup (its hosts show "Provider unavailable" until this clears) | `"OIDC provider discovery failed; will retry in the background"`, then `"OIDC provider discovery still failing"` every 30s, and `"OIDC provider discovered after earlier failure; now serving"` once it recovers. If no provider at all was reachable the process exits instead, with `no OIDC provider could be discovered` on stderr. | `provider_key`, `discovery_url`, `err` |
+| IdP unreachable at startup (its hosts show "Provider unavailable" until this clears; `provider_key` is the `[idp]` name) | `"OIDC provider discovery failed; will retry in the background"`, then `"OIDC provider discovery still failing"` every 30s, and `"OIDC provider discovered after earlier failure; now serving"` once it recovers. If no provider at all was reachable the process exits instead, with `no OIDC provider could be discovered` on stderr. | `provider_key`, `discovery_url`, `err` |
 | Login refused because its provider is still undiscovered | `"login refused: provider not yet discovered"` | `provider_key` |
 | JWKS refresh failing (bearer validation may start failing if this persists) | `"periodic JWKS refresh failed"` | `provider_key`, `err` |
 | Rate limited | `"rate limit exceeded on login/callback"` | `ip` |
@@ -133,7 +138,7 @@ on any session regardless of what the IdP does.
 Revoking a **browser session** is different and does have per-session
 control: the `/` overview page lists a user's own other active sessions
 with a revoke button (`POST /sessions/revoke`), scoped so a session can
-only ever revoke another session belonging to the same subject and base
+only ever revoke another session belonging to the same subject and
 domain — never anyone else's, even by guessing a session ID. `/logout`
 (also POST-only) ends the current session and, when the provider
 supports RP-Initiated Logout, sends the browser to the IdP's own

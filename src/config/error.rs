@@ -20,30 +20,65 @@ pub enum ConfigError {
     },
 
     #[error(
-        "host `{host}`: `base_domain` references `{base_domain}`, but no \
-         `[base_domain.\"{base_domain}\"]` block exists"
+        "{scope}: `idp` references `{idp}`, but no `[idp.\"{idp}\"]` block exists \
+         (defined: {})",
+        fmt_list(available)
     )]
-    UnknownBaseDomain { host: String, base_domain: String },
-
-    #[error(
-        "fallback: `base_domain` references `{base_domain}`, but no \
-         `[base_domain.\"{base_domain}\"]` block exists"
-    )]
-    FallbackUnknownBaseDomain { base_domain: String },
-
-    #[error(
-        "base_domain `{base_domain}`: `provider.discovery_url` (`{url}`) is not a valid URL: {source}"
-    )]
-    InvalidDiscoveryUrl {
-        base_domain: String,
-        url: String,
-        #[source]
-        source: url::ParseError,
+    UnknownIdp {
+        scope: String,
+        idp: String,
+        available: Vec<String>,
     },
 
-    #[error("host `{host}`: `provider.discovery_url` (`{url}`) is not a valid URL: {source}")]
-    InvalidHostDiscoveryUrl {
-        host: String,
+    #[error(
+        "domain `{domain}`: `idp` is not set and more than one `[idp]` block \
+         exists — set it to one of: {}",
+        fmt_list(available)
+    )]
+    DomainMissingIdp {
+        domain: String,
+        available: Vec<String>,
+    },
+
+    #[error(
+        "domain `{domain}`: no `[idp.\"...\"]` block is defined — add one with \
+         the provider's discovery_url, client_id and client_secret"
+    )]
+    NoIdpDefined { domain: String },
+
+    #[error(
+        "host `{host}` is not under any configured domain (defined: {}) — add a \
+         `[domain.\"...\"]` block whose name is a DNS suffix of the host, or fix \
+         the hostname",
+        fmt_list(domains)
+    )]
+    HostNotUnderAnyDomain { host: String, domains: Vec<String> },
+
+    #[error(
+        "host `{host}`: `domain` references `{domain}`, but no \
+         `[domain.\"{domain}\"]` block exists"
+    )]
+    UnknownDomain { host: String, domain: String },
+
+    #[error(
+        "host `{host}`: `domain` is `{domain}`, which is not a DNS suffix of the \
+         hostname — the session cookie is scoped to `Domain=.{domain}`, so the \
+         browser would never send it to this host"
+    )]
+    HostDomainMismatch { host: String, domain: String },
+
+    #[error(
+        "domain `{domain}`: `auth_subdomain` (`{auth_subdomain}`) is not a valid \
+         hostname (`https://{auth_subdomain}/callback` doesn't parse as a URL)"
+    )]
+    InvalidAuthSubdomain {
+        domain: String,
+        auth_subdomain: String,
+    },
+
+    #[error("idp `{idp}`: `discovery_url` (`{url}`) is not a valid URL: {source}")]
+    InvalidDiscoveryUrl {
+        idp: String,
         url: String,
         #[source]
         source: url::ParseError,
@@ -107,22 +142,6 @@ pub enum ConfigError {
     ConfigFilePermissionsTooOpen { path: PathBuf, mode: u32 },
 
     #[error(
-        "host `{host}`: `provider` override is missing `{field}` — when a \
-         host overrides `[host.\"{host}\".provider]` at all, it must specify the \
-         full provider (discovery_url, client_id, client_secret); partial \
-         overrides aren't supported since a mismatched client_id/secret pair \
-         would fail silently at login time instead of at startup"
-    )]
-    IncompleteProviderOverride { host: String, field: &'static str },
-
-    #[error(
-        "fallback: `provider` override is missing `{field}` (see the \
-         per-host provider-override error for why partial overrides aren't \
-         allowed)"
-    )]
-    IncompleteFallbackProviderOverride { field: &'static str },
-
-    #[error(
         "{scope}: `{url}` uses plain http — the OIDC client secret, \
          authorization codes and refresh tokens travel to this provider, so \
          it must be https (plain http is only allowed for loopback addresses \
@@ -142,4 +161,17 @@ pub enum ConfigError {
         #[source]
         source: std::net::AddrParseError,
     },
+}
+
+fn fmt_list(names: &[String]) -> String {
+    if names.is_empty() {
+        return "none".to_string();
+    }
+    let mut sorted: Vec<&str> = names.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+    sorted
+        .iter()
+        .map(|n| format!("`{n}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }

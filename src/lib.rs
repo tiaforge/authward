@@ -21,7 +21,6 @@ pub mod templates;
 use std::collections::HashMap;
 
 use axum_extra::extract::cookie::Key;
-use openidconnect::RedirectUrl;
 
 use crate::config::Config;
 use crate::crypto::RefreshTokenCipher;
@@ -30,7 +29,7 @@ use crate::ratelimit::{LOGIN_RATE_LIMIT_CAPACITY, LOGIN_RATE_LIMIT_REFILL_PER_SE
 use crate::state::{AppState, AppStateInner, ProviderRuntime};
 
 /// Builds the full application state from a resolved config: discovers
-/// every configured OIDC provider, opens the SQLite pool (running
+/// every configured `[idp]`, opens the SQLite pool (running
 /// migrations), and derives the crypto keys. Split out from `main` so
 /// integration tests can build a real `AppState` against a mock IdP
 /// without going through the CLI/process entry point.
@@ -45,22 +44,20 @@ use crate::state::{AppState, AppStateInner, ProviderRuntime};
 pub async fn build_state(cfg: Config) -> anyhow::Result<AppState> {
     let http_client = oidc::build_http_client()?;
 
-    let mut providers = HashMap::new();
     let mut runtimes = HashMap::new();
     let mut failures = Vec::new();
-    for (key, provider, base_domain) in cfg.providers() {
-        providers.insert(key.clone(), provider.clone());
-        match discover_provider(&http_client, &key, provider, base_domain).await {
+    for (key, idp) in &cfg.idps {
+        match discover_provider(&http_client, key, idp).await {
             Ok(runtime) => {
-                runtimes.insert(key, runtime);
+                runtimes.insert(key.clone(), runtime);
             }
             Err(err) => {
-                tracing::error!(provider_key = %key, discovery_url = %provider.discovery_url, err = %format!("{err:#}"), "OIDC provider discovery failed; will retry in the background");
-                failures.push(format!("{key} ({}): {err:#}", provider.discovery_url));
+                tracing::error!(provider_key = %key, discovery_url = %idp.discovery_url, err = %format!("{err:#}"), "OIDC provider discovery failed; will retry in the background");
+                failures.push(format!("{key} ({}): {err:#}", idp.discovery_url));
             }
         }
     }
-    if runtimes.is_empty() && !providers.is_empty() {
+    if runtimes.is_empty() && !cfg.idps.is_empty() {
         anyhow::bail!(
             "no OIDC provider could be discovered:\n  - {}",
             failures.join("\n  - ")
@@ -79,26 +76,22 @@ pub async fn build_state(cfg: Config) -> anyhow::Result<AppState> {
         db,
         cookie_key,
         refresh_cipher,
-        providers,
         runtimes,
         http_client,
         RateLimiter::new(LOGIN_RATE_LIMIT_CAPACITY, LOGIN_RATE_LIMIT_REFILL_PER_SEC),
     )))
 }
 
-/// One provider's discovery. All providers of a base domain share its
-/// auth subdomain's `/callback` as redirect URI — that's what gets
-/// registered at each IdP.
+/// One IdP's discovery. The redirect URI isn't fixed here: every domain
+/// using this IdP applies its own `https://<auth_subdomain>/callback` per
+/// request, and each of those must be registered at the IdP.
 async fn discover_provider(
     http_client: &openidconnect::reqwest::Client,
     key: &str,
-    provider: &config::Provider,
-    base_domain: &config::BaseDomain,
+    provider: &config::Idp,
 ) -> anyhow::Result<ProviderRuntime> {
-    let redirect_uri =
-        RedirectUrl::new(format!("https://{}/callback", base_domain.auth_subdomain))?;
     tracing::info!(provider_key = %key, discovery_url = %provider.discovery_url, "discovering OIDC provider");
-    let discovered = oidc::discover(http_client, provider, redirect_uri).await?;
+    let discovered = oidc::discover(http_client, provider).await?;
     Ok(ProviderRuntime {
         client: discovered.client,
         jwks: JwksCache::new(discovered.issuer, discovered.jwks_uri, discovered.jwks),
@@ -111,17 +104,17 @@ async fn discover_provider(
 /// runtime yet. Returns how many are still missing afterwards.
 pub async fn discover_missing_providers(state: &AppState) -> usize {
     let mut missing = 0;
-    for (key, provider, base_domain) in state.config.providers() {
-        if state.provider_runtime(&key).is_some() {
+    for (key, idp) in &state.config.idps {
+        if state.provider_runtime(key).is_some() {
             continue;
         }
-        match discover_provider(&state.http_client, &key, provider, base_domain).await {
+        match discover_provider(&state.http_client, key, idp).await {
             Ok(runtime) => {
                 tracing::info!(provider_key = %key, "OIDC provider discovered after earlier failure; now serving");
-                state.install_provider_runtime(key, runtime);
+                state.install_provider_runtime(key.clone(), runtime);
             }
             Err(err) => {
-                tracing::warn!(provider_key = %key, discovery_url = %provider.discovery_url, err = %format!("{err:#}"), "OIDC provider discovery still failing");
+                tracing::warn!(provider_key = %key, discovery_url = %idp.discovery_url, err = %format!("{err:#}"), "OIDC provider discovery still failing");
                 missing += 1;
             }
         }

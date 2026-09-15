@@ -2,7 +2,7 @@
 
 This walks through getting authward running end to end with one IdP
 (pocket-id, but any OIDC provider works the same way) and two apps on one
-base domain, using `authward init` rather than hand-editing TOML.
+domain, using `authward init` rather than hand-editing TOML.
 Read this before the [config reference](config-reference.md) — the goal
 here is a working setup, not full coverage of every field.
 
@@ -37,13 +37,20 @@ authward init
 
 It prompts for:
 
-1. **Base domain** (e.g. `example.com`) — everything under it shares one
-   auth subdomain, one provider, and single sign-on via the session
-   cookie's `Domain=.example.com` scope.
-2. **Auth subdomain** (defaults to `auth.<base domain>`).
-3. **OIDC discovery URL**.
-4. **OIDC client ID** and **client secret**.
-5. **First app hostname to protect** (e.g. `app.example.com`).
+1. **Domain** (e.g. `example.com`) — everything under it shares one
+   auth subdomain, one identity provider, and single sign-on via the
+   session cookie's `Domain=.example.com` scope.
+2. **Auth subdomain** (defaults to `auth.<domain>`).
+3. **A name for your identity provider** (defaults to `default`) — the
+   config refers to the IdP by this name; it only matters once you add a
+   second one.
+4. **OIDC discovery URL**.
+5. **OIDC client ID** and **client secret**.
+6. **First app hostname to protect** (e.g. `app.example.com`, which must
+   be under the domain).
+7. Whether to **protect every other host under the domain** with the
+   same settings (default no). Answering yes adds a fallback, so any
+   host Caddy sends to authward is protected without its own block.
 
 It then writes `config.toml` (chmod 600 — it contains generated secret
 key material for cookie signing and refresh-token-at-rest encryption)
@@ -52,14 +59,18 @@ re-running it is safe.
 
 ## 3. Add the second app
 
-The wizard only sets up one host. Open the generated `config.toml` and
-add a second `[host."..."]` block for your other app, inheriting
-everything from the same base domain:
+The wizard only lists one host. Open the generated `config.toml` and
+add a second `[host."..."]` block for your other app. Its domain is
+inferred from the name and everything else is inherited, so the block
+can be empty:
 
 ```toml
 [host."app2.example.com"]
-base_domain = "example.com"
 ```
+
+(If you answered yes to the fallback question, this step is optional:
+`app2.example.com` is already covered. A `[host]` block is only needed
+to give it settings of its own.)
 
 See [config-reference.md](config-reference.md) for every field a host
 can set (`required_group`, `bypass_paths`, `forward_identity_headers`,
@@ -93,9 +104,9 @@ Visit `https://app.example.com/` in a browser. You should be redirected
 to your IdP, log in, and land back on the app with a session cookie set.
 Visiting `https://auth.example.com/` shows the overview page (who's
 logged in, other active sessions, links to request an API token for any
-host with a `resource` configured). The page is per base domain: it only
-lists hosts under `example.com`. Hosts under a second base domain appear
-on that domain's own auth subdomain.
+host with a `resource` configured). The page is per domain: it only
+lists hosts under `example.com`. Hosts under a second domain appear on
+that domain's own auth subdomain.
 
 If something doesn't work, see the [runbook](runbook.md)'s "reading logs"
 section — every request that's denied or errors logs a structured reason.

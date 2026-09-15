@@ -425,8 +425,8 @@ fn sign_hs256(hmac_key: &CoreHmacKey, header_json: &str, payload: &serde_json::V
 
 // ---- App under test ---------------------------------------------------
 
-fn test_provider(idp_base_url: &str) -> config::Provider {
-    config::Provider {
+fn test_provider(idp_base_url: &str) -> config::Idp {
+    config::Idp {
         discovery_url: url::Url::parse(&format!("{idp_base_url}/.well-known/openid-configuration"))
             .unwrap(),
         client_id: CLIENT_ID.to_string(),
@@ -434,20 +434,33 @@ fn test_provider(idp_base_url: &str) -> config::Provider {
     }
 }
 
-fn base_domain_block(name: &str, auth_subdomain: &str, idp_base_url: &str) -> config::BaseDomain {
+/// The `[idp]` name every domain built by `add_domain` references.
+const DEFAULT_IDP: &str = "default";
+
+fn base_domain_block(name: &str, auth_subdomain: &str) -> config::BaseDomain {
     config::BaseDomain {
         name: name.to_string(),
         auth_subdomain: auth_subdomain.to_string(),
-        provider: test_provider(idp_base_url),
+        callback_url: url::Url::parse(&format!("https://{auth_subdomain}/callback")).unwrap(),
+        idp: DEFAULT_IDP.to_string(),
+        fallback: None,
     }
 }
 
-fn resolved_host(host: &str, base_domain: &str, idp_base_url: &str) -> config::ResolvedHost {
+/// Registers `idp_base_url` as `[idp."default"]` (idempotent, so several
+/// domains can share it) and a domain that authenticates against it.
+fn add_domain(cfg: &mut config::Config, name: &str, auth_subdomain: &str, idp_base_url: &str) {
+    cfg.idps
+        .insert(DEFAULT_IDP.to_string(), test_provider(idp_base_url));
+    cfg.base_domains
+        .insert(name.to_string(), base_domain_block(name, auth_subdomain));
+}
+
+fn resolved_host(host: &str, base_domain: &str) -> config::ResolvedHost {
     config::ResolvedHost {
         host: Some(host.to_string()),
         base_domain: base_domain.to_string(),
-        provider: test_provider(idp_base_url),
-        provider_key: base_domain.to_string(),
+        provider_key: DEFAULT_IDP.to_string(),
         required_group: None,
         group_claim_name: "groups".to_string(),
         bypass_paths: Vec::new(),
@@ -484,9 +497,9 @@ fn base_config(db_path: &std::path::Path) -> config::Config {
             otel_endpoint: None,
             listen_addr: "127.0.0.1:0".parse().unwrap(),
         },
+        idps: HashMap::new(),
         base_domains: HashMap::new(),
         hosts: HashMap::new(),
-        fallback: None,
     }
 }
 
@@ -495,13 +508,10 @@ async fn spawn_app(
     db_path: &std::path::Path,
 ) -> (String, authward::state::AppState) {
     let mut cfg = base_config(db_path);
-    cfg.base_domains.insert(
-        "test.local".to_string(),
-        base_domain_block("test.local", "auth.test.local", idp_base_url),
-    );
+    add_domain(&mut cfg, "test.local", "auth.test.local", idp_base_url);
     cfg.hosts.insert(
         "app.test.local".to_string(),
-        resolved_host("app.test.local", "test.local", idp_base_url),
+        resolved_host("app.test.local", "test.local"),
     );
     spawn_app_with_config(cfg).await
 }
@@ -1152,13 +1162,10 @@ async fn reaper_deletes_a_session_past_max_age_even_with_a_refresh_token() {
     let db_dir = tempfile::tempdir().unwrap();
     let mut cfg = base_config(&db_dir.path().join("sessions.db"));
     cfg.global.session_max_age = Duration::from_secs(1);
-    cfg.base_domains.insert(
-        "test.local".to_string(),
-        base_domain_block("test.local", "auth.test.local", &idp_base_url),
-    );
+    add_domain(&mut cfg, "test.local", "auth.test.local", &idp_base_url);
     cfg.hosts.insert(
         "app.test.local".to_string(),
-        resolved_host("app.test.local", "test.local", &idp_base_url),
+        resolved_host("app.test.local", "test.local"),
     );
     let (app, state) = spawn_app_with_config(cfg).await;
     let idp_client = reqwest::Client::builder()
@@ -1178,7 +1185,7 @@ async fn reaper_deletes_a_session_past_max_age_even_with_a_refresh_token() {
     // The cookie carries the session ID encrypted, so find the row by
     // subject instead.
     let rows =
-        authward::db::list_sessions_for_subject(&state.db, "test.local", "test.local", "alice")
+        authward::db::list_sessions_for_subject(&state.db, "test.local", DEFAULT_IDP, "alice")
             .await
             .unwrap();
     assert_eq!(rows.len(), 1);
@@ -1280,17 +1287,14 @@ async fn multiple_hosts_on_one_base_domain_share_sso() {
     let db_dir = tempfile::tempdir().unwrap();
 
     let mut cfg = base_config(&db_dir.path().join("sessions.db"));
-    cfg.base_domains.insert(
-        "test.local".to_string(),
-        base_domain_block("test.local", "auth.test.local", &idp_base_url),
-    );
+    add_domain(&mut cfg, "test.local", "auth.test.local", &idp_base_url);
     cfg.hosts.insert(
         "app-one.test.local".to_string(),
-        resolved_host("app-one.test.local", "test.local", &idp_base_url),
+        resolved_host("app-one.test.local", "test.local"),
     );
     cfg.hosts.insert(
         "app-two.test.local".to_string(),
-        resolved_host("app-two.test.local", "test.local", &idp_base_url),
+        resolved_host("app-two.test.local", "test.local"),
     );
     let (app, _state) = spawn_app_with_config(cfg).await;
 
@@ -1335,21 +1339,15 @@ async fn a_different_base_domain_does_not_accept_the_session() {
     let db_dir = tempfile::tempdir().unwrap();
 
     let mut cfg = base_config(&db_dir.path().join("sessions.db"));
-    cfg.base_domains.insert(
-        "test.local".to_string(),
-        base_domain_block("test.local", "auth.test.local", &idp_base_url),
-    );
-    cfg.base_domains.insert(
-        "other.local".to_string(),
-        base_domain_block("other.local", "auth.other.local", &idp_base_url),
-    );
+    add_domain(&mut cfg, "test.local", "auth.test.local", &idp_base_url);
+    add_domain(&mut cfg, "other.local", "auth.other.local", &idp_base_url);
     cfg.hosts.insert(
         "app.test.local".to_string(),
-        resolved_host("app.test.local", "test.local", &idp_base_url),
+        resolved_host("app.test.local", "test.local"),
     );
     cfg.hosts.insert(
         "app.other.local".to_string(),
-        resolved_host("app.other.local", "other.local", &idp_base_url),
+        resolved_host("app.other.local", "other.local"),
     );
     let (app, _state) = spawn_app_with_config(cfg).await;
 
@@ -1397,22 +1395,20 @@ async fn per_host_provider_override_is_honored() {
     let (idp_b, _count_b, _tokens_b) = spawn_mock_idp(Duration::from_secs(3600)).await;
     let db_dir = tempfile::tempdir().unwrap();
     let mut cfg = base_config(&db_dir.path().join("sessions.db"));
-    cfg.base_domains.insert(
-        "test.local".to_string(),
-        base_domain_block("test.local", "auth.test.local", &idp_a),
-    );
+    add_domain(&mut cfg, "test.local", "auth.test.local", &idp_a);
     cfg.hosts.insert(
         "app.test.local".to_string(),
-        resolved_host("app.test.local", "test.local", &idp_a),
+        resolved_host("app.test.local", "test.local"),
     );
     cfg.hosts.insert(
         "partner.test.local".to_string(),
         config::ResolvedHost {
-            provider: test_provider(&idp_b),
-            provider_key: "host:partner.test.local".to_string(),
-            ..resolved_host("partner.test.local", "test.local", &idp_a)
+            provider_key: "partner".to_string(),
+            ..resolved_host("partner.test.local", "test.local")
         },
     );
+    cfg.idps
+        .insert("partner".to_string(), test_provider(&idp_b));
     let (app, _state) = spawn_app_with_config(cfg).await;
     let idp_client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -1525,9 +1521,11 @@ async fn startup_fails_when_no_provider_can_be_discovered() {
     let dead = reserve_dead_address().await;
     let db_dir = tempfile::tempdir().unwrap();
     let mut cfg = base_config(&db_dir.path().join("sessions.db"));
-    cfg.base_domains.insert(
-        "test.local".to_string(),
-        base_domain_block("test.local", "auth.test.local", &format!("http://{dead}")),
+    add_domain(
+        &mut cfg,
+        "test.local",
+        "auth.test.local",
+        &format!("http://{dead}"),
     );
     let err = authward::build_state(cfg)
         .await
@@ -1535,7 +1533,7 @@ async fn startup_fails_when_no_provider_can_be_discovered() {
         .expect("startup must fail when the only provider is unreachable");
     let msg = format!("{err:#}");
     assert!(
-        msg.contains("no OIDC provider could be discovered") && msg.contains("test.local"),
+        msg.contains("no OIDC provider could be discovered") && msg.contains(DEFAULT_IDP),
         "error should say what failed: {msg}"
     );
 }
@@ -1547,22 +1545,20 @@ async fn a_down_provider_does_not_block_startup_and_is_picked_up_later() {
     let idp_b = format!("http://{dead}");
     let db_dir = tempfile::tempdir().unwrap();
     let mut cfg = base_config(&db_dir.path().join("sessions.db"));
-    cfg.base_domains.insert(
-        "test.local".to_string(),
-        base_domain_block("test.local", "auth.test.local", &idp_a),
-    );
+    add_domain(&mut cfg, "test.local", "auth.test.local", &idp_a);
     cfg.hosts.insert(
         "app.test.local".to_string(),
-        resolved_host("app.test.local", "test.local", &idp_a),
+        resolved_host("app.test.local", "test.local"),
     );
     cfg.hosts.insert(
         "partner.test.local".to_string(),
         config::ResolvedHost {
-            provider: test_provider(&idp_b),
-            provider_key: "host:partner.test.local".to_string(),
-            ..resolved_host("partner.test.local", "test.local", &idp_a)
+            provider_key: "partner".to_string(),
+            ..resolved_host("partner.test.local", "test.local")
         },
     );
+    cfg.idps
+        .insert("partner".to_string(), test_provider(&idp_b));
     // IdP B is down: startup must still succeed for IdP A's hosts.
     let (app, state) = spawn_app_with_config(cfg).await;
     let idp_client = reqwest::Client::builder()
@@ -1635,15 +1631,12 @@ async fn fallback_provider_covers_hosts_with_no_explicit_config() {
     let db_dir = tempfile::tempdir().unwrap();
 
     let mut cfg = base_config(&db_dir.path().join("sessions.db"));
-    cfg.base_domains.insert(
-        "test.local".to_string(),
-        base_domain_block("test.local", "auth.test.local", &idp_base_url),
-    );
+    add_domain(&mut cfg, "test.local", "auth.test.local", &idp_base_url);
     // No entry in `hosts` at all — every host on this instance relies on
     // the fallback provider.
-    cfg.fallback = Some(config::ResolvedHost {
+    cfg.base_domains.get_mut("test.local").unwrap().fallback = Some(config::ResolvedHost {
         host: None,
-        ..resolved_host("<fallback>", "test.local", &idp_base_url)
+        ..resolved_host("*.test.local", "test.local")
     });
     let (app, _state) = spawn_app_with_config(cfg).await;
 
@@ -1715,11 +1708,8 @@ async fn required_group_grants_or_denies_access() {
     let db_dir = tempfile::tempdir().unwrap();
 
     let mut cfg = base_config(&db_dir.path().join("sessions.db"));
-    cfg.base_domains.insert(
-        "test.local".to_string(),
-        base_domain_block("test.local", "auth.test.local", &idp_base_url),
-    );
-    let mut admin_host = resolved_host("admin.test.local", "test.local", &idp_base_url);
+    add_domain(&mut cfg, "test.local", "auth.test.local", &idp_base_url);
+    let mut admin_host = resolved_host("admin.test.local", "test.local");
     admin_host.required_group = Some("admins".to_string());
     cfg.hosts.insert("admin.test.local".to_string(), admin_host);
     let (app, _state) = spawn_app_with_config(cfg).await;
@@ -1804,11 +1794,8 @@ async fn revoking_group_membership_denies_access_on_next_refresh_without_relogin
     let db_dir = tempfile::tempdir().unwrap();
 
     let mut cfg = base_config(&db_dir.path().join("sessions.db"));
-    cfg.base_domains.insert(
-        "test.local".to_string(),
-        base_domain_block("test.local", "auth.test.local", &idp_base_url),
-    );
-    let mut admin_host = resolved_host("admin.test.local", "test.local", &idp_base_url);
+    add_domain(&mut cfg, "test.local", "auth.test.local", &idp_base_url);
+    let mut admin_host = resolved_host("admin.test.local", "test.local");
     admin_host.required_group = Some("admins".to_string());
     cfg.hosts.insert("admin.test.local".to_string(), admin_host);
     let (app, _state) = spawn_app_with_config(cfg).await;
@@ -1867,16 +1854,12 @@ async fn raw_verify_bearer(app: &str, host: &str, token: &str) -> reqwest::Statu
         .status()
 }
 
-fn api_host(
-    resource: &str,
-    required_scope: Option<&str>,
-    idp_base_url: &str,
-) -> config::ResolvedHost {
+fn api_host(resource: &str, required_scope: Option<&str>) -> config::ResolvedHost {
     config::ResolvedHost {
         resource: Some(resource.to_string()),
         required_scope: required_scope.map(str::to_string),
         token_header: "x-auth-token".to_string(),
-        ..resolved_host("api.test.local", "test.local", idp_base_url)
+        ..resolved_host("api.test.local", "test.local")
     }
 }
 
@@ -1886,13 +1869,10 @@ async fn bearer_token_grants_access_for_matching_resource_and_scope() {
         spawn_mock_idp_full(Duration::from_secs(3600), Duration::ZERO, true).await;
     let db_dir = tempfile::tempdir().unwrap();
     let mut cfg = base_config(&db_dir.path().join("sessions.db"));
-    cfg.base_domains.insert(
-        "test.local".to_string(),
-        base_domain_block("test.local", "auth.test.local", &idp_base_url),
-    );
+    add_domain(&mut cfg, "test.local", "auth.test.local", &idp_base_url);
     cfg.hosts.insert(
         "api.test.local".to_string(),
-        api_host("https://api.test.local/", Some("read"), &idp_base_url),
+        api_host("https://api.test.local/", Some("read")),
     );
     let (app, _state) = spawn_app_with_config(cfg).await;
 
@@ -1918,17 +1898,14 @@ async fn bearer_token_is_tried_when_the_session_cookie_is_stale_and_scheme_is_ca
         spawn_mock_idp_full(Duration::from_secs(3600), Duration::ZERO, true).await;
     let db_dir = tempfile::tempdir().unwrap();
     let mut cfg = base_config(&db_dir.path().join("sessions.db"));
-    cfg.base_domains.insert(
-        "test.local".to_string(),
-        base_domain_block("test.local", "auth.test.local", &idp_base_url),
-    );
+    add_domain(&mut cfg, "test.local", "auth.test.local", &idp_base_url);
     cfg.hosts.insert(
         "api.test.local".to_string(),
-        api_host("https://api.test.local/", Some("read"), &idp_base_url),
+        api_host("https://api.test.local/", Some("read")),
     );
     cfg.hosts.insert(
         "app.test.local".to_string(),
-        resolved_host("app.test.local", "test.local", &idp_base_url),
+        resolved_host("app.test.local", "test.local"),
     );
     let (app, state) = spawn_app_with_config(cfg).await;
     let idp_client = reqwest::Client::builder()
@@ -1949,7 +1926,7 @@ async fn bearer_token_is_tried_when_the_session_cookie_is_stale_and_scheme_is_ca
     )
     .await;
     let rows =
-        authward::db::list_sessions_for_subject(&state.db, "test.local", "test.local", "alice")
+        authward::db::list_sessions_for_subject(&state.db, "test.local", DEFAULT_IDP, "alice")
             .await
             .unwrap();
     authward::db::delete_session(&state.db, &rows[0].id)
@@ -2003,15 +1980,12 @@ async fn token_header_is_configurable_and_authorization_requires_the_bearer_sche
         spawn_mock_idp_full(Duration::from_secs(3600), Duration::ZERO, true).await;
     let db_dir = tempfile::tempdir().unwrap();
     let mut cfg = base_config(&db_dir.path().join("sessions.db"));
-    cfg.base_domains.insert(
-        "test.local".to_string(),
-        base_domain_block("test.local", "auth.test.local", &idp_base_url),
-    );
+    add_domain(&mut cfg, "test.local", "auth.test.local", &idp_base_url);
     cfg.hosts.insert(
         "api.test.local".to_string(),
         config::ResolvedHost {
             token_header: "authorization".to_string(),
-            ..api_host("https://api.test.local/", Some("read"), &idp_base_url)
+            ..api_host("https://api.test.local/", Some("read"))
         },
     );
     cfg.hosts.insert(
@@ -2019,7 +1993,7 @@ async fn token_header_is_configurable_and_authorization_requires_the_bearer_sche
         config::ResolvedHost {
             host: Some("custom.test.local".to_string()),
             token_header: "x-api-token".to_string(),
-            ..api_host("https://api.test.local/", Some("read"), &idp_base_url)
+            ..api_host("https://api.test.local/", Some("read"))
         },
     );
     let (app, _state) = spawn_app_with_config(cfg).await;
@@ -2088,13 +2062,10 @@ async fn bearer_token_for_a_different_resource_is_rejected() {
         spawn_mock_idp_full(Duration::from_secs(3600), Duration::ZERO, true).await;
     let db_dir = tempfile::tempdir().unwrap();
     let mut cfg = base_config(&db_dir.path().join("sessions.db"));
-    cfg.base_domains.insert(
-        "test.local".to_string(),
-        base_domain_block("test.local", "auth.test.local", &idp_base_url),
-    );
+    add_domain(&mut cfg, "test.local", "auth.test.local", &idp_base_url);
     cfg.hosts.insert(
         "api.test.local".to_string(),
-        api_host("https://api.test.local/", None, &idp_base_url),
+        api_host("https://api.test.local/", None),
     );
     let (app, _state) = spawn_app_with_config(cfg).await;
 
@@ -2118,13 +2089,10 @@ async fn bearer_token_missing_required_scope_is_rejected() {
         spawn_mock_idp_full(Duration::from_secs(3600), Duration::ZERO, true).await;
     let db_dir = tempfile::tempdir().unwrap();
     let mut cfg = base_config(&db_dir.path().join("sessions.db"));
-    cfg.base_domains.insert(
-        "test.local".to_string(),
-        base_domain_block("test.local", "auth.test.local", &idp_base_url),
-    );
+    add_domain(&mut cfg, "test.local", "auth.test.local", &idp_base_url);
     cfg.hosts.insert(
         "api.test.local".to_string(),
-        api_host("https://api.test.local/", Some("admin"), &idp_base_url),
+        api_host("https://api.test.local/", Some("admin")),
     );
     let (app, _state) = spawn_app_with_config(cfg).await;
 
@@ -2147,13 +2115,10 @@ async fn expired_bearer_token_is_rejected() {
         spawn_mock_idp_full(Duration::from_secs(3600), Duration::ZERO, true).await;
     let db_dir = tempfile::tempdir().unwrap();
     let mut cfg = base_config(&db_dir.path().join("sessions.db"));
-    cfg.base_domains.insert(
-        "test.local".to_string(),
-        base_domain_block("test.local", "auth.test.local", &idp_base_url),
-    );
+    add_domain(&mut cfg, "test.local", "auth.test.local", &idp_base_url);
     cfg.hosts.insert(
         "api.test.local".to_string(),
-        api_host("https://api.test.local/", None, &idp_base_url),
+        api_host("https://api.test.local/", None),
     );
     let (app, _state) = spawn_app_with_config(cfg).await;
 
@@ -2176,13 +2141,10 @@ async fn bearer_tokens_without_sub_or_not_yet_valid_or_wrong_typ_are_rejected() 
         spawn_mock_idp_full(Duration::from_secs(3600), Duration::ZERO, true).await;
     let db_dir = tempfile::tempdir().unwrap();
     let mut cfg = base_config(&db_dir.path().join("sessions.db"));
-    cfg.base_domains.insert(
-        "test.local".to_string(),
-        base_domain_block("test.local", "auth.test.local", &idp_base_url),
-    );
+    add_domain(&mut cfg, "test.local", "auth.test.local", &idp_base_url);
     cfg.hosts.insert(
         "api.test.local".to_string(),
-        api_host("https://api.test.local/", None, &idp_base_url),
+        api_host("https://api.test.local/", None),
     );
     let (app, _state) = spawn_app_with_config(cfg).await;
 
@@ -2235,13 +2197,10 @@ async fn bearer_token_survives_idp_key_rotation() {
         spawn_mock_idp_full(Duration::from_secs(3600), Duration::ZERO, true).await;
     let db_dir = tempfile::tempdir().unwrap();
     let mut cfg = base_config(&db_dir.path().join("sessions.db"));
-    cfg.base_domains.insert(
-        "test.local".to_string(),
-        base_domain_block("test.local", "auth.test.local", &idp_base_url),
-    );
+    add_domain(&mut cfg, "test.local", "auth.test.local", &idp_base_url);
     cfg.hosts.insert(
         "api.test.local".to_string(),
-        api_host("https://api.test.local/", None, &idp_base_url),
+        api_host("https://api.test.local/", None),
     );
     // build_state discovers and caches the JWKS for the *original* key here.
     let (app, _state) = spawn_app_with_config(cfg).await;
@@ -2272,13 +2231,10 @@ async fn token_helper_scopes_the_request_to_the_selected_hosts_resource() {
         spawn_mock_idp_full(Duration::from_secs(3600), Duration::ZERO, true).await;
     let db_dir = tempfile::tempdir().unwrap();
     let mut cfg = base_config(&db_dir.path().join("sessions.db"));
-    cfg.base_domains.insert(
-        "test.local".to_string(),
-        base_domain_block("test.local", "auth.test.local", &idp_base_url),
-    );
+    add_domain(&mut cfg, "test.local", "auth.test.local", &idp_base_url);
     cfg.hosts.insert(
         "api.test.local".to_string(),
-        api_host("https://api.test.local/", None, &idp_base_url),
+        api_host("https://api.test.local/", None),
     );
     let (app, _state) = spawn_app_with_config(cfg).await;
     let idp_client = reqwest::Client::builder()
@@ -2520,11 +2476,8 @@ async fn identity_headers_forwarded_when_enabled() {
     let (idp_base_url, _count, _tokens) = spawn_mock_idp(Duration::from_secs(3600)).await;
     let db_dir = tempfile::tempdir().unwrap();
     let mut cfg = base_config(&db_dir.path().join("sessions.db"));
-    cfg.base_domains.insert(
-        "test.local".to_string(),
-        base_domain_block("test.local", "auth.test.local", &idp_base_url),
-    );
-    let mut app_host = resolved_host("app.test.local", "test.local", &idp_base_url);
+    add_domain(&mut cfg, "test.local", "auth.test.local", &idp_base_url);
+    let mut app_host = resolved_host("app.test.local", "test.local");
     app_host.forward_identity_headers = true;
     cfg.hosts.insert("app.test.local".to_string(), app_host);
     let (app, _state) = spawn_app_with_config(cfg).await;
@@ -2595,11 +2548,8 @@ async fn unverified_email_is_not_forwarded() {
     let (idp_base_url, _count, _tokens) = spawn_mock_idp(Duration::from_secs(3600)).await;
     let db_dir = tempfile::tempdir().unwrap();
     let mut cfg = base_config(&db_dir.path().join("sessions.db"));
-    cfg.base_domains.insert(
-        "test.local".to_string(),
-        base_domain_block("test.local", "auth.test.local", &idp_base_url),
-    );
-    let mut app_host = resolved_host("app.test.local", "test.local", &idp_base_url);
+    add_domain(&mut cfg, "test.local", "auth.test.local", &idp_base_url);
+    let mut app_host = resolved_host("app.test.local", "test.local");
     app_host.forward_identity_headers = true;
     cfg.hosts.insert("app.test.local".to_string(), app_host);
     let (app, _state) = spawn_app_with_config(cfg).await;
@@ -2636,13 +2586,10 @@ async fn session_is_cut_off_at_its_absolute_max_age() {
     let db_dir = tempfile::tempdir().unwrap();
     let mut cfg = base_config(&db_dir.path().join("sessions.db"));
     cfg.global.session_max_age = Duration::from_secs(1);
-    cfg.base_domains.insert(
-        "test.local".to_string(),
-        base_domain_block("test.local", "auth.test.local", &idp_base_url),
-    );
+    add_domain(&mut cfg, "test.local", "auth.test.local", &idp_base_url);
     cfg.hosts.insert(
         "app.test.local".to_string(),
-        resolved_host("app.test.local", "test.local", &idp_base_url),
+        resolved_host("app.test.local", "test.local"),
     );
     let (app, _state) = spawn_app_with_config(cfg).await;
     let idp_client = reqwest::Client::builder()
@@ -2815,11 +2762,8 @@ async fn spoofed_identity_header_on_the_request_is_ignored() {
     let (idp_base_url, _count, _tokens) = spawn_mock_idp(Duration::from_secs(3600)).await;
     let db_dir = tempfile::tempdir().unwrap();
     let mut cfg = base_config(&db_dir.path().join("sessions.db"));
-    cfg.base_domains.insert(
-        "test.local".to_string(),
-        base_domain_block("test.local", "auth.test.local", &idp_base_url),
-    );
-    let mut app_host = resolved_host("app.test.local", "test.local", &idp_base_url);
+    add_domain(&mut cfg, "test.local", "auth.test.local", &idp_base_url);
+    let mut app_host = resolved_host("app.test.local", "test.local");
     app_host.forward_identity_headers = true;
     cfg.hosts.insert("app.test.local".to_string(), app_host);
     let (app, _state) = spawn_app_with_config(cfg).await;
@@ -3111,11 +3055,8 @@ async fn bypass_path_skips_auth_entirely() {
     let (idp_base_url, _count, _tokens) = spawn_mock_idp(Duration::from_secs(3600)).await;
     let db_dir = tempfile::tempdir().unwrap();
     let mut cfg = base_config(&db_dir.path().join("sessions.db"));
-    cfg.base_domains.insert(
-        "test.local".to_string(),
-        base_domain_block("test.local", "auth.test.local", &idp_base_url),
-    );
-    let mut app_host = resolved_host("app.test.local", "test.local", &idp_base_url);
+    add_domain(&mut cfg, "test.local", "auth.test.local", &idp_base_url);
+    let mut app_host = resolved_host("app.test.local", "test.local");
     app_host.bypass_paths = vec!["/public/logo.svg".to_string()];
     cfg.hosts.insert("app.test.local".to_string(), app_host);
     let (app, _state) = spawn_app_with_config(cfg).await;
@@ -3157,11 +3098,8 @@ async fn bypass_path_appended_as_query_string_does_not_bypass_a_protected_route(
     let (idp_base_url, _count, _tokens) = spawn_mock_idp(Duration::from_secs(3600)).await;
     let db_dir = tempfile::tempdir().unwrap();
     let mut cfg = base_config(&db_dir.path().join("sessions.db"));
-    cfg.base_domains.insert(
-        "test.local".to_string(),
-        base_domain_block("test.local", "auth.test.local", &idp_base_url),
-    );
-    let mut app_host = resolved_host("app.test.local", "test.local", &idp_base_url);
+    add_domain(&mut cfg, "test.local", "auth.test.local", &idp_base_url);
+    let mut app_host = resolved_host("app.test.local", "test.local");
     app_host.bypass_paths = vec!["/public/logo.svg".to_string()];
     cfg.hosts.insert("app.test.local".to_string(), app_host);
     let (app, _state) = spawn_app_with_config(cfg).await;
@@ -3185,11 +3123,8 @@ async fn bypass_path_with_a_fragment_does_not_bypass() {
     let (idp_base_url, _count, _tokens) = spawn_mock_idp(Duration::from_secs(3600)).await;
     let db_dir = tempfile::tempdir().unwrap();
     let mut cfg = base_config(&db_dir.path().join("sessions.db"));
-    cfg.base_domains.insert(
-        "test.local".to_string(),
-        base_domain_block("test.local", "auth.test.local", &idp_base_url),
-    );
-    let mut app_host = resolved_host("app.test.local", "test.local", &idp_base_url);
+    add_domain(&mut cfg, "test.local", "auth.test.local", &idp_base_url);
+    let mut app_host = resolved_host("app.test.local", "test.local");
     app_host.bypass_paths = vec!["/public/logo.svg".to_string()];
     cfg.hosts.insert("app.test.local".to_string(), app_host);
     let (app, _state) = spawn_app_with_config(cfg).await;
@@ -3250,13 +3185,10 @@ async fn mixed_case_and_multi_level_host_headers_resolve_correctly() {
     let (idp_base_url, _count, _tokens) = spawn_mock_idp(Duration::from_secs(3600)).await;
     let db_dir = tempfile::tempdir().unwrap();
     let mut cfg = base_config(&db_dir.path().join("sessions.db"));
-    cfg.base_domains.insert(
-        "test.local".to_string(),
-        base_domain_block("test.local", "auth.test.local", &idp_base_url),
-    );
+    add_domain(&mut cfg, "test.local", "auth.test.local", &idp_base_url);
     cfg.hosts.insert(
         "deep.app.test.local".to_string(),
-        resolved_host("deep.app.test.local", "test.local", &idp_base_url),
+        resolved_host("deep.app.test.local", "test.local"),
     );
     let (app, _state) = spawn_app_with_config(cfg).await;
     let idp_client = reqwest::Client::builder()
@@ -3288,4 +3220,129 @@ async fn mixed_case_and_multi_level_host_headers_resolve_correctly() {
             .status(),
         reqwest::StatusCode::OK
     );
+}
+
+// ---- Config rework: per-domain fallback, shared IdPs -------------------
+
+/// A domain's `fallback` covers unlisted hosts under *that* domain only;
+/// an unlisted host under another domain is still a hard failure.
+#[tokio::test]
+async fn a_domains_fallback_does_not_cover_hosts_under_another_domain() {
+    let (idp_base_url, _refresh_grant_count, _refresh_tokens) =
+        spawn_mock_idp(Duration::from_secs(3600)).await;
+    let db_dir = tempfile::tempdir().unwrap();
+
+    let mut cfg = base_config(&db_dir.path().join("sessions.db"));
+    add_domain(&mut cfg, "test.local", "auth.test.local", &idp_base_url);
+    add_domain(&mut cfg, "other.local", "auth.other.local", &idp_base_url);
+    cfg.base_domains.get_mut("test.local").unwrap().fallback = Some(config::ResolvedHost {
+        host: None,
+        ..resolved_host("*.test.local", "test.local")
+    });
+    let (app, _state) = spawn_app_with_config(cfg).await;
+
+    let mut browser = Browser::new();
+    let resp = browser
+        .get(&app, "unlisted.deep.test.local", "/verify")
+        .await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "an unlisted host under the domain with a fallback is protected, not unknown"
+    );
+    assert!(
+        resp.headers()
+            .get("x-login-url")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.starts_with("https://auth.test.local/login?")),
+        "the fallback host logs in at its own domain's auth subdomain"
+    );
+
+    let resp = browser.get(&app, "unlisted.other.local", "/verify").await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::BAD_GATEWAY,
+        "the other domain has no fallback, so its unlisted hosts stay a hard failure"
+    );
+}
+
+/// Two domains referencing the same `[idp]` share one discovered client,
+/// but each login carries that domain's own `/callback` as redirect URI
+/// and completes on that domain's auth subdomain.
+#[tokio::test]
+async fn two_domains_sharing_one_idp_each_use_their_own_callback() {
+    let (idp_base_url, _refresh_grant_count, _refresh_tokens) =
+        spawn_mock_idp(Duration::from_secs(3600)).await;
+    let db_dir = tempfile::tempdir().unwrap();
+
+    let mut cfg = base_config(&db_dir.path().join("sessions.db"));
+    add_domain(&mut cfg, "test.local", "auth.test.local", &idp_base_url);
+    add_domain(&mut cfg, "other.local", "auth.other.local", &idp_base_url);
+    cfg.hosts.insert(
+        "app.test.local".to_string(),
+        resolved_host("app.test.local", "test.local"),
+    );
+    cfg.hosts.insert(
+        "app.other.local".to_string(),
+        resolved_host("app.other.local", "other.local"),
+    );
+    let (app, state) = spawn_app_with_config(cfg).await;
+    assert_eq!(
+        state.provider_runtimes().len(),
+        1,
+        "one [idp] block is discovered exactly once, however many domains use it"
+    );
+
+    let idp_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    for (auth_host, app_host) in [
+        ("auth.test.local", "app.test.local"),
+        ("auth.other.local", "app.other.local"),
+    ] {
+        let mut browser = Browser::new();
+        let rd = format!("https://{app_host}/");
+        let resp = browser
+            .get(&app, auth_host, &format!("/login?rd={}", urlencode(&rd)))
+            .await;
+        assert_eq!(resp.status(), reqwest::StatusCode::SEE_OTHER);
+        let authorize_url = location(&resp);
+        assert_eq!(
+            query_param(&authorize_url, "redirect_uri"),
+            format!("https://{auth_host}/callback"),
+            "the authorization request names this domain's own callback"
+        );
+
+        let mut authorize_url = url::Url::parse(&authorize_url).unwrap();
+        authorize_url
+            .query_pairs_mut()
+            .append_pair("login_hint", "alice");
+        let idp_resp = follow_real_redirect(&idp_client, authorize_url.as_str()).await;
+        assert_eq!(idp_resp.status(), reqwest::StatusCode::SEE_OTHER);
+        let callback_location = location(&idp_resp);
+        assert!(
+            callback_location.starts_with(&format!("https://{auth_host}/callback")),
+            "the IdP sends the browser back to this domain's callback: {callback_location}"
+        );
+        let code = query_param(&callback_location, "code");
+        let csrf = query_param(&callback_location, "state");
+
+        let resp = browser
+            .get(
+                &app,
+                auth_host,
+                &format!("/callback?code={code}&state={csrf}"),
+            )
+            .await;
+        assert_eq!(resp.status(), reqwest::StatusCode::SEE_OTHER);
+        assert_eq!(location(&resp), rd);
+
+        assert_eq!(
+            browser.get(&app, app_host, "/verify").await.status(),
+            reqwest::StatusCode::OK,
+            "{app_host} accepts the session established on its own domain"
+        );
+    }
 }

@@ -94,7 +94,7 @@ directory — nothing here needs root.
 
 ### Startup and IdP availability
 
-Every configured provider is discovered at startup (its
+Every configured `[idp]` is discovered at startup (its
 `.well-known/openid-configuration` and JWKS are fetched). A provider
 whose IdP can't be reached is logged as an error and retried in the
 background every 30 seconds; its hosts answer with a "Provider
@@ -151,16 +151,16 @@ and resubmit" page, which Caddy relays as-is. The submitted body is not
 buffered or replayed — that's an accepted limitation.
 
 One more trust-boundary note: the session cookie is scoped to
-`Domain=.<base_domain>` — that's what makes single sign-on across the
-apps work — so every subdomain under a base domain is *same-site* as far
+`Domain=.<domain>` — that's what makes single sign-on across the
+apps work — so every subdomain under a domain is *same-site* as far
 as the browser is concerned. authward's own state-changing routes
 (`/logout`, `/sessions/revoke`) additionally check `Origin` /
 `Sec-Fetch-Site` so a compromised sibling app can't drive them, but a
-sibling app can still *set* a cookie for the whole base domain. Only put
-apps under one base domain that you'd trust with each other's sessions.
+sibling app can still *set* a cookie for the whole domain. Only put
+apps under one domain that you'd trust with each other's sessions.
 
 The same domain scoping means the browser sends `authward_session` to
-every app under the base domain, and `forward_auth` passes the original
+every app under the domain, and `forward_auth` passes the original
 request — cookie included — on to the backend. A backend that logs,
 leaks, or is compromised could therefore replay that cookie as a
 single-sign-on session against every sibling app. No backend ever needs
@@ -209,4 +209,4 @@ retry/backoff if the IdP is unreachable during a login or refresh (you
 get a plain error page; only startup discovery is retried), no buffering
 of a non-GET request body across a login redirect (a plain "please
 resubmit" page instead), and no central "logout everywhere" across
-multiple base domains.
+multiple domains.

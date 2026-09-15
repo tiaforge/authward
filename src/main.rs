@@ -84,9 +84,14 @@ async fn run_server(config_path: &Path) -> anyhow::Result<()> {
     let otel_provider = logging::init(cfg.global.otel_endpoint.as_deref());
 
     tracing::info!(
-        base_domains = cfg.base_domains.len(),
+        idps = cfg.idps.len(),
+        domains = cfg.base_domains.len(),
         hosts = cfg.hosts.len(),
-        has_fallback = cfg.fallback.is_some(),
+        fallbacks = cfg
+            .base_domains
+            .values()
+            .filter(|d| d.fallback.is_some())
+            .count(),
         "config loaded"
     );
 

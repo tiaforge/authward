@@ -1,15 +1,40 @@
 # Config reference
 
 The config file is TOML with four kinds of block: `[global]`, one or
-more `[base_domain."..."]`, one or more `[host."..."]`, and an optional
-`[fallback]`. On any problem, authward reports **every** error it
-finds in one run, not just the first — fix them all at once rather than
-one at a time.
+more `[idp."..."]`, one or more `[domain."..."]` (each with an optional
+`.fallback` sub-table), and any number of `[host."..."]`. On any problem,
+authward reports **every** error it finds in one run, not just the
+first — fix them all at once rather than one at a time.
 
-Host and base-domain names are case-normalized (lowercased) at load
-time, and matched against the (also-lowercased) incoming `Host` /
+Host and domain names are case-normalized (lowercased) at load time, and
+matched against the (also-lowercased) incoming `Host` /
 `X-Forwarded-Host`, so `App.Example.COM` in the config and
 `app.example.com` on the wire resolve to the same host.
+
+A complete small example:
+
+```toml
+[global]
+cookie_signing_key = "..."
+refresh_token_encryption_key = "..."
+
+[idp."pocketid"]
+discovery_url = "https://idp.example.com/.well-known/openid-configuration"
+client_id = "authward"
+client_secret = "..."
+
+[domain."example.com"]
+auth_subdomain = "auth.example.com"
+idp = "pocketid"                 # may be omitted while there is only one [idp]
+
+[domain."example.com".fallback]  # optional: any *.example.com host with no [host] block
+required_group = "users"
+
+[host."app.example.com"]         # an empty block is fine: it inherits everything
+
+[host."admin.example.com"]
+required_group = "admins"
+```
 
 ## `[global]`
 
@@ -29,28 +54,48 @@ startup and refuses to start otherwise. Prefer the env vars
 (`AUTHWARD_COOKIE_KEY` / `AUTHWARD_REFRESH_KEY`) when your
 deployment already has a secrets-injection mechanism.
 
-## `[base_domain."<name>"]`
+## `[idp."<name>"]`
 
-One block per base domain — a DNS suffix that shares one auth subdomain,
-one OIDC client, and (via the session cookie's `Domain=.<name>` scope)
-single sign-on across every host on it.
+One block per registered OIDC client. The name is yours to choose
+(`pocketid`, `keycloak-staff`, ...); domains and hosts refer to the block
+by it, and it is recorded on every session (as the `provider_key` field
+in logs). One identity provider with two different client registrations
+is two `[idp]` blocks.
 
 | Field | Required | Notes |
 |---|---|---|
-| `auth_subdomain` | yes | The host that serves `/login`, `/callback`, `/logout`, `/`, `/token`, `/healthz` for this base domain. Point Caddy's plain `reverse_proxy` block at this host. The overview page and `/token` here only cover hosts whose `base_domain` is this one — each base domain has its own dashboard. |
-| `provider.discovery_url` | yes | The IdP's `.well-known/openid-configuration` URL. Must be `https` — plain `http` is only accepted for loopback addresses (`127.0.0.1`, `localhost`, `::1`), and the same rule is applied at startup to every endpoint the discovery document advertises, since the client secret and tokens go to those. |
-| `provider.client_id` | yes | |
-| `provider.client_secret` | yes | Treat as a secret. |
+| `discovery_url` | yes | The IdP's `.well-known/openid-configuration` URL. Must be `https` — plain `http` is only accepted for loopback addresses (`127.0.0.1`, `localhost`, `::1`), and the same rule is applied at startup to every endpoint the discovery document advertises, since the client secret and tokens go to those. |
+| `client_id` | yes | |
+| `client_secret` | yes | Treat as a secret. |
+
+Every `[idp]` is discovered once at startup (retried in the background if
+its IdP is down at that moment — see the [deployment guide](deployment.md))
+and gets one OIDC client and one JWKS cache, shared by every domain that
+uses it. Register `https://<auth_subdomain>/callback` for **each** domain
+that uses the IdP as a redirect URI of that client.
+
+## `[domain."<name>"]`
+
+One block per domain — a DNS suffix that shares one auth subdomain, one
+default IdP, and (via the session cookie's `Domain=.<name>` scope) single
+sign-on across every host on it.
+
+| Field | Required | Notes |
+|---|---|---|
+| `auth_subdomain` | yes | The host that serves `/login`, `/callback`, `/logout`, `/`, `/token`, `/healthz` for this domain. Point Caddy's plain `reverse_proxy` block at this host. The overview page and `/token` here only cover hosts under this domain — each domain has its own dashboard. |
+| `idp` | yes, unless exactly one `[idp]` block exists | Name of the `[idp."..."]` this domain's hosts authenticate against unless a host overrides it. With a single `[idp]` defined it is chosen automatically; with several, omitting it is a config error that lists the choices. |
+| `fallback` | no | A sub-table (`[domain."<name>".fallback]`) with the same fields as a `[host]` block minus `domain`. Applies to any host under this domain that has no `[host]` block of its own. Omit it to make an unlisted host under this domain a hard failure (logged, `502`). |
 
 ## `[host."<hostname>"]`
 
-One block per protected app hostname. Every field except `base_domain`
-is optional and inherits from the named base domain when omitted.
+One block per protected app hostname. Every field is optional; a host
+inherits everything it doesn't set from its domain, so an empty block is
+a valid, fully protected host.
 
 | Field | Required | Default | Notes |
 |---|---|---|---|
-| `base_domain` | yes | — | Must name a configured `[base_domain."..."]`; a dangling reference is a hard config error. |
-| `provider` | no | inherited | A full override (`discovery_url`, `client_id`, `client_secret`, all three or none — partial overrides are rejected rather than merged field-by-field). Puts this one host on a different OIDC client or a different IdP than its base domain's default; see [Per-host providers](#per-host-providers) for how sessions behave. |
+| `domain` | no | inferred | The `[domain."..."]` this host belongs to. Inferred as the longest configured domain that the hostname equals or is a subdomain of (at any depth), which is the only domain whose session cookie the browser would send to this host. A host under no configured domain is a hard config error. Set it explicitly only when configured domains nest (e.g. both `example.com` and `corp.example.com`) and you want the shorter one; it must still be a suffix of the hostname. |
+| `idp` | no | the domain's | Name of an `[idp."..."]` block. Puts this one host on a different OIDC client or a different identity provider than its domain's default; see [Per-host IdPs](#per-host-idps) for how sessions behave. |
 | `required_group` | no | none (any valid login passes) | Value the claim named by `group_claim_name` must contain. Checked after every login and every silent refresh — losing the group mid-session denies on the next refresh, not just at next login. |
 | `group_claim_name` | no | `groups` | The claim can be a JSON array of strings or a single string; anything else, or a missing claim while `required_group` is set, fails closed (denied). |
 | `bypass_paths` | no | `[]` | Exact paths (no query string, no fragment) that skip auth entirely — e.g. `/healthz` on an app that has its own. Must start with `/`; must not contain `?` or `#`. Matching is exact-path only after one round of percent-decoding; a query string or fragment appended to a protected path never matches a bypass entry. |
@@ -59,79 +104,85 @@ is optional and inherits from the named base domain when omitted.
 | `required_scope` | no | none | A scope that must be present in an API token's `scope` claim for this host. Only meaningful alongside `resource`. |
 | `token_header` | no | `X-Auth-Token` | The request header an API token is read from. With the default, the header's value is the bare token — no `Bearer` word — so non-technical users can paste it as-is, and it stays out of the `Authorization` header that apps like Immich use for their own login. Set to `Authorization` to read a conventional `Authorization: Bearer <token>` instead. Only the configured header is ever read. Any valid header name is accepted except `Cookie`, `Host`, `X-Forwarded-Host` and `X-Forwarded-Uri`. Only meaningful alongside `resource`. |
 
-## `[fallback]`
+## Host resolution
 
-Same fields as a `[host."..."]` block, minus a hostname — applies to any
-request whose `Host`/`X-Forwarded-Host` doesn't match a base domain or an
-explicit host entry. Omit it entirely to make an unrecognized host a
-hard failure (logged, `502`) instead of silently falling back to
-something.
+For every `/verify`, the incoming `X-Forwarded-Host` (or `Host`) is
+matched, in order:
 
-## Per-host providers
+1. A `[host."<hostname>"]` block with exactly that name.
+2. Otherwise, the `fallback` of the longest configured domain the
+   hostname falls under (equal to it, or a subdomain at any depth).
+3. Otherwise it is a hard failure: logged, `502`. Neither an allow nor a
+   silent deny — an unknown host is a configuration mistake.
 
-Every distinct provider — each base domain's default plus every host
-(or fallback) `provider` override — is discovered at startup (retried
-in the background if its IdP is down at that moment — see the
-[deployment guide](deployment.md)) and gets its own OIDC client and
-JWKS cache. All clients under one base domain
-share that base domain's `https://<auth_subdomain>/callback` as their
-redirect URI, so register that URI at each IdP.
+A host's `[host]` block always wins over its domain's fallback, and a
+fallback never reaches across domains: `[domain."example.com".fallback]`
+has no effect on `x.other.com`, listed or not.
 
-A session records which provider logged it in, and a host only accepts
-sessions from *its* provider:
+## Per-host IdPs
 
-- `/login?rd=https://partner.example.com/...` runs the login at the
-  provider `partner.example.com` is configured with (the host named by
-  `rd`; no `rd`, or an unknown host, means the base domain's default).
-  `/token?host=...` likewise uses the target host's provider.
-- `/verify` for a host rejects a session established at any other
-  provider, even on the same base domain, and sends the browser to log
-  in at the right one. Bearer tokens are validated against the host's
-  own provider's JWKS and issuer.
-- A base domain still has one session cookie. Logging in at an
-  overridden host replaces a session from the default provider (and
-  vice versa), so a user moving between hosts on different providers is
-  bounced through `/login` each time they cross over — silently, when
-  the IdP still has its own session. Put hosts that users move between
-  constantly on the same provider.
-- The dashboard lists and revokes only sessions from the same provider
-  as the current one; the same `sub` string at two IdPs is two people.
+A session records which `[idp]` logged it in, and a host only accepts
+sessions from *its* IdP:
+
+- `/login?rd=https://partner.example.com/...` runs the login at the IdP
+  `partner.example.com` is configured with (the host named by `rd`; no
+  `rd`, or an unknown host, means the domain's default). `/token?host=...`
+  likewise uses the target host's IdP.
+- `/verify` for a host rejects a session established at any other IdP,
+  even on the same domain, and sends the browser to log in at the right
+  one. Bearer tokens are validated against the host's own IdP's JWKS and
+  issuer.
+- A domain still has one session cookie. Logging in at a host with an
+  `idp` override replaces a session from the default IdP (and vice
+  versa), so a user moving between hosts on different IdPs is bounced
+  through `/login` each time they cross over — silently, when the IdP
+  still has its own session. Put hosts that users move between constantly
+  on the same IdP.
+- The dashboard lists and revokes only sessions from the same IdP as the
+  current one; the same `sub` string at two IdPs is two people.
 - `/logout` ends the session at the IdP that created it.
 
-## Two-provider example
+Upgrading from a config that predates named IdPs: sessions created before
+the upgrade record the old provider identifier and are rejected at their
+next `/verify`, so every user logs in once more. Nothing needs cleaning
+up; the reaper removes the old rows as they age out.
 
-A host can point at an entirely different IdP than its base domain's
-default by fully overriding `provider`:
+## Two-IdP example
+
+A host can point at an entirely different identity provider than its
+domain's default by naming another `[idp]`:
 
 ```toml
 [global]
 cookie_signing_key = "..."
 refresh_token_encryption_key = "..."
 
-[base_domain."example.com"]
-auth_subdomain = "auth.example.com"
-
-[base_domain."example.com".provider]
+[idp."pocketid"]
 discovery_url = "https://idp-a.example.com/.well-known/openid-configuration"
 client_id = "authward"
 client_secret = "..."
 
-# Inherits idp-a above.
-[host."app.example.com"]
-base_domain = "example.com"
-
-# Overrides to a second IdP entirely, still under the same base domain
-# (same auth subdomain, same single-sign-on cookie scope — but this one
-# host's own login goes to idp-b instead).
-[host."partner-app.example.com"]
-base_domain = "example.com"
-
-[host."partner-app.example.com".provider]
-discovery_url = "https://idp-b.example.com/.well-known/openid-configuration"
+[idp."partner"]
+discovery_url = "https://idp-b.partner.net/.well-known/openid-configuration"
 client_id = "authward-partner"
 client_secret = "..."
+
+[domain."example.com"]
+auth_subdomain = "auth.example.com"
+idp = "pocketid"
+
+# Inherits pocketid.
+[host."app.example.com"]
+
+# Logs in at the partner's IdP instead, still under the same domain (same
+# auth subdomain, same single-sign-on cookie scope).
+[host."partner-app.example.com"]
+idp = "partner"
 ```
 
+Both IdPs need `https://auth.example.com/callback` registered as a
+redirect URI, since that is where every login under `example.com` lands.
+
 See [`examples/config.toml`](../examples/config.toml) for a minimal
-complete single-provider example, and [runbook.md](runbook.md) for how
-to add a host or a second provider to a running deployment.
+complete single-IdP example, and [runbook.md](runbook.md) for how to add
+a host or a second IdP to a running deployment.

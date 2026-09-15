@@ -1,8 +1,10 @@
-//! OIDC provider client setup. Discovery happens once per base domain at
-//! startup (Phase 1 scope); the resource-scoped-token JWKS refresh loop in
-//! Phase 5 is a separate concern from this.
+//! OIDC provider client setup. Discovery happens once per `[idp]` block at
+//! startup; the resource-scoped-token JWKS refresh loop in Phase 5 is a
+//! separate concern from this. The client comes back *without* a redirect
+//! URI: one IdP can serve several domains, each with its own `/callback`,
+//! so the caller sets it per request (`set_redirect_uri` on a clone).
 //!
-//! `config::Provider::discovery_url` is the *full* discovery-document URL
+//! `config::Idp::discovery_url` is the *full* discovery-document URL
 //! (e.g. `https://idp.example.com/.well-known/openid-configuration`), not
 //! a bare issuer — that's what operators are used to pasting from their
 //! IdP's docs. We fetch it directly with `reqwest` and parse the resulting
@@ -17,10 +19,10 @@ use anyhow::Context;
 use openidconnect::core::{CoreClient, CoreJsonWebKey, CoreProviderMetadata};
 use openidconnect::{
     ClientId, ClientSecret, EndpointMaybeSet, EndpointNotSet, EndpointSet, IssuerUrl,
-    JsonWebKeySet, JsonWebKeySetUrl, RedirectUrl,
+    JsonWebKeySet, JsonWebKeySetUrl,
 };
 
-use crate::config::Provider as ProviderConfig;
+use crate::config::Idp;
 
 /// Clock-skew leeway applied to ID token `exp`/`iat` validation, per the
 /// plan's locked-in decision.
@@ -40,7 +42,7 @@ pub type DiscoveredClient = CoreClient<
     EndpointMaybeSet,
 >;
 
-/// Everything a base domain's discovery step produces: the OIDC client
+/// Everything an IdP's discovery step produces: the OIDC client
 /// used for the browser login/refresh flows, plus the issuer and JWKS
 /// separately, since bearer-token validation (Phase 5) needs its *own*,
 /// independently-refreshable copy of the JWKS — the client's is baked in
@@ -68,8 +70,7 @@ pub struct DiscoveredProvider {
 
 pub async fn discover(
     http_client: &openidconnect::reqwest::Client,
-    provider: &ProviderConfig,
-    redirect_uri: RedirectUrl,
+    provider: &Idp,
 ) -> anyhow::Result<DiscoveredProvider> {
     let response = http_client
         .get(provider.discovery_url.clone())
@@ -140,8 +141,7 @@ pub async fn discover(
         metadata,
         ClientId::new(provider.client_id.clone()),
         Some(ClientSecret::new(provider.client_secret.clone())),
-    )
-    .set_redirect_uri(redirect_uri);
+    );
 
     Ok(DiscoveredProvider {
         client,

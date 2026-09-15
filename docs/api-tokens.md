@@ -21,9 +21,9 @@ with:
 - optionally, one or more **scopes** the resource accepts, e.g. `read`,
   `admin`
 
-Whatever OIDC client authward uses for that host (its base domain's
-default, or a per-host `provider` override) needs to be allowed to
-request tokens for this resource.
+Whatever `[idp]` authward uses for that host (its domain's default, or
+the host's own `idp = ...`) needs to be allowed to request tokens for
+this resource.
 
 ## 2. Wire it into authward's config
 
@@ -31,7 +31,6 @@ Add `resource` (and optionally `required_scope`) to the host:
 
 ```toml
 [host."app.example.com"]
-base_domain = "example.com"
 resource = "https://app.example.com/api"
 required_scope = "read"   # omit if any scope from the resource is acceptable
 ```
@@ -63,11 +62,11 @@ If the host has no `resource` configured, `/token?host=...` returns a
 400 rather than silently falling back to a session — this is a
 config-completeness check, not a runtime fallback.
 
-`/token` and the overview page are scoped to one base domain: the auth
-subdomain you visit only lists, and only issues tokens for, hosts whose
-`base_domain` is the one that auth subdomain belongs to. A host under a
-second base domain shows up on *that* domain's overview page, and its
-token URL is `https://<that domain's auth_subdomain>/token?host=...`.
+`/token` and the overview page are scoped to one domain: the auth
+subdomain you visit only lists, and only issues tokens for, hosts under
+the domain that auth subdomain belongs to. A host under a second domain
+shows up on *that* domain's overview page, and its token URL is
+`https://<that domain's auth_subdomain>/token?host=...`.
 Asking `auth.example.com` for a token for a host on `other.com` returns
 a 400 ("Wrong auth domain").
 
@@ -95,7 +94,7 @@ local and stateless:
 1. JWT signature checked against the IdP's JWKS (cached, refreshed
    periodically; refreshed on demand once if a signature check fails,
    to pick up key rotation — see [`src/jwks_cache.rs`](../src/jwks_cache.rs)).
-2. `iss` must match the configured provider.
+2. `iss` must match the host's `[idp]`.
 3. `aud` must contain the host's `resource` value.
 4. `exp` must not have passed (with the usual ±60s clock-skew leeway).
 5. If `required_scope` is set, the space-delimited `scope` claim must

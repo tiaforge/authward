@@ -234,7 +234,7 @@ pub async fn login(
 
 /// The provider a `/login` should run against: whichever the host in the
 /// (already validated, same-base-domain) `rd` uses, so a redirect from a
-/// host with a provider override logs in at *that* IdP. Anything else —
+/// host with an `idp` override logs in at *that* IdP. Anything else —
 /// no `rd`, an unconfigured host, the auth subdomain itself — is the base
 /// domain's default.
 fn provider_key_for_redirect(
@@ -248,7 +248,7 @@ fn provider_key_for_redirect(
         .and_then(|host| state.config.resolve_host(&host))
         .filter(|resolved| resolved.base_domain == base_domain.name)
         .map(|resolved| resolved.provider_key.clone())
-        .unwrap_or_else(|| base_domain.name.clone())
+        .unwrap_or_else(|| base_domain.idp.clone())
 }
 
 /// `/token` helper (Phase 5): authenticates the user exactly like `/login`,
@@ -359,7 +359,12 @@ async fn start_authorization(
             "The identity provider for this site can't be reached right now. Please try again in a minute.",
         );
     };
-    let oidc_client = &runtime.client;
+    // One discovered client per IdP, shared by every domain that uses it;
+    // the redirect URI is this domain's own `/callback`.
+    let oidc_client = runtime
+        .client
+        .clone()
+        .set_redirect_uri(base_domain.redirect_url());
 
     let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
 
@@ -507,7 +512,20 @@ pub async fn callback(
             "Unknown provider for this login.",
         );
     };
-    let oidc_client = &runtime.client;
+    // The token request must carry the same redirect URI the
+    // authorization request used: the flow's domain's `/callback`.
+    let Some(flow_domain) = state.config.base_domains.get(&flow.base_domain) else {
+        return error_page_clearing_flow(
+            jar,
+            StatusCode::BAD_GATEWAY,
+            "Login failed",
+            "Unknown domain for this login.",
+        );
+    };
+    let oidc_client = runtime
+        .client
+        .clone()
+        .set_redirect_uri(flow_domain.redirect_url());
 
     let token_request = match oidc_client.exchange_code(AuthorizationCode::new(code)) {
         Ok(req) => req,
@@ -685,7 +703,7 @@ pub async fn verify(
     let Some(resolved_host) = state.config.resolve_host(&host) else {
         tracing::error!(
             host,
-            "verify: no per-host config and no fallback provider configured"
+            "verify: no [host] block for this host and no fallback on its domain"
         );
         return StatusCode::BAD_GATEWAY.into_response();
     };
@@ -1125,7 +1143,7 @@ pub async fn logout(
     // The IdP to log out of is the one that logged this session in — read
     // before deleting. No session (or a foreign one) means the base
     // domain's default, which is where a stray browser most likely was.
-    let mut provider_key = base_domain.name.clone();
+    let mut provider_key = base_domain.idp.clone();
     if let Some(cookie) = jar.get(SESSION_COOKIE_NAME) {
         if let Ok(Some(session)) = db::get_session(&state.db, cookie.value()).await
             && session.base_domain == base_domain.name
@@ -1159,7 +1177,7 @@ pub async fn logout(
     let end_session_endpoint = state
         .provider_runtime(&provider_key)
         .and_then(|runtime| runtime.end_session_endpoint.clone());
-    let redirect_url = match (end_session_endpoint, state.providers.get(&provider_key)) {
+    let redirect_url = match (end_session_endpoint, state.config.idps.get(&provider_key)) {
         (Some(end_session_endpoint), Some(provider)) => {
             let mut url = end_session_endpoint;
             url.query_pairs_mut()

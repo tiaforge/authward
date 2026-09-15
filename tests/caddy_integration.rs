@@ -230,20 +230,27 @@ async fn full_flow_through_real_caddy() {
     // --- authward itself, via the same in-process construction the
     // rest of the suite uses, so this test only adds the Caddy layer on
     // top rather than re-testing authward's own logic.
+    let mut idps = std::collections::HashMap::new();
+    idps.insert(
+        "default".to_string(),
+        authward::config::Idp {
+            discovery_url: url::Url::parse(&format!(
+                "{idp_base_url}/.well-known/openid-configuration"
+            ))
+            .unwrap(),
+            client_id: CLIENT_ID.to_string(),
+            client_secret: CLIENT_SECRET.to_string(),
+        },
+    );
     let mut base_domains = std::collections::HashMap::new();
     base_domains.insert(
         "test.local".to_string(),
         authward::config::BaseDomain {
             name: "test.local".to_string(),
             auth_subdomain: "auth.test.local".to_string(),
-            provider: authward::config::Provider {
-                discovery_url: url::Url::parse(&format!(
-                    "{idp_base_url}/.well-known/openid-configuration"
-                ))
-                .unwrap(),
-                client_id: CLIENT_ID.to_string(),
-                client_secret: CLIENT_SECRET.to_string(),
-            },
+            callback_url: url::Url::parse("https://auth.test.local/callback").unwrap(),
+            idp: "default".to_string(),
+            fallback: None,
         },
     );
     let mut hosts = std::collections::HashMap::new();
@@ -252,15 +259,7 @@ async fn full_flow_through_real_caddy() {
         authward::config::ResolvedHost {
             host: Some("app.test.local".to_string()),
             base_domain: "test.local".to_string(),
-            provider_key: "test.local".to_string(),
-            provider: authward::config::Provider {
-                discovery_url: url::Url::parse(&format!(
-                    "{idp_base_url}/.well-known/openid-configuration"
-                ))
-                .unwrap(),
-                client_id: CLIENT_ID.to_string(),
-                client_secret: CLIENT_SECRET.to_string(),
-            },
+            provider_key: "default".to_string(),
             required_group: None,
             group_claim_name: "groups".to_string(),
             bypass_paths: Vec::new(),
@@ -281,9 +280,9 @@ async fn full_flow_through_real_caddy() {
             otel_endpoint: None,
             listen_addr: "127.0.0.1:0".parse().unwrap(),
         },
+        idps,
         base_domains,
         hosts,
-        fallback: None,
     };
     let state = authward::build_state(cfg)
         .await
