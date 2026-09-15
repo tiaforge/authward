@@ -44,9 +44,9 @@ schedule is one less thing to track.
 2. Add a Caddy `forward_auth` site block for it, modeled on
    [`deploy/Caddyfile`](../deploy/Caddyfile)'s `app.example.com` example.
 3. Reload both Caddy and authward. Order doesn't matter — authward
-   rejects a request for an unconfigured host with a `502` rather than
+   rejects a request for an unconfigured host with a `401` rather than
    crashing, so a brief window where Caddy knows about the host before
-   authward's config is reloaded just produces `502`s, not confusion.
+   authward's config is reloaded just produces `401`s, not confusion.
 
 No IdP-side change needed unless the new host also needs its own OIDC
 client (see "adding a second provider" below) or its own resource for
@@ -105,12 +105,20 @@ useless as a cookie.
 | Rate limited | `"rate limit exceeded on login/callback"` | `ip` |
 | Reaper activity (informational, not a failure) | `"reaper: swept expired sessions"` | `reaped` (count) |
 
-A `502` with no matching request-scoped log line at all usually means
-the *host* wasn't recognized — check `"config loaded"` at startup logged
-`hosts = N` matching what you expect, and that Caddy's `X-Forwarded-Host`
-matches the config's host key exactly (case doesn't matter — both sides
-lowercase — but the base hostname must match; `X-Forwarded-Host` should
-not include a port).
+A `401` with no `x-login-url` header and no matching request-scoped log
+line at all usually means the *host* wasn't recognized — check
+`"config loaded"` at startup logged `hosts = N` matching what you
+expect, and that Caddy's `X-Forwarded-Host` matches the config's host
+key exactly (case doesn't matter — both sides lowercase — but the base
+hostname must match; `X-Forwarded-Host` should not include a port).
+
+This is also the one `401` that's completely blank in the browser — a
+normal not-logged-in `401` is intercepted by Caddy and redirected to
+`/login` before it ever renders, and a session that expired mid-POST
+renders an explicit "Session expired" page. So if you're testing a new
+host and the browser just shows a bare, empty `401` with no page
+content and no redirect, that alone points at an unrecognized host
+before you even check headers or logs.
 
 ## Revoking API access
 

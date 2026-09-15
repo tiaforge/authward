@@ -705,7 +705,7 @@ pub async fn verify(
             host,
             "verify: no [host] block for this host and no fallback on its domain"
         );
-        return StatusCode::BAD_GATEWAY.into_response();
+        return StatusCode::UNAUTHORIZED.into_response();
     };
 
     // Bypass paths (Phase 9) skip auth entirely — checked before touching

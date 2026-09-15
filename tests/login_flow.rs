@@ -1621,7 +1621,12 @@ async fn unconfigured_host_with_no_fallback_is_a_hard_failure() {
     let resp = browser
         .get(&app, "nobody-configured-this-host.example", "/verify")
         .await;
-    assert_eq!(resp.status(), reqwest::StatusCode::BAD_GATEWAY);
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+    assert!(
+        resp.headers().get("x-login-url").is_none(),
+        "an unconfigured host has no auth subdomain to redirect to, so this 401 must not \
+         be mistaken for a normal login-required denial"
+    );
 }
 
 #[tokio::test]
@@ -3261,8 +3266,12 @@ async fn a_domains_fallback_does_not_cover_hosts_under_another_domain() {
     let resp = browser.get(&app, "unlisted.other.local", "/verify").await;
     assert_eq!(
         resp.status(),
-        reqwest::StatusCode::BAD_GATEWAY,
+        reqwest::StatusCode::UNAUTHORIZED,
         "the other domain has no fallback, so its unlisted hosts stay a hard failure"
+    );
+    assert!(
+        resp.headers().get("x-login-url").is_none(),
+        "unlike the fallback-covered host above, there's no auth subdomain to redirect to"
     );
 }
 

@@ -84,7 +84,7 @@ sign-on across every host on it.
 |---|---|---|
 | `auth_subdomain` | yes | The host that serves `/login`, `/callback`, `/logout`, `/`, `/token`, `/healthz` for this domain. Point Caddy's plain `reverse_proxy` block at this host. The overview page and `/token` here only cover hosts under this domain — each domain has its own dashboard. |
 | `idp` | yes, unless exactly one `[idp]` block exists | Name of the `[idp."..."]` this domain's hosts authenticate against unless a host overrides it. With a single `[idp]` defined it is chosen automatically; with several, omitting it is a config error that lists the choices. |
-| `fallback` | no | A sub-table (`[domain."<name>".fallback]`) with the same fields as a `[host]` block minus `domain`. Applies to any host under this domain that has no `[host]` block of its own. Omit it to make an unlisted host under this domain a hard failure (logged, `502`). |
+| `fallback` | no | A sub-table (`[domain."<name>".fallback]`) with the same fields as a `[host]` block minus `domain`. Applies to any host under this domain that has no `[host]` block of its own. Omit it to make an unlisted host under this domain a hard failure (logged, `401`). |
 
 ## `[host."<hostname>"]`
 
@@ -112,7 +112,7 @@ matched, in order:
 1. A `[host."<hostname>"]` block with exactly that name.
 2. Otherwise, the `fallback` of the longest configured domain the
    hostname falls under (equal to it, or a subdomain at any depth).
-3. Otherwise it is a hard failure: logged, `502`. Neither an allow nor a
+3. Otherwise it is a hard failure: logged, `401`. Neither an allow nor a
    silent deny — an unknown host is a configuration mistake.
 
 A host's `[host]` block always wins over its domain's fallback, and a

@@ -18,7 +18,7 @@ Rust + Axum forward-auth service providing OIDC login for apps behind Caddy that
 - **Persistence:** SQLite (`rusqlite` or `sqlx`) for the refresh-token store. Single instance, no HA requirement.
 - **Group authorization:** Group membership only (no arbitrary claim matching). Claim name configurable per-host, default `groups`. No config on a host = no check, any valid login passes.
 - **Bypass paths:** Declared per-host in config (public assets, webhooks). Exact-match only against the normalized path (percent-decoded, query string stripped, no prefix/wildcard/regex matching) — closes the class of bug where an unanchored match let an attacker append an allowed path to bypass auth on an unrelated route. `/healthz` lives on the auth subdomain, which isn't behind `forward_auth`, so it needs no bypass entry.
-- **Failure modes:** IdP unreachable at login → plain error page. Malformed or missing per-host config with no fallback match → log error, fail hard (502).
+- **Failure modes:** IdP unreachable at login → plain error page. Malformed or missing per-host config with no fallback match → log error, fail hard (401).
 - **Proxy:** Caddy `forward_auth` first; design headers/response codes so nginx/Traefik support is addable later without a rewrite.
 
 ### Added in refinement pass (post-comparison review)
@@ -92,7 +92,7 @@ Rust + Axum forward-auth service providing OIDC login for apps behind Caddy that
 
 - Host resolution from `X-Forwarded-Host` (fallback `Host`)
 - Look up per-host config; if none found, use fallback provider config (if defined)
-- If neither found: log error, `502`
+- If neither found: log error, `401`
 - Confirm cookie domain is derived correctly per base domain across multiple test hosts
 - Test: two hosts on the same base domain share SSO; a host on a different base domain gets its own auth subdomain and session
 - Test `rd` open-redirect validation: reject any `rd` target whose host isn't within the same base domain
