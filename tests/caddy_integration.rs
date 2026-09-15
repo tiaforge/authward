@@ -263,6 +263,7 @@ async fn full_flow_through_real_caddy() {
             required_group: None,
             group_claim_name: "groups".to_string(),
             bypass_paths: Vec::new(),
+            path_required_groups: Vec::new(),
             forward_identity_headers: true,
             resource: None,
             required_scope: None,

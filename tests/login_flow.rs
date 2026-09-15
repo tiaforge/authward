@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use authward::bypass;
 use authward::config;
 use axum::extract::{Form, Query, State};
 use axum::http::StatusCode;
@@ -464,6 +465,7 @@ fn resolved_host(host: &str, base_domain: &str) -> config::ResolvedHost {
         required_group: None,
         group_claim_name: "groups".to_string(),
         bypass_paths: Vec::new(),
+        path_required_groups: Vec::new(),
         forward_identity_headers: false,
         resource: None,
         required_scope: None,
@@ -563,6 +565,29 @@ impl Browser {
             .get(format!("{app_base_url}{path}"))
             .header("host", host)
             .header("x-forwarded-proto", "http")
+            .header("cookie", self.cookie_header())
+            .send()
+            .await
+            .unwrap();
+        self.absorb_set_cookies(&resp);
+        resp
+    }
+
+    /// Like `get`, but for `/verify` with an explicit `X-Forwarded-Uri` —
+    /// for tests that need to hit a specific app-side path (bypass_paths,
+    /// path_required_groups) rather than authward's own `/verify` route.
+    async fn get_verify_for_uri(
+        &mut self,
+        app_base_url: &str,
+        host: &str,
+        uri: &str,
+    ) -> reqwest::Response {
+        let resp = self
+            .client
+            .get(format!("{app_base_url}/verify"))
+            .header("host", host)
+            .header("x-forwarded-proto", "http")
+            .header("x-forwarded-uri", uri)
             .header("cookie", self.cookie_header())
             .send()
             .await
@@ -1789,6 +1814,174 @@ async fn no_required_group_means_any_valid_login_passes() {
             .await
             .status(),
         reqwest::StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn path_required_group_override_replaces_host_level_check() {
+    let (idp_base_url, _refresh_grant_count, _refresh_tokens) =
+        spawn_mock_idp(Duration::from_secs(3600)).await;
+    let db_dir = tempfile::tempdir().unwrap();
+
+    let mut cfg = base_config(&db_dir.path().join("sessions.db"));
+    add_domain(&mut cfg, "test.local", "auth.test.local", &idp_base_url);
+    let mut app_host = resolved_host("app.test.local", "test.local");
+    app_host.required_group = Some("users".to_string());
+    app_host.path_required_groups = vec![config::PathRequiredGroup {
+        path: "/admin/*".to_string(),
+        required_group: "admins".to_string(),
+    }];
+    cfg.hosts.insert("app.test.local".to_string(), app_host);
+    let (app, _state) = spawn_app_with_config(cfg).await;
+
+    let idp_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    // Admin-only, NOT a member of "users" — must still pass under /admin/*
+    // (the override replaces the host's check, it doesn't AND with it),
+    // but must be denied everywhere else where the host's own "users"
+    // check applies.
+    let mut admin_only = Browser::new();
+    login_as_with_groups(
+        &app,
+        &idp_client,
+        &mut admin_only,
+        "admin-only",
+        "admins",
+        "https://app.test.local/",
+    )
+    .await;
+    assert_eq!(
+        admin_only
+            .get_verify_for_uri(&app, "app.test.local", "/admin/dashboard")
+            .await
+            .status(),
+        reqwest::StatusCode::OK,
+        "admins-only session should pass under /admin/* even without the host's `users` group"
+    );
+    assert_eq!(
+        admin_only
+            .get_verify_for_uri(&app, "app.test.local", "/other")
+            .await
+            .status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "outside /admin/*, the host's own required_group (users) still applies"
+    );
+
+    // Regular user, NOT a member of "admins" — must be denied under
+    // /admin/* even though they'd pass the host's default check.
+    let mut user_only = Browser::new();
+    login_as_with_groups(
+        &app,
+        &idp_client,
+        &mut user_only,
+        "user-only",
+        "users",
+        "https://app.test.local/",
+    )
+    .await;
+    assert_eq!(
+        user_only
+            .get_verify_for_uri(&app, "app.test.local", "/admin/dashboard")
+            .await
+            .status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "a `users` session must not pass /admin/* just because it satisfies the host's default"
+    );
+    assert_eq!(
+        user_only
+            .get_verify_for_uri(&app, "app.test.local", "/other")
+            .await
+            .status(),
+        reqwest::StatusCode::OK,
+        "outside /admin/*, the host's own required_group (users) is satisfied"
+    );
+}
+
+#[tokio::test]
+async fn bypass_path_wins_over_path_required_group_override() {
+    let (idp_base_url, _count, _tokens) = spawn_mock_idp(Duration::from_secs(3600)).await;
+    let db_dir = tempfile::tempdir().unwrap();
+    let mut cfg = base_config(&db_dir.path().join("sessions.db"));
+    add_domain(&mut cfg, "test.local", "auth.test.local", &idp_base_url);
+    let mut app_host = resolved_host("app.test.local", "test.local");
+    app_host.required_group = Some("admins".to_string());
+    app_host.bypass_paths = vec![bypass::BypassEntry::unrestricted("/admin/public")];
+    app_host.path_required_groups = vec![config::PathRequiredGroup {
+        path: "/admin/*".to_string(),
+        required_group: "admins".to_string(),
+    }];
+    cfg.hosts.insert("app.test.local".to_string(), app_host);
+    let (app, _state) = spawn_app_with_config(cfg).await;
+
+    // No session cookie at all — if path_required_groups (or the host's
+    // required_group) were checked, this would 401. bypass_paths must
+    // win and skip auth entirely.
+    let resp = reqwest::Client::new()
+        .get(format!("{app}/verify"))
+        .header("host", "app.test.local")
+        .header("x-forwarded-uri", "/admin/public")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "a path bypassed via bypass_paths must skip auth entirely, even though it also \
+         matches a path_required_groups entry on the same host"
+    );
+}
+
+#[tokio::test]
+async fn path_required_group_first_match_in_list_order_wins() {
+    let (idp_base_url, _refresh_grant_count, _refresh_tokens) =
+        spawn_mock_idp(Duration::from_secs(3600)).await;
+    let db_dir = tempfile::tempdir().unwrap();
+
+    let mut cfg = base_config(&db_dir.path().join("sessions.db"));
+    add_domain(&mut cfg, "test.local", "auth.test.local", &idp_base_url);
+    let mut app_host = resolved_host("app.test.local", "test.local");
+    app_host.path_required_groups = vec![
+        config::PathRequiredGroup {
+            path: "/admin/*".to_string(),
+            required_group: "admins".to_string(),
+        },
+        config::PathRequiredGroup {
+            path: "/admin/reports/*".to_string(),
+            required_group: "reporters".to_string(),
+        },
+    ];
+    cfg.hosts.insert("app.test.local".to_string(), app_host);
+    let (app, _state) = spawn_app_with_config(cfg).await;
+
+    let idp_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    // Only a "reporters" member, not "admins" — the more specific SECOND
+    // entry would grant access, but the FIRST matching entry in list
+    // order ("/admin/*", requiring "admins") is the one that applies.
+    let mut reporter = Browser::new();
+    login_as_with_groups(
+        &app,
+        &idp_client,
+        &mut reporter,
+        "reporter",
+        "reporters",
+        "https://app.test.local/",
+    )
+    .await;
+    assert_eq!(
+        reporter
+            .get_verify_for_uri(&app, "app.test.local", "/admin/reports/q1")
+            .await
+            .status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "the first matching entry in list order (/admin/*, requiring admins) must win, \
+         not the more specific later entry"
     );
 }
 
@@ -3062,7 +3255,7 @@ async fn bypass_path_skips_auth_entirely() {
     let mut cfg = base_config(&db_dir.path().join("sessions.db"));
     add_domain(&mut cfg, "test.local", "auth.test.local", &idp_base_url);
     let mut app_host = resolved_host("app.test.local", "test.local");
-    app_host.bypass_paths = vec!["/public/logo.svg".to_string()];
+    app_host.bypass_paths = vec![bypass::BypassEntry::unrestricted("/public/logo.svg")];
     cfg.hosts.insert("app.test.local".to_string(), app_host);
     let (app, _state) = spawn_app_with_config(cfg).await;
 
@@ -3105,7 +3298,7 @@ async fn bypass_wildcard_path_skips_auth_for_everything_under_the_prefix() {
     let mut cfg = base_config(&db_dir.path().join("sessions.db"));
     add_domain(&mut cfg, "test.local", "auth.test.local", &idp_base_url);
     let mut app_host = resolved_host("app.test.local", "test.local");
-    app_host.bypass_paths = vec!["/public/*".to_string()];
+    app_host.bypass_paths = vec![bypass::BypassEntry::unrestricted("/public/*")];
     cfg.hosts.insert("app.test.local".to_string(), app_host);
     let (app, _state) = spawn_app_with_config(cfg).await;
 
@@ -3117,7 +3310,11 @@ async fn bypass_wildcard_path_skips_auth_for_everything_under_the_prefix() {
             .send()
             .await
             .unwrap();
-        assert_eq!(resp.status(), reqwest::StatusCode::OK, "{uri} should bypass");
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::OK,
+            "{uri} should bypass"
+        );
         for name in ["x-auth-user", "x-auth-email", "x-auth-groups"] {
             assert_eq!(
                 resp.headers().get(name).map(|v| v.as_bytes()),
@@ -3150,7 +3347,7 @@ async fn bypass_wildcard_does_not_match_a_request_with_a_dot_segment() {
     let mut cfg = base_config(&db_dir.path().join("sessions.db"));
     add_domain(&mut cfg, "test.local", "auth.test.local", &idp_base_url);
     let mut app_host = resolved_host("app.test.local", "test.local");
-    app_host.bypass_paths = vec!["/public/*".to_string()];
+    app_host.bypass_paths = vec![bypass::BypassEntry::unrestricted("/public/*")];
     cfg.hosts.insert("app.test.local".to_string(), app_host);
     let (app, _state) = spawn_app_with_config(cfg).await;
 
@@ -3165,13 +3362,84 @@ async fn bypass_wildcard_does_not_match_a_request_with_a_dot_segment() {
 }
 
 #[tokio::test]
+async fn scoped_bypass_allows_configured_method_and_denies_others() {
+    let (idp_base_url, _count, _tokens) = spawn_mock_idp(Duration::from_secs(3600)).await;
+    let db_dir = tempfile::tempdir().unwrap();
+    let mut cfg = base_config(&db_dir.path().join("sessions.db"));
+    add_domain(&mut cfg, "test.local", "auth.test.local", &idp_base_url);
+    let mut app_host = resolved_host("app.test.local", "test.local");
+    app_host.bypass_paths = vec![bypass::BypassEntry {
+        path: "/api/assets/*".to_string(),
+        methods: Some(vec!["GET".to_string(), "HEAD".to_string()]),
+    }];
+    cfg.hosts.insert("app.test.local".to_string(), app_host);
+    let (app, _state) = spawn_app_with_config(cfg).await;
+
+    let resp = reqwest::Client::new()
+        .get(format!("{app}/verify"))
+        .header("host", "app.test.local")
+        .header("x-forwarded-uri", "/api/assets/1")
+        .header("x-forwarded-method", "GET")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "GET is in the configured methods list"
+    );
+
+    let resp = reqwest::Client::new()
+        .get(format!("{app}/verify"))
+        .header("host", "app.test.local")
+        .header("x-forwarded-uri", "/api/assets/1")
+        .header("x-forwarded-method", "DELETE")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "DELETE is not in the configured methods list, so the same path must not bypass"
+    );
+}
+
+#[tokio::test]
+async fn scoped_bypass_fails_closed_when_x_forwarded_method_is_missing() {
+    let (idp_base_url, _count, _tokens) = spawn_mock_idp(Duration::from_secs(3600)).await;
+    let db_dir = tempfile::tempdir().unwrap();
+    let mut cfg = base_config(&db_dir.path().join("sessions.db"));
+    add_domain(&mut cfg, "test.local", "auth.test.local", &idp_base_url);
+    let mut app_host = resolved_host("app.test.local", "test.local");
+    app_host.bypass_paths = vec![bypass::BypassEntry {
+        path: "/api/assets/*".to_string(),
+        methods: Some(vec!["GET".to_string()]),
+    }];
+    cfg.hosts.insert("app.test.local".to_string(), app_host);
+    let (app, _state) = spawn_app_with_config(cfg).await;
+
+    let resp = reqwest::Client::new()
+        .get(format!("{app}/verify"))
+        .header("host", "app.test.local")
+        .header("x-forwarded-uri", "/api/assets/1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "a method-scoped entry must not match when the method can't be determined"
+    );
+}
+
+#[tokio::test]
 async fn bypass_path_appended_as_query_string_does_not_bypass_a_protected_route() {
     let (idp_base_url, _count, _tokens) = spawn_mock_idp(Duration::from_secs(3600)).await;
     let db_dir = tempfile::tempdir().unwrap();
     let mut cfg = base_config(&db_dir.path().join("sessions.db"));
     add_domain(&mut cfg, "test.local", "auth.test.local", &idp_base_url);
     let mut app_host = resolved_host("app.test.local", "test.local");
-    app_host.bypass_paths = vec!["/public/logo.svg".to_string()];
+    app_host.bypass_paths = vec![bypass::BypassEntry::unrestricted("/public/logo.svg")];
     cfg.hosts.insert("app.test.local".to_string(), app_host);
     let (app, _state) = spawn_app_with_config(cfg).await;
 
@@ -3196,7 +3464,7 @@ async fn bypass_path_with_a_fragment_does_not_bypass() {
     let mut cfg = base_config(&db_dir.path().join("sessions.db"));
     add_domain(&mut cfg, "test.local", "auth.test.local", &idp_base_url);
     let mut app_host = resolved_host("app.test.local", "test.local");
-    app_host.bypass_paths = vec!["/public/logo.svg".to_string()];
+    app_host.bypass_paths = vec![bypass::BypassEntry::unrestricted("/public/logo.svg")];
     cfg.hosts.insert("app.test.local".to_string(), app_host);
     let (app, _state) = spawn_app_with_config(cfg).await;
 

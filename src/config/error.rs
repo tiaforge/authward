@@ -107,6 +107,59 @@ pub enum ConfigError {
     )]
     BypassPathWildcardMustBeSuffix { host: String, path: String },
 
+    #[error(
+        "host `{host}`: bypass path `{path}` has a `methods` list but it's \
+         empty — omit `methods` entirely for an unrestricted (any-method) \
+         bypass, or list at least one HTTP method (e.g. `methods = [\"GET\", \
+         \"HEAD\"]`)"
+    )]
+    BypassPathEmptyMethods { host: String, path: String },
+
+    #[error(
+        "host `{host}`: bypass path `{path}` lists `methods = [...]` entry \
+         `{method}`, which is not a recognized HTTP method — use one of \
+         GET, HEAD, POST, PUT, DELETE, PATCH, OPTIONS, CONNECT, TRACE \
+         (case-insensitive)"
+    )]
+    BypassPathInvalidMethod {
+        host: String,
+        path: String,
+        method: String,
+    },
+
+    #[error(
+        "host `{host}`: path_required_groups path `{path}` must start with \
+         `/` (matched as an absolute path, optionally ending in `/*` to \
+         match that path and everything under it — same rules as \
+         bypass_paths)"
+    )]
+    PathRequiredGroupMustBeAbsolute { host: String, path: String },
+
+    #[error(
+        "host `{host}`: path_required_groups path `{path}` must not \
+         contain a query string (`?`) or fragment (`#`) — matching is \
+         exact-path-only and those characters are stripped from the real \
+         request before matching"
+    )]
+    PathRequiredGroupHasQueryOrFragment { host: String, path: String },
+
+    #[error(
+        "host `{host}`: path_required_groups path `{path}` contains `*` \
+         somewhere other than a trailing `/*` — the only supported \
+         wildcard form is a path ending in `/*`, which matches that path \
+         and everything under it (e.g. `/admin/*`); `**`, a mid-path `*`, \
+         or more than one `*` are not supported"
+    )]
+    PathRequiredGroupWildcardMustBeSuffix { host: String, path: String },
+
+    #[error(
+        "host `{host}`: path_required_groups entry for `{path}` has an \
+         empty `required_group` — set it to the group name this path \
+         should require (e.g. `required_group = \"admins\"`), or remove \
+         the entry"
+    )]
+    PathRequiredGroupEmptyGroup { host: String, path: String },
+
     #[error("host `{host}`: `token_header` `{header}` can't be used: {reason}")]
     InvalidTokenHeader {
         host: String,

@@ -91,6 +91,29 @@ pub struct RawDomain {
     pub fallback: Option<RawHostFields>,
 }
 
+/// One `bypass_paths` entry: either a bare path (unrestricted — matches
+/// any request method, same as before this variant existed), or a table
+/// restricting the bypass to specific HTTP methods.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum RawBypassEntry {
+    Path(String),
+    Scoped {
+        path: String,
+        #[serde(default)]
+        methods: Vec<String>,
+    },
+}
+
+/// One `path_required_groups` entry: a path pattern (same syntax as
+/// `bypass_paths`) and the group that overrides the host's own
+/// `required_group` for requests matching it.
+#[derive(Debug, Deserialize)]
+pub struct RawPathRequiredGroup {
+    pub path: String,
+    pub required_group: String,
+}
+
 /// The per-host fields, shared by `[host."..."]` blocks and a domain's
 /// `fallback` sub-table.
 #[derive(Debug, Default, Deserialize)]
@@ -100,7 +123,9 @@ pub struct RawHostFields {
     pub required_group: Option<String>,
     pub group_claim_name: Option<String>,
     #[serde(default)]
-    pub bypass_paths: Vec<String>,
+    pub bypass_paths: Vec<RawBypassEntry>,
+    #[serde(default)]
+    pub path_required_groups: Vec<RawPathRequiredGroup>,
     pub forward_identity_headers: Option<bool>,
     pub resource: Option<String>,
     pub required_scope: Option<String>,

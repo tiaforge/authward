@@ -41,8 +41,20 @@ idp = "pocketid"
 # successful login passes.
 [host."app.example.com"]
 
-# A host that layers on the optional per-host fields.
+# A host that layers on the optional per-host fields. /public/* is open to
+# any method; a scoped entry can restrict a bypass to read-only methods so
+# state-changing requests on the same path still require login; and
+# path_required_groups can require a stricter group than the host's own
+# for a specific sub-path (overrides, doesn't add to, required_group).
 [host."admin.example.com"]
 required_group = "admins"
-bypass_paths = ["/healthz", "/static/logo.svg", "/public/*"]
+bypass_paths = [
+  "/healthz",
+  "/static/logo.svg",
+  "/public/*",
+  { path = "/api/shared/*", methods = ["GET", "HEAD"] },
+]
+path_required_groups = [
+  { path = "/super/*", required_group = "superadmins" },
+]
 forward_identity_headers = true

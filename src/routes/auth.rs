@@ -708,12 +708,18 @@ pub async fn verify(
         return StatusCode::UNAUTHORIZED.into_response();
     };
 
+    let uri = headers.get("x-forwarded-uri").and_then(|v| v.to_str().ok());
+    let method = headers
+        .get("x-forwarded-method")
+        .and_then(|v| v.to_str().ok());
+
     // Bypass paths (Phase 9) skip auth entirely — checked before touching
     // the session/bearer-token logic at all. Caddy carries the original
-    // app request's path+query in X-Forwarded-Uri; its absence just means
-    // no bypass can apply (fails closed into normal auth, not open).
-    if let Some(uri) = headers.get("x-forwarded-uri").and_then(|v| v.to_str().ok())
-        && crate::bypass::matches_bypass(uri, &resolved_host.bypass_paths)
+    // app request's path+query in X-Forwarded-Uri and its method in
+    // X-Forwarded-Method; either's absence just means no (method-scoped)
+    // bypass can apply (fails closed into normal auth, not open).
+    if let Some(uri) = uri
+        && crate::bypass::matches_bypass(uri, method, &resolved_host.bypass_paths)
     {
         return ok_with_identity("", "", "");
     }
@@ -745,8 +751,13 @@ pub async fn verify(
     };
 
     // Group-membership authorization (Phase 4): no `required_group`
-    // configured on this host means no check, any valid login passes.
-    if let Some(required_group) = &resolved_host.required_group
+    // configured on this host means no check, any valid login passes. A
+    // path matching `path_required_groups` overrides `required_group`
+    // entirely for this request rather than adding to it.
+    let effective_required_group =
+        crate::authz::matching_path_required_group(uri, &resolved_host.path_required_groups)
+            .or(resolved_host.required_group.as_deref());
+    if let Some(required_group) = effective_required_group
         && !crate::authz::has_required_group(
             &session.claims_json,
             &resolved_host.group_claim_name,
@@ -809,8 +820,15 @@ async fn bearer_auth(
             // API token just because that path skipped the check. If the
             // IdP's access tokens don't carry the group claim at all,
             // this fails closed (denies) rather than silently skipping
-            // the check, consistent with the rest of this codebase.
-            if let Some(required_group) = &resolved_host.required_group
+            // the check, consistent with the rest of this codebase. Same
+            // `path_required_groups` override as the cookie-session path.
+            let uri = headers.get("x-forwarded-uri").and_then(|v| v.to_str().ok());
+            let effective_required_group = crate::authz::matching_path_required_group(
+                uri,
+                &resolved_host.path_required_groups,
+            )
+            .or(resolved_host.required_group.as_deref());
+            if let Some(required_group) = effective_required_group
                 && !crate::authz::has_required_group(
                     &claims,
                     &resolved_host.group_claim_name,

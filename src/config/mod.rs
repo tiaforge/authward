@@ -9,7 +9,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use openidconnect::RedirectUrl;
-use raw::{RawConfig, RawDomain, RawHost, RawHostFields, RawIdp};
+use raw::{
+    RawBypassEntry, RawConfig, RawDomain, RawHost, RawHostFields, RawIdp, RawPathRequiredGroup,
+};
 use url::Url;
 
 /// Fully resolved, ready-to-use configuration: every host's fields are
@@ -134,7 +136,13 @@ pub struct ResolvedHost {
     pub provider_key: String,
     pub required_group: Option<String>,
     pub group_claim_name: String,
-    pub bypass_paths: Vec<String>,
+    pub bypass_paths: Vec<crate::bypass::BypassEntry>,
+    /// Per-path overrides of `required_group`: a request whose path
+    /// matches an entry here is checked ONLY against that entry's group
+    /// (not ANDed with `required_group` above) — the first entry in list
+    /// order that matches wins. A path matched by `bypass_paths` skips
+    /// auth entirely and never reaches this check at all.
+    pub path_required_groups: Vec<PathRequiredGroup>,
     pub forward_identity_headers: bool,
     pub resource: Option<String>,
     pub required_scope: Option<String>,
@@ -144,6 +152,14 @@ pub struct ResolvedHost {
     /// session token, so the default keeps out of that header's way. When
     /// this *is* `authorization`, the value must use the `Bearer` scheme.
     pub token_header: String,
+}
+
+/// One `path_required_groups` entry, already validated at config-load
+/// time.
+#[derive(Debug, Clone)]
+pub struct PathRequiredGroup {
+    pub path: String,
+    pub required_group: String,
 }
 
 const DEFAULT_GROUP_CLAIM_NAME: &str = "groups";
@@ -363,6 +379,77 @@ fn validate_bypass_path(host: &str, path: &str, errors: &mut Vec<ConfigError>) {
         errors.push(ConfigError::BypassPathWildcardMustBeSuffix {
             host: host.to_string(),
             path: path.to_string(),
+        });
+    }
+}
+
+const KNOWN_HTTP_METHODS: [&str; 9] = [
+    "GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "CONNECT", "TRACE",
+];
+
+/// Validates and normalizes a scoped bypass entry's `methods` list,
+/// pushing errors for an empty list or an unrecognized method token, and
+/// returning the uppercase-normalized methods regardless (so a partially
+/// invalid list still resolves to *something* well-formed — the caller
+/// discards it anyway once `errors` is non-empty).
+fn validate_bypass_methods(
+    host: &str,
+    path: &str,
+    methods: &[String],
+    errors: &mut Vec<ConfigError>,
+) -> Vec<String> {
+    if methods.is_empty() {
+        errors.push(ConfigError::BypassPathEmptyMethods {
+            host: host.to_string(),
+            path: path.to_string(),
+        });
+    }
+    methods
+        .iter()
+        .map(|m| {
+            let upper = m.to_ascii_uppercase();
+            if !KNOWN_HTTP_METHODS.contains(&upper.as_str()) {
+                errors.push(ConfigError::BypassPathInvalidMethod {
+                    host: host.to_string(),
+                    path: path.to_string(),
+                    method: m.clone(),
+                });
+            }
+            upper
+        })
+        .collect()
+}
+
+/// Path-shape rules for a `path_required_groups` entry — identical to
+/// `validate_bypass_path`'s, plus the group name must be non-empty.
+fn validate_path_required_group(
+    host: &str,
+    entry: &RawPathRequiredGroup,
+    errors: &mut Vec<ConfigError>,
+) {
+    let path = &entry.path;
+    if !path.starts_with('/') {
+        errors.push(ConfigError::PathRequiredGroupMustBeAbsolute {
+            host: host.to_string(),
+            path: path.clone(),
+        });
+    }
+    if path.contains('?') || path.contains('#') {
+        errors.push(ConfigError::PathRequiredGroupHasQueryOrFragment {
+            host: host.to_string(),
+            path: path.clone(),
+        });
+    }
+    if path.contains('*') && !(path.ends_with("/*") && path.matches('*').count() == 1) {
+        errors.push(ConfigError::PathRequiredGroupWildcardMustBeSuffix {
+            host: host.to_string(),
+            path: path.clone(),
+        });
+    }
+    if entry.required_group.trim().is_empty() {
+        errors.push(ConfigError::PathRequiredGroupEmptyGroup {
+            host: host.to_string(),
+            path: path.clone(),
         });
     }
 }
@@ -609,9 +696,33 @@ fn resolve_host_fields(
         None => IdpRef::Ok(domain.idp.clone()),
     };
 
-    for path in &raw.bypass_paths {
-        validate_bypass_path(label, path, &mut errors);
+    let mut bypass_paths = Vec::with_capacity(raw.bypass_paths.len());
+    for entry in &raw.bypass_paths {
+        match entry {
+            RawBypassEntry::Path(path) => {
+                validate_bypass_path(label, path, &mut errors);
+                bypass_paths.push(crate::bypass::BypassEntry::unrestricted(path.clone()));
+            }
+            RawBypassEntry::Scoped { path, methods } => {
+                validate_bypass_path(label, path, &mut errors);
+                let methods = validate_bypass_methods(label, path, methods, &mut errors);
+                bypass_paths.push(crate::bypass::BypassEntry {
+                    path: path.clone(),
+                    methods: Some(methods),
+                });
+            }
+        }
     }
+
+    let mut path_required_groups = Vec::with_capacity(raw.path_required_groups.len());
+    for entry in &raw.path_required_groups {
+        validate_path_required_group(label, entry, &mut errors);
+        path_required_groups.push(PathRequiredGroup {
+            path: entry.path.clone(),
+            required_group: entry.required_group.clone(),
+        });
+    }
+
     let token_header = resolve_token_header(label, raw.token_header.as_deref(), &mut errors);
 
     if !errors.is_empty() {
@@ -632,7 +743,8 @@ fn resolve_host_fields(
             .group_claim_name
             .clone()
             .unwrap_or_else(|| DEFAULT_GROUP_CLAIM_NAME.to_string()),
-        bypass_paths: raw.bypass_paths.clone(),
+        bypass_paths,
+        path_required_groups,
         forward_identity_headers: raw.forward_identity_headers.unwrap_or(false),
         resource: raw.resource.clone(),
         required_scope: raw.required_scope.clone(),
@@ -997,9 +1109,144 @@ bypass_paths = ["/share/*", "/healthz", "/*"]
 "#
         ))
         .expect("wildcard bypass paths should load");
+        let paths: Vec<&str> = cfg.hosts["app.example.com"]
+            .bypass_paths
+            .iter()
+            .map(|e| e.path.as_str())
+            .collect();
+        assert_eq!(paths, vec!["/share/*", "/healthz", "/*"]);
+        assert!(
+            cfg.hosts["app.example.com"]
+                .bypass_paths
+                .iter()
+                .all(|e| e.methods.is_none()),
+            "plain-string bypass_paths entries must be unrestricted"
+        );
+    }
+
+    #[test]
+    fn scoped_bypass_path_loads_and_normalizes_methods() {
+        let cfg = load_str(&format!(
+            r#"{ONE_IDP}
+[domain."example.com"]
+auth_subdomain = "auth.example.com"
+
+[host."app.example.com"]
+bypass_paths = [
+  "/healthz",
+  {{ path = "/api/assets/*", methods = ["get", "Head"] }},
+]
+"#
+        ))
+        .expect("scoped bypass path should load");
+        let entries = &cfg.hosts["app.example.com"].bypass_paths;
+        assert_eq!(entries[0].path, "/healthz");
+        assert_eq!(entries[0].methods, None);
+        assert_eq!(entries[1].path, "/api/assets/*");
         assert_eq!(
-            cfg.hosts["app.example.com"].bypass_paths,
-            vec!["/share/*", "/healthz", "/*"]
+            entries[1].methods,
+            Some(vec!["GET".to_string(), "HEAD".to_string()])
+        );
+    }
+
+    #[test]
+    fn scoped_bypass_path_empty_methods_is_an_error() {
+        let errors = load_str(&format!(
+            r#"{ONE_IDP}
+[domain."example.com"]
+auth_subdomain = "auth.example.com"
+
+[host."app.example.com"]
+bypass_paths = [{{ path = "/api/assets/*", methods = [] }}]
+"#
+        ))
+        .expect_err("empty methods list should be rejected");
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ConfigError::BypassPathEmptyMethods { .. })),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn scoped_bypass_path_unknown_method_is_an_error() {
+        let errors = load_str(&format!(
+            r#"{ONE_IDP}
+[domain."example.com"]
+auth_subdomain = "auth.example.com"
+
+[host."app.example.com"]
+bypass_paths = [{{ path = "/api/assets/*", methods = ["FETCH"] }}]
+"#
+        ))
+        .expect_err("unknown method should be rejected");
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ConfigError::BypassPathInvalidMethod { method, .. } if method == "FETCH")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn trailing_wildcard_path_required_group_loads_without_error() {
+        let cfg = load_str(&format!(
+            r#"{ONE_IDP}
+[domain."example.com"]
+auth_subdomain = "auth.example.com"
+
+[host."app.example.com"]
+path_required_groups = [{{ path = "/admin/*", required_group = "admins" }}]
+"#
+        ))
+        .expect("path_required_groups should load");
+        let overrides = &cfg.hosts["app.example.com"].path_required_groups;
+        assert_eq!(overrides.len(), 1);
+        assert_eq!(overrides[0].path, "/admin/*");
+        assert_eq!(overrides[0].required_group, "admins");
+    }
+
+    #[test]
+    fn path_required_group_wildcard_must_be_a_trailing_slash_star() {
+        for bad in ["/admin*", "/a/**", "/*/*"] {
+            let errors = load_str(&format!(
+                r#"{ONE_IDP}
+[domain."example.com"]
+auth_subdomain = "auth.example.com"
+
+[host."app.example.com"]
+path_required_groups = [{{ path = "{bad}", required_group = "admins" }}]
+"#
+            ))
+            .expect_err(&format!("`{bad}` should be rejected"));
+            assert!(
+                errors.iter().any(|e| matches!(
+                    e,
+                    ConfigError::PathRequiredGroupWildcardMustBeSuffix { .. }
+                )),
+                "`{bad}`: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn path_required_group_empty_group_is_an_error() {
+        let errors = load_str(&format!(
+            r#"{ONE_IDP}
+[domain."example.com"]
+auth_subdomain = "auth.example.com"
+
+[host."app.example.com"]
+path_required_groups = [{{ path = "/admin/*", required_group = "" }}]
+"#
+        ))
+        .expect_err("empty required_group should be rejected");
+        assert!(
+            errors
+                .iter()
+                .any(|e| matches!(e, ConfigError::PathRequiredGroupEmptyGroup { .. })),
+            "{errors:?}"
         );
     }
 

@@ -19,6 +19,32 @@ pub fn has_required_group(claims_json: &Value, claim_name: &str, required_group:
     }
 }
 
+/// Finds the first `path_required_groups` entry (in list order) whose
+/// path pattern matches `raw_target`, if any — the same path-matching
+/// rules as `bypass_paths` (exact match, or a trailing-`/*` prefix
+/// match).
+///
+/// Returns `None` when `raw_target` is absent, fails the same
+/// conservative normalization `bypass_paths` uses (dot-segments, `//`,
+/// double-encoding, a fragment), or no entry matches. Unlike
+/// `bypass_paths`, `None` here is safe: it never means "skip the check,"
+/// only "no override for this request" — the caller still falls back to
+/// the host's own, always-present `required_group`. An ambiguous or
+/// non-canonical path therefore just narrows to the host's default
+/// check rather than being denied outright, which is fine because the
+/// alternative direction (treating it as a match when it might not be)
+/// is what would actually be unsafe.
+pub fn matching_path_required_group<'a>(
+    raw_target: Option<&str>,
+    overrides: &'a [crate::config::PathRequiredGroup],
+) -> Option<&'a str> {
+    let normalized = crate::bypass::normalize_for_bypass_match(raw_target?)?;
+    overrides
+        .iter()
+        .find(|o| crate::bypass::path_matches(&o.path, &normalized))
+        .map(|o| o.required_group.as_str())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -63,5 +89,53 @@ mod tests {
         let claims = json!({"roles": ["admins"], "groups": []});
         assert!(has_required_group(&claims, "roles", "admins"));
         assert!(!has_required_group(&claims, "groups", "admins"));
+    }
+
+    fn overrides(entries: &[(&str, &str)]) -> Vec<crate::config::PathRequiredGroup> {
+        entries
+            .iter()
+            .map(|(path, group)| crate::config::PathRequiredGroup {
+                path: (*path).to_string(),
+                required_group: (*group).to_string(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn matching_path_required_group_finds_a_matching_entry() {
+        let overrides = overrides(&[("/admin/*", "admins")]);
+        assert_eq!(
+            matching_path_required_group(Some("/admin/dashboard"), &overrides),
+            Some("admins")
+        );
+    }
+
+    #[test]
+    fn matching_path_required_group_first_match_wins() {
+        let overrides = overrides(&[("/admin/*", "admins"), ("/admin/reports/*", "reporters")]);
+        assert_eq!(
+            matching_path_required_group(Some("/admin/reports/q1"), &overrides),
+            Some("admins"),
+            "the first matching entry in list order wins, even if a later one is more specific"
+        );
+    }
+
+    #[test]
+    fn matching_path_required_group_no_match_returns_none() {
+        let overrides = overrides(&[("/admin/*", "admins")]);
+        assert_eq!(
+            matching_path_required_group(Some("/public"), &overrides),
+            None
+        );
+    }
+
+    #[test]
+    fn matching_path_required_group_ambiguous_input_returns_none() {
+        let overrides = overrides(&[("/admin/*", "admins")]);
+        assert_eq!(
+            matching_path_required_group(Some("/admin/../admin/x"), &overrides),
+            None
+        );
+        assert_eq!(matching_path_required_group(None, &overrides), None);
     }
 }

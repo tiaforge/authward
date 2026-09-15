@@ -98,11 +98,40 @@ a valid, fully protected host.
 | `idp` | no | the domain's | Name of an `[idp."..."]` block. Puts this one host on a different OIDC client or a different identity provider than its domain's default; see [Per-host IdPs](#per-host-idps) for how sessions behave. |
 | `required_group` | no | none (any valid login passes) | Value the claim named by `group_claim_name` must contain. Checked after every login and every silent refresh — losing the group mid-session denies on the next refresh, not just at next login. |
 | `group_claim_name` | no | `groups` | The claim can be a JSON array of strings or a single string; anything else, or a missing claim while `required_group` is set, fails closed (denied). |
-| `bypass_paths` | no | `[]` | Paths that skip auth entirely — e.g. `/healthz` on an app that has its own. Each entry is either an exact path (no query string, no fragment), or a path ending in `/*` that matches that path (trailing slash included) and everything under it, e.g. `/share/*` matches `/share/`, `/share/foo`, and `/share/foo/bar`, but not bare `/share` or `/shared-other` — the trailing `/` is a hard segment boundary. A bare `/*` matches every path, as an explicit catch-all. Every entry must start with `/`; must not contain `?` or `#`; and `*` is only accepted as that trailing `/*` — anywhere else (mid-path, `**`, more than one `*`) it's a config error. Matching is against the request path after one round of percent-decoding; a query string or fragment appended to a protected path never matches, and a decoded path containing a `.`/`..` segment or `//` never matches any bypass entry (fails closed to normal auth), even under a wildcard. |
+| `bypass_paths` | no | `[]` | Paths that skip auth entirely — e.g. `/healthz` on an app that has its own. Each entry is either a bare path string (exact path, no query string, no fragment, unrestricted — matches any request method), or a path ending in `/*` that matches that path (trailing slash included) and everything under it, e.g. `/share/*` matches `/share/`, `/share/foo`, and `/share/foo/bar`, but not bare `/share` or `/shared-other` — the trailing `/` is a hard segment boundary. A bare `/*` matches every path, as an explicit catch-all. Every entry must start with `/`; must not contain `?` or `#`; and `*` is only accepted as that trailing `/*` — anywhere else (mid-path, `**`, more than one `*`) it's a config error. Matching is against the request path after one round of percent-decoding; a query string or fragment appended to a protected path never matches, and a decoded path containing a `.`/`..` segment or `//` never matches any bypass entry (fails closed to normal auth), even under a wildcard. An entry can also be a table, `{ path = "...", methods = [...] }`, to restrict the bypass to specific HTTP methods (e.g. `methods = ["GET", "HEAD"]` so a public read-only path doesn't also exempt `DELETE`/`PUT`/`POST` on the same prefix from auth) — `methods` is validated against the standard HTTP method set (case-insensitively, normalized to uppercase) and must not be empty; a request whose method can't be determined (missing `X-Forwarded-Method`) never matches a method-scoped entry. |
+| `path_required_groups` | no | `[]` | Per-path overrides of `required_group`: a list of `{ path = "...", required_group = "..." }`, using the exact same path syntax as `bypass_paths` (exact path, or trailing `/*` prefix). A request whose path matches an entry is checked **only** against that entry's `required_group` — it replaces the host's own `required_group` for that request rather than adding to it, so e.g. `/admin/*` can require `admins` even for a session that isn't also a member of the host's regular `required_group`. When more than one entry matches, the **first** in list order wins — list more specific patterns first if you need that kind of nesting. Applies identically whether the request carries a session cookie or a bearer token. A path matched by `bypass_paths` skips auth entirely and is never checked against `path_required_groups` — bypass always takes precedence. |
 | `forward_identity_headers` | no | `false` | When true, a successful `/verify` fills in `X-Auth-User` / `X-Auth-Email` / `X-Auth-Groups`, which Caddy's `copy_headers` must be configured to relay (see the Caddyfile). All three headers are sent on every successful `/verify` even when this is false (as empty values) so `copy_headers` always overwrites a client-supplied one. `X-Auth-Email` is only populated when the IdP marks the email verified (`email_verified: true`); an unverified email is whatever the user typed into their profile. Backends should key on `X-Auth-User` (the OIDC `sub`), which is stable and IdP-assigned. `X-Auth-Groups` is comma-joined without escaping — don't use group names containing commas. |
 | `resource` | no | none | The OAuth resource identifier (RFC 8707) this host's API accepts. Required for `/token` to issue an API token for this host, and for a bearer token to be accepted at all (see [api-tokens.md](api-tokens.md)). |
 | `required_scope` | no | none | A scope that must be present in an API token's `scope` claim for this host. Only meaningful alongside `resource`. |
 | `token_header` | no | `X-Auth-Token` | The request header an API token is read from. With the default, the header's value is the bare token — no `Bearer` word — so non-technical users can paste it as-is, and it stays out of the `Authorization` header that apps like Immich use for their own login. Set to `Authorization` to read a conventional `Authorization: Bearer <token>` instead. Only the configured header is ever read. Any valid header name is accepted except `Cookie`, `Host`, `X-Forwarded-Host` and `X-Forwarded-Uri`. Only meaningful alongside `resource`. |
+
+### Scoped bypass paths and path-level group overrides
+
+A worked example, e.g. protecting a self-hosted photo app whose public
+share links need a few read-only endpoints exposed without also
+un-gating their mutating counterparts, and whose admin panel needs a
+stricter group than the app itself:
+
+```toml
+[host."photos.example.com"]
+required_group = "photo_users"
+bypass_paths = [
+  "/share/*",
+  "/_app/immutable/*",
+  { path = "/api/assets/*", methods = ["GET", "HEAD"] },
+]
+path_required_groups = [
+  { path = "/admin/*", required_group = "photo_admins" },
+]
+```
+
+Here, `GET`/`HEAD` requests under `/api/assets/*` skip auth (needed by
+the public share viewer), but `DELETE`/`PUT`/`POST` on those same paths
+still require a valid `photo_users` session. `/admin/*` requires
+`photo_admins` specifically — a `photo_users` session that isn't also a
+`photo_admins` member is denied there, and (since this is an override,
+not an additional check) a `photo_admins` session doesn't separately
+need to be a `photo_users` member to pass.
 
 ## Host resolution
 

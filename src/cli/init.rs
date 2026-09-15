@@ -194,7 +194,8 @@ auth_subdomain = "{auth_subdomain}"
 idp = "{idp_name}"
 {fallback}
 # Inherits everything from its domain; add fields here (required_group,
-# bypass_paths, ...) to override. Add one block per app to protect.
+# bypass_paths, path_required_groups, ...) to override. Add one block per
+# app to protect.
 [host."{first_host}"]
 "#
     )
