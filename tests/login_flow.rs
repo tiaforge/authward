@@ -3767,7 +3767,10 @@ async fn verify_success_is_cacheable_but_401_and_403_never_are() {
     assert_eq!(header_str(&resp, "cache-control"), Some("max-age=60"));
     // Host has no path rules, so the answer doesn't depend on the URI —
     // but always on the cookie and on which app is being accessed.
-    assert_eq!(header_str(&resp, "vary"), Some("cookie, x-forwarded-host"));
+    assert_eq!(
+        header_str(&resp, "vary"),
+        Some("cookie, host, x-forwarded-host")
+    );
 
     // Same session, a host that requires a group bob lacks: 403, uncached.
     let resp = bob.get(&app, "admin.test.local", "/verify").await;
@@ -3902,7 +3905,7 @@ async fn verify_bearer_success_is_cacheable_until_token_expiry_and_varies_on_its
     );
     assert_eq!(
         header_str(&resp, "vary"),
-        Some("cookie, x-forwarded-host, x-auth-token")
+        Some("cookie, host, x-forwarded-host, x-auth-token")
     );
 
     let expired = build_access_token(
@@ -3940,6 +3943,6 @@ async fn verify_varies_on_uri_and_method_when_the_host_has_path_rules() {
     assert_eq!(header_str(&resp, "cache-control"), Some("max-age=60"));
     assert_eq!(
         header_str(&resp, "vary"),
-        Some("cookie, x-forwarded-host, x-forwarded-uri, x-forwarded-method")
+        Some("cookie, host, x-forwarded-host, x-forwarded-uri, x-forwarded-method")
     );
 }

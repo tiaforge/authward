@@ -52,3 +52,7 @@ cargo test
 suite against an in-process mock IdP. `tests/caddy_integration.rs` drives
 the same flow through a real `caddy` binary if one is available on
 `PATH` (or `CADDY_BIN`), and skips itself with a message otherwise.
+`tests/nginx_cache_integration.rs` checks that cached `/verify` answers
+never cross users, apps, API tokens or paths behind a real caching nginx,
+run via rootless `podman` (or a native binary via `NGINX_BIN`); it skips
+itself when neither is available.

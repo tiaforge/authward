@@ -231,28 +231,43 @@ does not, unless you add a cache plugin in front of it; nginx
 - **The cache key must include everything the answer depends on.** A
   cached 200 carries the `X-Auth-User`/`-Email`/`-Groups` identity
   headers. If the cache serves it for the wrong request, one user's
-  identity reaches the backend for everyone else, which lets anyone in
-  as that user. authward lists those headers in `Vary`: `Cookie` and
-  `X-Forwarded-Host` always; `X-Forwarded-Uri` and `X-Forwarded-Method`
-  when the host has `bypass_paths` or `path_required_groups`; and the
-  host's `token_header` when the answer came from an API token. `Vary`
-  only protects you if the cache honours it, so also set an explicit
-  cache key that covers all of these. With nginx, for example:
+  identity reaches the backend for everyone else, and a user who may
+  only use one app gets into another. authward lists those headers in
+  `Vary`: `Cookie`, `Host` and `X-Forwarded-Host` always;
+  `X-Forwarded-Uri` and `X-Forwarded-Method` when the host has
+  `bypass_paths` or `path_required_groups`; and the host's
+  `token_header` when the answer came from an API token.
+
+  Watch out for how a cache evaluates `Vary`. nginx matches it against
+  the *browser's* request, where proxy-added headers like
+  `X-Forwarded-Host` don't exist yet. That's why `Host` is listed too:
+  without it, nginx's default cache key (`$scheme$proxy_host$request_uri`,
+  which names authward's address, not the app's) served a user's cached
+  200 from one app for another app that requires a group the user isn't
+  in. Don't rely on `Vary` alone. Set an explicit key that covers the
+  app's host, the method, the original URI, the cookie and the token
+  header. For nginx:
 
   ```nginx
-  proxy_cache_key "$host|$request_method|$request_uri|$http_cookie|$http_x_auth_token";
+  proxy_cache_key "$host|$request_method|$request_uri|$http_cookie|$http_x_auth_token|$http_authorization";
   ```
 
-  Never put a cache that ignores `Vary` in front of `/verify` without
-  such a key.
+  Replace `$http_x_auth_token` if a host uses another `token_header`.
+  [`tests/nginx_cache_integration.rs`](../tests/nginx_cache_integration.rs)
+  runs a real nginx with both this key and nginx's default one, checking
+  that no cached answer crosses users, apps, API tokens or paths. Never
+  put a cache that ignores `Vary` in front of `/verify` without such a
+  key, and for any other cache, test it the same way before relying on
+  it.
 - **Lots of cache entries.** `Cookie` holds every cookie for the domain,
   and varying on the URI adds one entry per path and query string, so hit
   rates for hosts with path rules will be low. A client can also fill the
   cache by sending random cookies or query strings, so size the cache and
   let it evict.
-- If a host reads API tokens from `Authorization`, a standards-compliant
-  shared cache won't reuse those answers at all (RFC 9111 §3.5). That's
-  safe, it just gives no benefit.
+- Answers to requests carrying `Authorization` may not be reused by a
+  strictly standards-compliant shared cache (RFC 9111 §3.5), which is
+  safe, just without benefit. nginx does cache them, and keys them
+  correctly with the key above.
 
 ## Observability
 

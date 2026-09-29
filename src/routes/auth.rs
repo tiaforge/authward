@@ -806,9 +806,13 @@ pub async fn verify(
 /// cookie, the protected app's host (one cookie spans the whole base
 /// domain, but `required_group` is per host), the original path and
 /// method when the host has path-dependent rules, and `token_header`
-/// when the answer came from an API token. A cache that ignores `Vary`
-/// would serve one user's identity headers to everyone — see
-/// docs/deployment.md.
+/// when the answer came from an API token. The app's host is listed both
+/// as `X-Forwarded-Host` and as `Host`: nginx matches `Vary` against the
+/// client's own request, where `X-Forwarded-Host` doesn't exist yet (the
+/// proxy adds it) but `Host` is the app's — without it, nginx's default
+/// cache key serves one app's 200 for another (see
+/// tests/nginx_cache_integration.rs). A cache that ignores `Vary` would
+/// serve one user's identity headers to everyone — see docs/deployment.md.
 fn cacheable(
     state: &AppState,
     resolved_host: &crate::config::ResolvedHost,
@@ -825,7 +829,7 @@ fn cacheable(
         return response;
     }
 
-    let mut vary = vec!["cookie", "x-forwarded-host"];
+    let mut vary = vec!["cookie", "host", "x-forwarded-host"];
     if !resolved_host.bypass_paths.is_empty() || !resolved_host.path_required_groups.is_empty() {
         vary.extend(["x-forwarded-uri", "x-forwarded-method"]);
     }
