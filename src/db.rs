@@ -6,7 +6,7 @@ use std::path::Path;
 use chrono::{DateTime, Utc};
 use sqlx::migrate::{Migration, MigrationType, Migrator};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use sqlx::{Row, SqlSafeStr, SqlitePool};
+use sqlx::{AssertSqlSafe, Row, SqlSafeStr, SqlitePool};
 
 use crate::crypto::RefreshTokenCipher;
 
@@ -15,30 +15,40 @@ use crate::crypto::RefreshTokenCipher;
 /// binary doesn't depend on that directory existing next to it wherever
 /// it's deployed.
 fn migrator() -> Migrator {
-    let migrations = vec![
-        Migration::new(
+    Migrator::with_migrations(vec![
+        migration(
             1,
-            "sessions".into(),
-            MigrationType::ReversibleUp,
-            include_str!("../migrations/0001_sessions.sql").into_sql_str(),
-            false,
+            "sessions",
+            include_str!("../migrations/0001_sessions.sql"),
         ),
-        Migration::new(
+        migration(
             2,
-            "session_claims".into(),
-            MigrationType::ReversibleUp,
-            include_str!("../migrations/0002_session_claims.sql").into_sql_str(),
-            false,
+            "session_claims",
+            include_str!("../migrations/0002_session_claims.sql"),
         ),
-        Migration::new(
+        migration(
             3,
-            "session_provider".into(),
-            MigrationType::ReversibleUp,
-            include_str!("../migrations/0003_session_provider.sql").into_sql_str(),
-            false,
+            "session_provider",
+            include_str!("../migrations/0003_session_provider.sql"),
         ),
-    ];
-    Migrator::with_migrations(migrations)
+    ])
+}
+
+/// sqlx records a checksum of each migration's exact SQL text and refuses
+/// to start ("migration N was previously applied but has been modified")
+/// if it differs later. A checkout with `core.autocrlf` turns these files'
+/// line endings into CRLF, so the same migration built on another machine
+/// would checksum differently; normalizing to LF first keeps the checksum
+/// a property of the SQL, not of the checkout. `.gitattributes` pins the
+/// files to LF as well.
+fn migration(version: i64, description: &'static str, sql: &'static str) -> Migration {
+    Migration::new(
+        version,
+        description.into(),
+        MigrationType::ReversibleUp,
+        AssertSqlSafe(sql.replace("\r\n", "\n")).into_sql_str(),
+        false,
+    )
 }
 
 pub async fn connect(path: &Path) -> anyhow::Result<SqlitePool> {
@@ -297,4 +307,16 @@ pub async fn list_expired_session_ids(
     rows.iter()
         .map(|row| row.try_get::<String, _>("id").map_err(Into::into))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn migration_checksum_ignores_line_endings() {
+        let lf = migration(1, "t", "CREATE TABLE t (a);\nSELECT 1;\n");
+        let crlf = migration(1, "t", "CREATE TABLE t (a);\r\nSELECT 1;\r\n");
+        assert_eq!(lf.checksum, crlf.checksum);
+    }
 }
