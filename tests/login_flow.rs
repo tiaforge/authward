@@ -497,6 +497,7 @@ fn base_config(db_path: &std::path::Path) -> config::Config {
             session_ttl_fallback: Duration::from_secs(3600),
             session_max_age: Duration::from_secs(24 * 3600),
             verify_cache_max_age: Duration::ZERO,
+            bind_session_to_client_ip: true,
             otel_endpoint: None,
             listen_addr: "127.0.0.1:0".parse().unwrap(),
         },
@@ -524,6 +525,9 @@ async fn spawn_app(
 struct Browser {
     client: reqwest::Client,
     cookies: HashMap<String, String>,
+    /// One `X-Forwarded-For` header line per entry, sent on `get` and
+    /// `get_verify_for_uri`. Empty sends none.
+    forwarded_for: Vec<String>,
 }
 
 impl Browser {
@@ -534,7 +538,13 @@ impl Browser {
                 .build()
                 .unwrap(),
             cookies: HashMap::new(),
+            forwarded_for: Vec::new(),
         }
+    }
+
+    fn with_forwarded_for(mut self, lines: &[&str]) -> Self {
+        self.forwarded_for = lines.iter().map(|l| l.to_string()).collect();
+        self
     }
 
     fn cookie_header(&self) -> String {
@@ -561,15 +571,16 @@ impl Browser {
     /// `host` is what it should believe the request was addressed to,
     /// exactly as Caddy's `X-Forwarded-Host` would convey in production).
     async fn get(&mut self, app_base_url: &str, host: &str, path: &str) -> reqwest::Response {
-        let resp = self
+        let mut req = self
             .client
             .get(format!("{app_base_url}{path}"))
             .header("host", host)
             .header("x-forwarded-proto", "http")
-            .header("cookie", self.cookie_header())
-            .send()
-            .await
-            .unwrap();
+            .header("cookie", self.cookie_header());
+        for line in &self.forwarded_for {
+            req = req.header("x-forwarded-for", line);
+        }
+        let resp = req.send().await.unwrap();
         self.absorb_set_cookies(&resp);
         resp
     }
@@ -1127,6 +1138,7 @@ async fn reaper_deletes_sessions_with_no_refresh_token_survivors() {
         Utc::now() - ChronoDuration::seconds(1),
         None,
         &serde_json::Value::Null,
+        None,
     )
     .await
     .unwrap();
@@ -3769,7 +3781,7 @@ async fn verify_success_is_cacheable_but_401_and_403_never_are() {
     // but always on the cookie and on which app is being accessed.
     assert_eq!(
         header_str(&resp, "vary"),
-        Some("cookie, host, x-forwarded-host")
+        Some("cookie, host, x-forwarded-host, x-forwarded-for")
     );
 
     // Same session, a host that requires a group bob lacks: 403, uncached.
@@ -3905,7 +3917,7 @@ async fn verify_bearer_success_is_cacheable_until_token_expiry_and_varies_on_its
     );
     assert_eq!(
         header_str(&resp, "vary"),
-        Some("cookie, host, x-forwarded-host, x-auth-token")
+        Some("cookie, host, x-forwarded-host, x-forwarded-for, x-auth-token")
     );
 
     let expired = build_access_token(
@@ -3943,6 +3955,369 @@ async fn verify_varies_on_uri_and_method_when_the_host_has_path_rules() {
     assert_eq!(header_str(&resp, "cache-control"), Some("max-age=60"));
     assert_eq!(
         header_str(&resp, "vary"),
-        Some("cookie, host, x-forwarded-host, x-forwarded-uri, x-forwarded-method")
+        Some(
+            "cookie, host, x-forwarded-host, x-forwarded-uri, x-forwarded-method, x-forwarded-for"
+        )
     );
+}
+
+// ---- session binding to the client address ----------------------------
+
+/// Everything observable about a response, for byte-for-byte comparison.
+async fn snapshot(resp: reqwest::Response) -> (u16, Vec<(String, Vec<u8>)>, Vec<u8>) {
+    let status = resp.status().as_u16();
+    let mut headers: Vec<_> = resp
+        .headers()
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.as_bytes().to_vec()))
+        .collect();
+    headers.sort();
+    let body = resp.bytes().await.unwrap().to_vec();
+    (status, headers, body)
+}
+
+/// A `/verify` call as a proxy would make it: the session cookie plus the
+/// given `X-Forwarded-For` lines, method and uri.
+async fn verify_from(
+    app: &str,
+    browser: &Browser,
+    xff: &[&str],
+    method: &str,
+) -> reqwest::Response {
+    let mut req = browser
+        .client
+        .get(format!("{app}/verify"))
+        .header("host", "app.test.local")
+        .header("x-forwarded-proto", "https")
+        .header("x-forwarded-host", "app.test.local")
+        .header("x-forwarded-method", method)
+        .header("x-forwarded-uri", "/thing")
+        .header("cookie", browser.cookie_header());
+    for line in xff {
+        req = req.header("x-forwarded-for", *line);
+    }
+    req.send().await.unwrap()
+}
+
+async fn bound_app(
+    configure: impl FnOnce(&mut authward::config::Config),
+) -> (
+    String,
+    authward::state::AppState,
+    reqwest::Client,
+    tempfile::TempDir,
+) {
+    let (idp_base_url, _count, _tokens) = spawn_mock_idp(Duration::from_secs(3600)).await;
+    let db_dir = tempfile::tempdir().unwrap();
+    let mut cfg = base_config(&db_dir.path().join("sessions.db"));
+    configure(&mut cfg);
+    add_domain(&mut cfg, "test.local", "auth.test.local", &idp_base_url);
+    cfg.hosts.insert(
+        "app.test.local".to_string(),
+        resolved_host("app.test.local", "test.local"),
+    );
+    let (app, state) = spawn_app_with_config(cfg).await;
+    let idp_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    (app, state, idp_client, db_dir)
+}
+
+async fn login_from(app: &str, idp: &reqwest::Client, xff: &[&str]) -> Browser {
+    let mut browser = Browser::new().with_forwarded_for(xff);
+    login_as(app, idp, &mut browser, "alice", "https://app.test.local/").await;
+    browser.forwarded_for.clear();
+    browser
+}
+
+async fn stored_ip(state: &authward::state::AppState) -> Option<String> {
+    let cookie_less: Vec<(Option<String>,)> = sqlx::query_as("SELECT client_ip FROM sessions")
+        .fetch_all(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(cookie_less.len(), 1);
+    cookie_less[0].0.clone()
+}
+
+#[tokio::test]
+async fn bound_session_works_from_its_address_and_is_refused_elsewhere() {
+    let (app, state, idp, _dir) = bound_app(|_| {}).await;
+    let alice = login_from(&app, &idp, &["203.0.113.7"]).await;
+    assert_eq!(stored_ip(&state).await.as_deref(), Some("203.0.113.7"));
+
+    assert_eq!(
+        verify_from(&app, &alice, &["203.0.113.7"], "GET")
+            .await
+            .status(),
+        reqwest::StatusCode::OK
+    );
+
+    for method in ["GET", "POST"] {
+        let stolen = snapshot(verify_from(&app, &alice, &["198.51.100.9"], method).await).await;
+        let anonymous =
+            snapshot(verify_from(&app, &Browser::new(), &["198.51.100.9"], method).await).await;
+        assert_eq!(stolen.0, 401);
+        assert_eq!(
+            stolen, anonymous,
+            "{method}: a mismatch must look like no session"
+        );
+    }
+    assert!(
+        snapshot(verify_from(&app, &alice, &["198.51.100.9"], "GET").await)
+            .await
+            .1
+            .iter()
+            .any(|(k, _)| k == "x-login-url"),
+        "GET 401 keeps X-Login-Url exactly as an anonymous one does"
+    );
+
+    // Refusing the thief must leave the owner's session untouched.
+    assert_eq!(
+        verify_from(&app, &alice, &["203.0.113.7"], "GET")
+            .await
+            .status(),
+        reqwest::StatusCode::OK
+    );
+    assert_eq!(stored_ip(&state).await.as_deref(), Some("203.0.113.7"));
+}
+
+#[tokio::test]
+async fn unknown_request_addresses_behave_as_before() {
+    let (app, _state, idp, _dir) = bound_app(|_| {}).await;
+    let alice = login_from(&app, &idp, &["203.0.113.7"]).await;
+    for xff in [
+        &[][..],
+        &["garbage"],
+        &["198.51.100.9, 203.0.113.7"],
+        &["198.51.100.9", "198.51.100.10"],
+        &[""],
+    ] {
+        assert_eq!(
+            verify_from(&app, &alice, xff, "GET").await.status(),
+            reqwest::StatusCode::OK,
+            "{xff:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn login_with_an_unknown_address_binds_nothing() {
+    for xff in [
+        &[][..],
+        &["not-an-ip"],
+        &["203.0.113.7, 10.0.0.1"],
+        &["1.1.1.1", "2.2.2.2"],
+    ] {
+        let (app, state, idp, _dir) = bound_app(|_| {}).await;
+        let alice = login_from(&app, &idp, xff).await;
+        assert_eq!(stored_ip(&state).await, None, "{xff:?}");
+        assert_eq!(
+            verify_from(&app, &alice, &["198.51.100.9"], "GET")
+                .await
+                .status(),
+            reqwest::StatusCode::OK
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_legacy_session_without_an_address_is_never_bound_by_verify() {
+    let (app, state, idp, _dir) = bound_app(|_| {}).await;
+    let alice = login_from(&app, &idp, &["203.0.113.7"]).await;
+    sqlx::query("UPDATE sessions SET client_ip = NULL")
+        .execute(&state.db)
+        .await
+        .unwrap();
+    for addr in ["198.51.100.9", "203.0.113.7", "2001:db8::1"] {
+        assert_eq!(
+            verify_from(&app, &alice, &[addr], "GET").await.status(),
+            reqwest::StatusCode::OK
+        );
+    }
+    assert_eq!(stored_ip(&state).await, None);
+}
+
+#[tokio::test]
+async fn equivalent_address_spellings_compare_equal() {
+    let (app, state, idp, _dir) = bound_app(|_| {}).await;
+    let alice = login_from(&app, &idp, &["::ffff:203.0.113.7"]).await;
+    assert_eq!(stored_ip(&state).await.as_deref(), Some("203.0.113.7"));
+    assert_eq!(
+        verify_from(&app, &alice, &["203.0.113.7"], "GET")
+            .await
+            .status(),
+        reqwest::StatusCode::OK
+    );
+
+    let (app, state, idp, _dir) = bound_app(|_| {}).await;
+    let alice = login_from(&app, &idp, &["203.0.113.7"]).await;
+    assert_eq!(
+        verify_from(&app, &alice, &["::FFFF:203.0.113.7"], "GET")
+            .await
+            .status(),
+        reqwest::StatusCode::OK
+    );
+    drop(state);
+
+    let (app, _state, idp, _dir) = bound_app(|_| {}).await;
+    let alice = login_from(&app, &idp, &["2001:DB8::ABCD"]).await;
+    assert_eq!(
+        verify_from(&app, &alice, &["2001:db8:0:0:0:0:0:abcd"], "GET")
+            .await
+            .status(),
+        reqwest::StatusCode::OK
+    );
+    assert_eq!(
+        verify_from(&app, &alice, &["2001:db8::abce"], "GET")
+            .await
+            .status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn vary_gains_forwarded_for_only_when_binding_is_on() {
+    for (on, expected) in [
+        (true, "cookie, host, x-forwarded-host, x-forwarded-for"),
+        (false, "cookie, host, x-forwarded-host"),
+    ] {
+        let (app, _state, idp, _dir) = bound_app(|cfg| {
+            cfg.global.verify_cache_max_age = Duration::from_secs(60);
+            cfg.global.bind_session_to_client_ip = on;
+        })
+        .await;
+        let alice = login_from(&app, &idp, &["203.0.113.7"]).await;
+        let resp = verify_from(&app, &alice, &["203.0.113.7"], "GET").await;
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        assert_eq!(header_str(&resp, "cache-control"), Some("max-age=60"));
+        assert_eq!(header_str(&resp, "vary"), Some(expected), "binding on={on}");
+    }
+}
+
+#[tokio::test]
+async fn binding_off_changes_nothing() {
+    let (app, state, idp, _dir) =
+        bound_app(|cfg| cfg.global.bind_session_to_client_ip = false).await;
+    let alice = login_from(&app, &idp, &["203.0.113.7"]).await;
+    assert_eq!(
+        stored_ip(&state).await,
+        None,
+        "nothing is recorded when off"
+    );
+    assert_eq!(
+        verify_from(&app, &alice, &["198.51.100.9"], "GET")
+            .await
+            .status(),
+        reqwest::StatusCode::OK
+    );
+
+    // Turning it on later must not bind or refuse sessions made while off,
+    // and an already-bound session is not enforced while the switch is off.
+    let (app, state, idp, _dir) =
+        bound_app(|cfg| cfg.global.bind_session_to_client_ip = false).await;
+    let alice = login_from(&app, &idp, &["203.0.113.7"]).await;
+    sqlx::query("UPDATE sessions SET client_ip = '203.0.113.7'")
+        .execute(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(
+        verify_from(&app, &alice, &["198.51.100.9"], "GET")
+            .await
+            .status(),
+        reqwest::StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn a_forged_forwarded_for_never_creates_or_changes_a_binding() {
+    let (app, state, idp, _dir) = bound_app(|_| {}).await;
+    let alice = login_from(&app, &idp, &["203.0.113.7"]).await;
+
+    // Forging the owner's address from anywhere still needs the cookie; a
+    // request with no cookie gets nothing, whatever it claims.
+    let nobody = Browser::new();
+    assert_eq!(
+        verify_from(&app, &nobody, &["203.0.113.7"], "GET")
+            .await
+            .status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    // A forged other address neither authenticates nor rebinds.
+    assert_eq!(
+        verify_from(&app, &alice, &["198.51.100.9"], "GET")
+            .await
+            .status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(stored_ip(&state).await.as_deref(), Some("203.0.113.7"));
+
+    // Same for a session that has no binding: /verify never sets one.
+    sqlx::query("UPDATE sessions SET client_ip = NULL")
+        .execute(&state.db)
+        .await
+        .unwrap();
+    verify_from(&app, &alice, &["198.51.100.9"], "GET").await;
+    assert_eq!(stored_ip(&state).await, None);
+}
+
+#[tokio::test]
+async fn refresh_keeps_the_binding_and_logout_still_ends_the_session() {
+    let (idp_base_url, _count, _tokens) = spawn_mock_idp(Duration::from_secs(2)).await;
+    let db_dir = tempfile::tempdir().unwrap();
+    let mut cfg = base_config(&db_dir.path().join("sessions.db"));
+    add_domain(&mut cfg, "test.local", "auth.test.local", &idp_base_url);
+    cfg.hosts.insert(
+        "app.test.local".to_string(),
+        resolved_host("app.test.local", "test.local"),
+    );
+    let (app, state) = spawn_app_with_config(cfg).await;
+    let idp = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let mut alice = login_from(&app, &idp, &["203.0.113.7"]).await;
+
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+
+    // A thief's request must not trigger (or benefit from) a refresh.
+    assert_eq!(
+        verify_from(&app, &alice, &["198.51.100.9"], "GET")
+            .await
+            .status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        verify_from(&app, &alice, &["203.0.113.7"], "GET")
+            .await
+            .status(),
+        reqwest::StatusCode::OK,
+        "the owner's expired session still refreshes"
+    );
+    assert_eq!(stored_ip(&state).await.as_deref(), Some("203.0.113.7"));
+    assert_eq!(
+        verify_from(&app, &alice, &["198.51.100.9"], "GET")
+            .await
+            .status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+
+    let resp = alice
+        .post_form_with_headers(
+            &app,
+            "auth.test.local",
+            "/logout",
+            &[],
+            &[
+                ("origin", "http://auth.test.local"),
+                ("sec-fetch-site", "same-origin"),
+            ],
+        )
+        .await;
+    assert!(resp.status().is_redirection(), "{}", resp.status());
+    let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM sessions")
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(count.0, 0);
 }

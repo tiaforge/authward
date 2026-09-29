@@ -72,6 +72,9 @@ pub struct Global {
     /// Cap on how long a caller may cache a successful `/verify` answer;
     /// zero disables caching. See `routes::auth::cacheable`.
     pub verify_cache_max_age: Duration,
+    /// Sessions are bound to the client address recorded at login; see
+    /// `session::verify_session`.
+    pub bind_session_to_client_ip: bool,
     pub otel_endpoint: Option<String>,
     pub listen_addr: SocketAddr,
 }
@@ -361,6 +364,7 @@ fn resolve_global(raw: &RawConfig, path: &Path, errors: &mut Vec<ConfigError>) -
         session_ttl_fallback: Duration::from_secs(raw.global.session_ttl_fallback_seconds),
         session_max_age: Duration::from_secs(raw.global.session_max_age_seconds),
         verify_cache_max_age: Duration::from_secs(raw.global.verify_cache_max_age_seconds),
+        bind_session_to_client_ip: raw.global.bind_session_to_client_ip,
         otel_endpoint: raw.global.otel_endpoint.clone(),
         listen_addr: listen_addr.unwrap(),
     })
@@ -1315,6 +1319,20 @@ token_header = "{bad}"
                 "token_header {bad:?} should be rejected, got {errors:?}"
             );
         }
+    }
+
+    #[test]
+    fn session_binding_defaults_on_and_can_be_switched_off() {
+        let keys = r#"
+cookie_signing_key = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+refresh_token_encryption_key = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+"#;
+        let file = write_config(&format!("[global]{keys}"));
+        assert!(load(file.path()).unwrap().global.bind_session_to_client_ip);
+        let file = write_config(&format!(
+            "[global]{keys}bind_session_to_client_ip = false\n"
+        ));
+        assert!(!load(file.path()).unwrap().global.bind_session_to_client_ip);
     }
 
     #[test]

@@ -17,6 +17,9 @@ listen_addr = "127.0.0.1:8080"
 # Let a caching proxy reuse successful /verify answers for up to this many
 # seconds. Off by default; a cached answer outlives logout/revocation.
 # verify_cache_max_age_seconds = 30
+# Sessions are bound to the client address seen at login and refused from
+# any other. On by default; see docs/deployment.md.
+# bind_session_to_client_ip = true
 # otel_endpoint = "http://localhost:4317"
 
 # One identity provider: a single OIDC client registered at pocket-id, with

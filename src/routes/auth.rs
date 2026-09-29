@@ -648,6 +648,14 @@ pub async fn callback(
             ChronoDuration::seconds(state.config.global.session_ttl_fallback.as_secs() as i64)
         });
     let user_agent = headers.get("user-agent").and_then(|v| v.to_str().ok());
+    // The only place a binding is ever set: the login request's own
+    // address, never anything a later `/verify` call claims.
+    let client_ip = state
+        .config
+        .global
+        .bind_session_to_client_ip
+        .then(|| crate::ratelimit::bound_client_ip(&headers))
+        .flatten();
 
     if let Err(err) = db::create_session(
         &state.db,
@@ -660,6 +668,7 @@ pub async fn callback(
         expires_at,
         user_agent,
         &claims_json,
+        client_ip,
     )
     .await
     {
@@ -747,6 +756,7 @@ pub async fn verify(
         cookie.value(),
         &resolved_host.base_domain,
         Some(&resolved_host.provider_key),
+        &headers,
     )
     .await
     {
@@ -832,6 +842,10 @@ fn cacheable(
     let mut vary = vec!["cookie", "host", "x-forwarded-host"];
     if !resolved_host.bypass_paths.is_empty() || !resolved_host.path_required_groups.is_empty() {
         vary.extend(["x-forwarded-uri", "x-forwarded-method"]);
+    }
+    // A cached answer for one client address must not be served to another.
+    if state.config.global.bind_session_to_client_ip {
+        vary.push("x-forwarded-for");
     }
     vary.extend(token_header);
     let (Ok(cache_control), Ok(vary)) = (
@@ -1076,7 +1090,7 @@ pub async fn overview(
         );
     };
 
-    let Some(session) = current_session(&state, &jar, &base_domain.name).await else {
+    let Some(session) = current_session(&state, &jar, &headers, &base_domain.name).await else {
         return redirect_to_login(&base_domain.auth_subdomain);
     };
 
@@ -1157,7 +1171,7 @@ pub async fn revoke_session(
         return response;
     }
 
-    let Some(session) = current_session(&state, &jar, &base_domain.name).await else {
+    let Some(session) = current_session(&state, &jar, &headers, &base_domain.name).await else {
         return redirect_to_login(&base_domain.auth_subdomain);
     };
 
@@ -1200,10 +1214,11 @@ fn redirect_to_login(auth_subdomain: &str) -> Response {
 async fn current_session(
     state: &AppState,
     jar: &PrivateCookieJar,
+    headers: &HeaderMap,
     base_domain: &str,
 ) -> Option<crate::db::Session> {
     let cookie = jar.get(SESSION_COOKIE_NAME)?;
-    match crate::session::verify_session(state, cookie.value(), base_domain, None).await {
+    match crate::session::verify_session(state, cookie.value(), base_domain, None, headers).await {
         crate::session::VerifyOutcome::Valid(session) => Some(session),
         crate::session::VerifyOutcome::Invalid => None,
     }

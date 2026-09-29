@@ -38,6 +38,10 @@ pub struct RawGlobal {
     /// every `/verify` answer `no-store`.
     #[serde(default)]
     pub verify_cache_max_age_seconds: u64,
+    /// Bind each session to the client address seen at login (from
+    /// `X-Forwarded-For`) and refuse it from any other address.
+    #[serde(default = "default_bind_session_to_client_ip")]
+    pub bind_session_to_client_ip: bool,
     pub otel_endpoint: Option<String>,
     /// Internal address the service listens on. Must only be reachable by
     /// the proxy (see Phase 11) — never expose this publicly.
@@ -54,10 +58,15 @@ impl Default for RawGlobal {
             session_ttl_fallback_seconds: default_session_ttl_fallback_seconds(),
             session_max_age_seconds: default_session_max_age_seconds(),
             verify_cache_max_age_seconds: 0,
+            bind_session_to_client_ip: default_bind_session_to_client_ip(),
             otel_endpoint: None,
             listen_addr: default_listen_addr(),
         }
     }
+}
+
+fn default_bind_session_to_client_ip() -> bool {
+    true
 }
 
 fn default_sqlite_path() -> PathBuf {

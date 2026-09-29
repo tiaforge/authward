@@ -127,9 +127,70 @@ pub fn client_ip(headers: &HeaderMap) -> Option<IpAddr> {
         .ok()
 }
 
+/// The single client address a proxy vouches for in `X-Forwarded-For`,
+/// used to bind a session to where it was created. Unlike `client_ip` this
+/// never picks an entry out of a chain: the header must be exactly one
+/// header line holding exactly one IP, otherwise the address is unknown
+/// (`None`). The result is canonical (IPv4-mapped IPv6 becomes IPv4), so
+/// equal addresses compare equal however they were written.
+pub fn bound_client_ip(headers: &HeaderMap) -> Option<IpAddr> {
+    let mut values = headers.get_all("x-forwarded-for").iter();
+    let value = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    let value = value.to_str().ok()?.trim();
+    if value.contains(',') {
+        return None;
+    }
+    Some(value.parse::<IpAddr>().ok()?.to_canonical())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn xff(values: &[&str]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for v in values {
+            headers.append("x-forwarded-for", v.parse().unwrap());
+        }
+        headers
+    }
+
+    #[test]
+    fn bound_client_ip_accepts_exactly_one_address() {
+        assert_eq!(
+            bound_client_ip(&xff(&["203.0.113.5"])),
+            Some("203.0.113.5".parse().unwrap())
+        );
+        assert_eq!(
+            bound_client_ip(&xff(&[" 203.0.113.5 "])),
+            Some("203.0.113.5".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn bound_client_ip_normalizes_equivalent_forms() {
+        let v4 = bound_client_ip(&xff(&["1.2.3.4"]));
+        assert_eq!(v4, bound_client_ip(&xff(&["::ffff:1.2.3.4"])));
+        assert_eq!(
+            bound_client_ip(&xff(&["2001:DB8::1"])),
+            bound_client_ip(&xff(&["2001:db8:0:0:0:0:0:1"]))
+        );
+        assert!(v4.is_some());
+    }
+
+    #[test]
+    fn bound_client_ip_is_unknown_for_anything_else() {
+        assert_eq!(bound_client_ip(&HeaderMap::new()), None);
+        assert_eq!(bound_client_ip(&xff(&[""])), None);
+        assert_eq!(bound_client_ip(&xff(&["not-an-ip"])), None);
+        assert_eq!(bound_client_ip(&xff(&["1.2.3.4:80"])), None);
+        assert_eq!(bound_client_ip(&xff(&["1.2.3.4, 5.6.7.8"])), None);
+        assert_eq!(bound_client_ip(&xff(&["1.2.3.4,"])), None);
+        assert_eq!(bound_client_ip(&xff(&["1.2.3.4", "1.2.3.4"])), None);
+    }
 
     #[test]
     fn allows_bursts_up_to_capacity_then_blocks() {

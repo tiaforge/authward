@@ -5,6 +5,7 @@
 //! authorization config exists to check against — this module only
 //! refreshes and re-validates the token itself.
 
+use axum::http::HeaderMap;
 use chrono::{Duration as ChronoDuration, Utc};
 use openidconnect::{Nonce, OAuth2TokenResponse, RefreshToken, TokenResponse};
 
@@ -63,6 +64,7 @@ pub async fn verify_session(
     session_id: &str,
     expected_base_domain: &str,
     expected_provider_key: Option<&str>,
+    headers: &HeaderMap,
 ) -> VerifyOutcome {
     let session = match db::get_session(&state.db, session_id).await {
         Ok(Some(session)) => session,
@@ -80,6 +82,17 @@ pub async fn verify_session(
         && session.provider_key != expected
     {
         tracing::info!(session_id = %log_id(session_id), session_provider = %session.provider_key, expected_provider = expected, "session was established at a different provider than this host uses");
+        return VerifyOutcome::Invalid;
+    }
+    // Checked before anything that touches the row: a cookie replayed from
+    // elsewhere must not be able to clear, refresh or otherwise disturb the
+    // real owner's session. The caller sees a plain invalid session.
+    if state.config.global.bind_session_to_client_ip
+        && let Some(bound) = session.client_ip.as_deref()
+        && let Some(presented) = crate::ratelimit::bound_client_ip(headers)
+        && presented.to_string() != bound
+    {
+        tracing::warn!(session_id = %log_id(session_id), bound_ip = bound, presented_ip = %presented, "session presented from a different client address than it was created from");
         return VerifyOutcome::Invalid;
     }
     if session.is_past_max_age(state.config.global.session_max_age) {

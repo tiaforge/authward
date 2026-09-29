@@ -1,6 +1,7 @@
 //! SQLite-backed session store. Single instance, no HA requirement (see
 //! the plan's locked-in persistence decision).
 
+use std::net::IpAddr;
 use std::path::Path;
 
 use chrono::{DateTime, Utc};
@@ -30,6 +31,11 @@ fn migrator() -> Migrator {
             3,
             "session_provider",
             include_str!("../migrations/0003_session_provider.sql"),
+        ),
+        migration(
+            4,
+            "session_client_ip",
+            include_str!("../migrations/0004_session_client_ip.sql"),
         ),
     ])
 }
@@ -89,6 +95,9 @@ pub struct Session {
     /// for the per-host group-membership check (Phase 4), since the
     /// configurable `group_claim_name` isn't known at compile time.
     pub claims_json: serde_json::Value,
+    /// Normalized client address the session was created from, if it was
+    /// bound to one. Set only at login and never changed afterwards.
+    pub client_ip: Option<String>,
 }
 
 impl Session {
@@ -127,6 +136,7 @@ pub async fn create_session(
     expires_at: DateTime<Utc>,
     user_agent: Option<&str>,
     claims_json: &serde_json::Value,
+    client_ip: Option<IpAddr>,
 ) -> anyhow::Result<()> {
     let (nonce, ciphertext) = match refresh_token {
         Some((n, c)) => (Some(n), Some(c)),
@@ -135,8 +145,8 @@ pub async fn create_session(
     sqlx::query(
         "INSERT INTO sessions \
          (id, base_domain, provider_key, subject, email, refresh_token_nonce, \
-          refresh_token_ciphertext, expires_at, created_at, user_agent, claims_json) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          refresh_token_ciphertext, expires_at, created_at, user_agent, claims_json, client_ip) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(id)
     .bind(base_domain)
@@ -149,13 +159,14 @@ pub async fn create_session(
     .bind(Utc::now().timestamp())
     .bind(user_agent)
     .bind(claims_json.to_string())
+    .bind(client_ip.map(|ip| ip.to_canonical().to_string()))
     .execute(pool)
     .await?;
     Ok(())
 }
 
 const SESSION_COLUMNS: &str = "id, base_domain, provider_key, subject, email, refresh_token_nonce, \
-     refresh_token_ciphertext, expires_at, created_at, user_agent, claims_json";
+     refresh_token_ciphertext, expires_at, created_at, user_agent, claims_json, client_ip";
 
 fn session_from_row(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<Session> {
     let nonce: Option<Vec<u8>> = row.try_get("refresh_token_nonce")?;
@@ -188,6 +199,7 @@ fn session_from_row(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<Session> {
             .unwrap_or_default(),
         user_agent: row.try_get("user_agent")?,
         claims_json: serde_json::from_str(&claims_json).unwrap_or(serde_json::Value::Null),
+        client_ip: row.try_get("client_ip")?,
     })
 }
 
@@ -318,5 +330,43 @@ mod tests {
         let lf = migration(1, "t", "CREATE TABLE t (a);\nSELECT 1;\n");
         let crlf = migration(1, "t", "CREATE TABLE t (a);\r\nSELECT 1;\r\n");
         assert_eq!(lf.checksum, crlf.checksum);
+    }
+
+    #[tokio::test]
+    async fn client_ip_migration_keeps_existing_sessions_unbound() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.db");
+        let options = SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true);
+        let pool = SqlitePoolOptions::new()
+            .connect_with(options)
+            .await
+            .unwrap();
+
+        // A database as an older release left it: migrations 1-3 only,
+        // with a session in it.
+        let all = migrator();
+        let old = Migrator::with_migrations(
+            all.iter()
+                .filter(|m| m.version <= 3)
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
+        old.run(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO sessions (id, base_domain, subject, expires_at, created_at) \
+             VALUES ('old', 'test.local', 'alice', 4102444800, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        // Opening it with the current binary applies migration 4.
+        let pool = connect(&path).await.unwrap();
+        let session = get_session(&pool, "old").await.unwrap().unwrap();
+        assert_eq!(session.subject, "alice");
+        assert_eq!(session.client_ip, None);
     }
 }

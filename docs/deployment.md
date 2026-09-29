@@ -235,8 +235,11 @@ does not, unless you add a cache plugin in front of it; nginx
   only use one app gets into another. authward lists those headers in
   `Vary`: `Cookie`, `Host` and `X-Forwarded-Host` always;
   `X-Forwarded-Uri` and `X-Forwarded-Method` when the host has
-  `bypass_paths` or `path_required_groups`; and the host's
-  `token_header` when the answer came from an API token.
+  `bypass_paths` or `path_required_groups`; the host's
+  `token_header` when the answer came from an API token; and
+  `X-Forwarded-For` while `bind_session_to_client_ip` is on (see
+  [Binding sessions to the client IP](#binding-sessions-to-the-client-ip)),
+  so an answer cached for one address is never served to another.
 
   Watch out for how a cache evaluates `Vary`. nginx matches it against
   the *browser's* request, where proxy-added headers like
@@ -251,6 +254,11 @@ does not, unless you add a cache plugin in front of it; nginx
   ```nginx
   proxy_cache_key "$host|$request_method|$request_uri|$http_cookie|$http_x_auth_token|$http_authorization";
   ```
+
+  With `bind_session_to_client_ip` on, also add the client address to
+  the key (for nginx at the edge, `$remote_addr`), or a cached answer
+  for the victim's address is served to a thief. nginx does not
+  evaluate `Vary` against the headers you set on the subrequest.
 
   Replace `$http_x_auth_token` if a host uses another `token_header`.
   [`tests/nginx_cache_integration.rs`](../tests/nginx_cache_integration.rs)
@@ -268,6 +276,46 @@ does not, unless you add a cache plugin in front of it; nginx
   strictly standards-compliant shared cache (RFC 9111 §3.5), which is
   safe, just without benefit. nginx does cache them, and keys them
   correctly with the key above.
+
+## Binding sessions to the client IP
+
+The session cookie is scoped to the whole base domain, so the browser
+sends it to every service on that domain. Whoever runs one of those
+services can read the cookie from their own server and replay it against
+`/verify` through any other proxy. With `bind_session_to_client_ip`
+(`[global]`, **on by default**), authward records the client address when
+the session is created at login and afterwards accepts the session only
+from that address. Set it to `false` to turn the feature off entirely;
+nothing is recorded or checked, and `Vary` is left as it was.
+
+- A request from another address gets exactly the answer an
+  unauthenticated request gets (401, same body and headers). The mismatch
+  is only logged, at `warn` level, with a short session-id fingerprint
+  and both addresses. The session itself is untouched, so the owner is
+  not signed out.
+- The address comes from `X-Forwarded-For`, on the login request and on
+  `/verify`. It must hold **one** address and nothing else. A missing
+  header, several values (`a, b`, or two header lines) or something that
+  isn't an IP means the address is *unknown*: at login nothing is bound,
+  and at `/verify` the check is skipped. authward keeps working behind
+  proxies that don't send the header, just without protection.
+- Sessions created before this option existed, or while the address was
+  unknown, have no binding and are never bound later. The binding is set
+  at login only, never from `/verify`.
+- IPv4-mapped IPv6 (`::ffff:192.0.2.1`) and IPv4 compare equal, as do
+  differently written IPv6 forms.
+- Every device logs in separately, so one user has several sessions,
+  each bound to its own address. A user whose address changes (a phone
+  moving between networks) has to sign in again.
+- **Your proxy must send a trustworthy, single-valued `X-Forwarded-For`.**
+  A proxy that passes a client-supplied chain along defeats the check:
+  either the header has several values and nothing is enforced, or, if
+  the attacker's value is the only one, they can claim the victim's
+  address. Have the proxy overwrite the header with the address it saw
+  (nginx: `proxy_set_header X-Forwarded-For $remote_addr;`; Caddy: set
+  `trusted_proxies` correctly, and note that its `reverse_proxy` appends
+  to a client-supplied header unless it isn't trusted). Do this for
+  `auth.*` (login) as well as for the `/verify` subrequest.
 
 ## Observability
 
