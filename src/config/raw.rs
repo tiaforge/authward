@@ -33,6 +33,11 @@ pub struct RawGlobal {
     /// session cookie stays usable.
     #[serde(default = "default_session_max_age_seconds")]
     pub session_max_age_seconds: u64,
+    /// Upper bound on the `Cache-Control: max-age` a successful `/verify`
+    /// answer carries, for callers that cache it. `0` (the default) keeps
+    /// every `/verify` answer `no-store`.
+    #[serde(default)]
+    pub verify_cache_max_age_seconds: u64,
     pub otel_endpoint: Option<String>,
     /// Internal address the service listens on. Must only be reachable by
     /// the proxy (see Phase 11) — never expose this publicly.
@@ -48,6 +53,7 @@ impl Default for RawGlobal {
             sqlite_path: default_sqlite_path(),
             session_ttl_fallback_seconds: default_session_ttl_fallback_seconds(),
             session_max_age_seconds: default_session_max_age_seconds(),
+            verify_cache_max_age_seconds: 0,
             otel_endpoint: None,
             listen_addr: default_listen_addr(),
         }

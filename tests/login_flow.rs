@@ -496,6 +496,7 @@ fn base_config(db_path: &std::path::Path) -> config::Config {
             sqlite_path: db_path.to_path_buf(),
             session_ttl_fallback: Duration::from_secs(3600),
             session_max_age: Duration::from_secs(24 * 3600),
+            verify_cache_max_age: Duration::ZERO,
             otel_endpoint: None,
             listen_addr: "127.0.0.1:0".parse().unwrap(),
         },
@@ -3688,4 +3689,257 @@ async fn two_domains_sharing_one_idp_each_use_their_own_callback() {
             "{app_host} accepts the session established on its own domain"
         );
     }
+}
+
+// ---- /verify HTTP caching ---------------------------------------------
+
+fn header_str<'a>(resp: &'a reqwest::Response, name: &str) -> Option<&'a str> {
+    resp.headers().get(name).and_then(|v| v.to_str().ok())
+}
+
+/// The `max-age` a `/verify` answer carries, or `None` if it isn't
+/// cacheable.
+fn verify_max_age(resp: &reqwest::Response) -> Option<u64> {
+    header_str(resp, "cache-control")?
+        .strip_prefix("max-age=")?
+        .parse()
+        .ok()
+}
+
+#[tokio::test]
+async fn verify_stays_no_store_when_caching_is_disabled() {
+    let (idp_base_url, _count, _tokens) = spawn_mock_idp(Duration::from_secs(3600)).await;
+    let db_dir = tempfile::tempdir().unwrap();
+    let (app, _state) = spawn_app(&idp_base_url, &db_dir.path().join("sessions.db")).await;
+    let idp_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    let mut browser = Browser::new();
+    login_as(
+        &app,
+        &idp_client,
+        &mut browser,
+        "alice",
+        "https://app.test.local/",
+    )
+    .await;
+    let resp = browser.get(&app, "app.test.local", "/verify").await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(header_str(&resp, "cache-control"), Some("no-store"));
+    assert_eq!(header_str(&resp, "vary"), None);
+}
+
+#[tokio::test]
+async fn verify_success_is_cacheable_but_401_and_403_never_are() {
+    let (idp_base_url, _count, _tokens) = spawn_mock_idp(Duration::from_secs(3600)).await;
+    let db_dir = tempfile::tempdir().unwrap();
+    let mut cfg = base_config(&db_dir.path().join("sessions.db"));
+    cfg.global.verify_cache_max_age = Duration::from_secs(60);
+    add_domain(&mut cfg, "test.local", "auth.test.local", &idp_base_url);
+    cfg.hosts.insert(
+        "app.test.local".to_string(),
+        resolved_host("app.test.local", "test.local"),
+    );
+    let mut admin_host = resolved_host("admin.test.local", "test.local");
+    admin_host.required_group = Some("admins".to_string());
+    cfg.hosts.insert("admin.test.local".to_string(), admin_host);
+    let (app, _state) = spawn_app_with_config(cfg).await;
+    let idp_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    let mut bob = Browser::new();
+    login_as_with_groups(
+        &app,
+        &idp_client,
+        &mut bob,
+        "bob",
+        "users",
+        "https://app.test.local/",
+    )
+    .await;
+
+    let resp = bob.get(&app, "app.test.local", "/verify").await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(header_str(&resp, "cache-control"), Some("max-age=60"));
+    // Host has no path rules, so the answer doesn't depend on the URI —
+    // but always on the cookie and on which app is being accessed.
+    assert_eq!(header_str(&resp, "vary"), Some("cookie, x-forwarded-host"));
+
+    // Same session, a host that requires a group bob lacks: 403, uncached.
+    let resp = bob.get(&app, "admin.test.local", "/verify").await;
+    assert_eq!(resp.status(), reqwest::StatusCode::FORBIDDEN);
+    assert_eq!(header_str(&resp, "cache-control"), Some("no-store"));
+    assert_eq!(verify_max_age(&resp), None);
+
+    // No session: the 401 Caddy turns into the login redirect, uncached.
+    let resp = Browser::new().get(&app, "app.test.local", "/verify").await;
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+    assert!(resp.headers().contains_key("x-login-url"));
+    assert_eq!(header_str(&resp, "cache-control"), Some("no-store"));
+
+    // Other routes are unaffected — including a redirect.
+    let resp = Browser::new().get(&app, "auth.test.local", "/").await;
+    assert!(resp.status().is_redirection());
+    assert_eq!(header_str(&resp, "cache-control"), Some("no-store"));
+}
+
+#[tokio::test]
+async fn verify_max_age_never_outlives_the_session_token() {
+    // Access/ID token valid for 30s, cap far above that.
+    let (idp_base_url, _count, _tokens) = spawn_mock_idp(Duration::from_secs(30)).await;
+    let db_dir = tempfile::tempdir().unwrap();
+    let mut cfg = base_config(&db_dir.path().join("sessions.db"));
+    cfg.global.verify_cache_max_age = Duration::from_secs(600);
+    add_domain(&mut cfg, "test.local", "auth.test.local", &idp_base_url);
+    cfg.hosts.insert(
+        "app.test.local".to_string(),
+        resolved_host("app.test.local", "test.local"),
+    );
+    let (app, _state) = spawn_app_with_config(cfg).await;
+    let idp_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    let mut browser = Browser::new();
+    login_as(
+        &app,
+        &idp_client,
+        &mut browser,
+        "alice",
+        "https://app.test.local/",
+    )
+    .await;
+    let resp = browser.get(&app, "app.test.local", "/verify").await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let max_age = verify_max_age(&resp).expect("success should be cacheable");
+    assert!(
+        (1..=30).contains(&max_age),
+        "max-age {max_age} must be clamped to the token's remaining validity"
+    );
+}
+
+#[tokio::test]
+async fn verify_max_age_never_outlives_the_session_max_age() {
+    let (idp_base_url, _count, _tokens) = spawn_mock_idp(Duration::from_secs(3600)).await;
+    let db_dir = tempfile::tempdir().unwrap();
+    let mut cfg = base_config(&db_dir.path().join("sessions.db"));
+    cfg.global.verify_cache_max_age = Duration::from_secs(600);
+    cfg.global.session_max_age = Duration::from_secs(20);
+    add_domain(&mut cfg, "test.local", "auth.test.local", &idp_base_url);
+    cfg.hosts.insert(
+        "app.test.local".to_string(),
+        resolved_host("app.test.local", "test.local"),
+    );
+    let (app, _state) = spawn_app_with_config(cfg).await;
+    let idp_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    let mut browser = Browser::new();
+    login_as(
+        &app,
+        &idp_client,
+        &mut browser,
+        "alice",
+        "https://app.test.local/",
+    )
+    .await;
+    let resp = browser.get(&app, "app.test.local", "/verify").await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let max_age = verify_max_age(&resp).expect("success should be cacheable");
+    assert!(
+        (1..=20).contains(&max_age),
+        "max-age {max_age} must be clamped to the session's absolute max age"
+    );
+}
+
+#[tokio::test]
+async fn verify_bearer_success_is_cacheable_until_token_expiry_and_varies_on_its_header() {
+    let (idp_base_url, _count, _tokens, hmac_key) =
+        spawn_mock_idp_full(Duration::from_secs(3600), Duration::ZERO, true).await;
+    let db_dir = tempfile::tempdir().unwrap();
+    let mut cfg = base_config(&db_dir.path().join("sessions.db"));
+    cfg.global.verify_cache_max_age = Duration::from_secs(600);
+    add_domain(&mut cfg, "test.local", "auth.test.local", &idp_base_url);
+    cfg.hosts.insert(
+        "api.test.local".to_string(),
+        api_host("https://api.test.local/", None),
+    );
+    let (app, _state) = spawn_app_with_config(cfg).await;
+
+    let send = |token: String| {
+        let app = app.clone();
+        async move {
+            reqwest::Client::new()
+                .get(format!("{app}/verify"))
+                .header("host", "api.test.local")
+                .header("x-auth-token", token)
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+
+    let token = build_access_token(
+        &hmac_key.lock().unwrap(),
+        &idp_base_url,
+        "https://api.test.local/",
+        None,
+        120,
+    );
+    let resp = send(token).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let max_age = verify_max_age(&resp).expect("success should be cacheable");
+    assert!(
+        (1..=120).contains(&max_age),
+        "max-age {max_age} must be clamped to the token's exp"
+    );
+    assert_eq!(
+        header_str(&resp, "vary"),
+        Some("cookie, x-forwarded-host, x-auth-token")
+    );
+
+    let expired = build_access_token(
+        &hmac_key.lock().unwrap(),
+        &idp_base_url,
+        "https://api.test.local/",
+        None,
+        -3600,
+    );
+    let resp = send(expired).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+    assert_eq!(header_str(&resp, "cache-control"), Some("no-store"));
+}
+
+#[tokio::test]
+async fn verify_varies_on_uri_and_method_when_the_host_has_path_rules() {
+    let (idp_base_url, _count, _tokens) = spawn_mock_idp(Duration::from_secs(3600)).await;
+    let db_dir = tempfile::tempdir().unwrap();
+    let mut cfg = base_config(&db_dir.path().join("sessions.db"));
+    cfg.global.verify_cache_max_age = Duration::from_secs(60);
+    add_domain(&mut cfg, "test.local", "auth.test.local", &idp_base_url);
+    let mut app_host = resolved_host("app.test.local", "test.local");
+    app_host.bypass_paths = vec![bypass::BypassEntry::unrestricted("/public/logo.svg")];
+    cfg.hosts.insert("app.test.local".to_string(), app_host);
+    let (app, _state) = spawn_app_with_config(cfg).await;
+
+    let resp = reqwest::Client::new()
+        .get(format!("{app}/verify"))
+        .header("host", "app.test.local")
+        .header("x-forwarded-uri", "/public/logo.svg")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(header_str(&resp, "cache-control"), Some("max-age=60"));
+    assert_eq!(
+        header_str(&resp, "vary"),
+        Some("cookie, x-forwarded-host, x-forwarded-uri, x-forwarded-method")
+    );
 }

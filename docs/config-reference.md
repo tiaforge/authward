@@ -45,6 +45,7 @@ required_group = "admins"
 | `sqlite_path` | no | `authward.db` | Path to the session database. Created if missing; chmod'd to `0600`. |
 | `session_ttl_fallback_seconds` | no | `3600` | Used only when the IdP's token response doesn't include an explicit `expires_in`. |
 | `session_max_age_seconds` | no | `86400` (24h) | Absolute lifetime of a browser session from login, regardless of how many silent refreshes succeed. Bounds how long a stolen session cookie stays usable. Must be > 0. |
+| `verify_cache_max_age_seconds` | no | `0` (off) | Upper bound on the `Cache-Control: max-age` of a successful `/verify` answer, for proxies that cache it. Never exceeds the session's or API token's remaining validity; non-2xx answers are never cacheable. A cached answer outlives logout and revocation, so keep it short (≤ 60s). See [deployment.md](deployment.md#caching-verify-answers). |
 | `otel_endpoint` | no | unset | OTLP/gRPC endpoint for log export, e.g. `http://localhost:4317`. Logs always also go to stdout as JSON regardless. |
 | `listen_addr` | no | `127.0.0.1:8080` | Must stay unreachable except from Caddy — see [deployment.md](deployment.md). |
 

@@ -198,6 +198,62 @@ keep `copy_headers X-Auth-User X-Auth-Email X-Auth-Groups` on every
 protected host, not just the ones that forward identity. Verified against
 v2.11.4.
 
+### Caching `/verify` answers
+
+By default every `/verify` answer is `Cache-Control: no-store`, so the
+proxy asks authward on every single request. Setting
+`verify_cache_max_age_seconds` in `[global]` makes *successful* (2xx)
+answers cacheable, with `Cache-Control: max-age=N` where `N` is the
+smallest of:
+
+- `verify_cache_max_age_seconds`,
+- the time left until the session's access/ID token expires (the point
+  where authward would refresh it and re-check group membership),
+- the time left until the session's `session_max_age_seconds`,
+- for an API token, the time left until its `exp`.
+
+A 401 (including the one Caddy turns into the login redirect), a 403, and
+every other status stay `no-store`, as do all routes other than
+`/verify`.
+
+This only helps when the proxy actually caches. Caddy's `forward_auth`
+does not, unless you add a cache plugin in front of it; nginx
+`auth_request` combined with `proxy_cache` does.
+
+**Security trade-offs — read before enabling:**
+
+- **Logging out or revoking a session doesn't take effect right away.**
+  authward deletes the session at once, but a cached 200 keeps letting
+  that cookie in until its `max-age` runs out. The same applies to a
+  stolen cookie you've revoked, to a user removed from a group, and to
+  config changes (a removed bypass path, a newly required group). Keep
+  the value short: 60 seconds or less is a reasonable ceiling.
+- **The cache key must include everything the answer depends on.** A
+  cached 200 carries the `X-Auth-User`/`-Email`/`-Groups` identity
+  headers. If the cache serves it for the wrong request, one user's
+  identity reaches the backend for everyone else, which lets anyone in
+  as that user. authward lists those headers in `Vary`: `Cookie` and
+  `X-Forwarded-Host` always; `X-Forwarded-Uri` and `X-Forwarded-Method`
+  when the host has `bypass_paths` or `path_required_groups`; and the
+  host's `token_header` when the answer came from an API token. `Vary`
+  only protects you if the cache honours it, so also set an explicit
+  cache key that covers all of these. With nginx, for example:
+
+  ```nginx
+  proxy_cache_key "$host|$request_method|$request_uri|$http_cookie|$http_x_auth_token";
+  ```
+
+  Never put a cache that ignores `Vary` in front of `/verify` without
+  such a key.
+- **Lots of cache entries.** `Cookie` holds every cookie for the domain,
+  and varying on the URI adds one entry per path and query string, so hit
+  rates for hosts with path rules will be low. A client can also fill the
+  cache by sending random cookies or query strings, so size the cache and
+  let it evict.
+- If a host reads API tokens from `Authorization`, a standards-compliant
+  shared cache won't reuse those answers at all (RFC 9111 §3.5). That's
+  safe, it just gives no benefit.
+
 ## Observability
 
 JSON logs go to stdout always; level is controlled by `RUST_LOG`

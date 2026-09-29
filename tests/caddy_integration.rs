@@ -278,6 +278,7 @@ async fn full_flow_through_real_caddy() {
             sqlite_path: db_dir.path().join("sessions.db"),
             session_ttl_fallback: Duration::from_secs(3600),
             session_max_age: Duration::from_secs(24 * 3600),
+            verify_cache_max_age: Duration::ZERO,
             otel_endpoint: None,
             listen_addr: "127.0.0.1:0".parse().unwrap(),
         },

@@ -36,8 +36,10 @@ pub fn build_router(state: AppState) -> Router {
 
 /// Blanket response hardening. Nothing here is ever meant to be framed
 /// (the token page shows a live credential; the dashboard names sessions),
-/// and nothing is cacheable — `/verify` answers go to Caddy, everything
-/// else is per-user HTML. A route that sets its own `Cache-Control` wins.
+/// and nothing is cacheable — everything is per-user. A route that sets
+/// its own `Cache-Control` wins: the one exception is a successful
+/// `/verify` answer when `verify_cache_max_age` is set (see
+/// `routes::auth::cacheable`).
 async fn security_headers(request: Request, next: Next) -> Response {
     let mut response = next.run(request).await;
     let headers = response.headers_mut();

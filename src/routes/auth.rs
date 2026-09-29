@@ -721,7 +721,13 @@ pub async fn verify(
     if let Some(uri) = uri
         && crate::bypass::matches_bypass(uri, method, &resolved_host.bypass_paths)
     {
-        return ok_with_identity("", "", "");
+        return cacheable(
+            &state,
+            resolved_host,
+            ok_with_identity("", "", ""),
+            None,
+            None,
+        );
     }
 
     // No usable session — no cookie at all, or one that no longer names a
@@ -772,12 +778,68 @@ pub async fn verify(
         );
     }
 
-    ok_response(
+    // Cacheable only until the session next needs verify_session's
+    // attention: its access/ID token expiring (the refresh that re-checks
+    // groups) or its absolute max age, whichever comes first.
+    let now = Utc::now();
+    let max_age_deadline = session.created_at
+        + ChronoDuration::from_std(state.config.global.session_max_age)
+            .unwrap_or(ChronoDuration::MAX);
+    let valid_for = (session.expires_at.min(max_age_deadline) - now).num_seconds();
+    let response = ok_response(
         resolved_host,
         &session.subject,
         session.email.as_deref(),
         &session.claims_json,
-    )
+    );
+    cacheable(&state, resolved_host, response, Some(valid_for), None)
+}
+
+/// Lets the proxy cache a successful `/verify` answer: `max-age` is the
+/// smaller of `verify_cache_max_age` and `valid_for` (seconds the
+/// credential stays good for, `None` for "no credential involved").
+/// Anything but a 2xx is returned untouched, so it keeps the blanket
+/// `no-store` — a 401 in particular is what Caddy turns into the login
+/// redirect, and must never be replayed from a cache.
+///
+/// `Vary` names every request header the answer depends on: the session
+/// cookie, the protected app's host (one cookie spans the whole base
+/// domain, but `required_group` is per host), the original path and
+/// method when the host has path-dependent rules, and `token_header`
+/// when the answer came from an API token. A cache that ignores `Vary`
+/// would serve one user's identity headers to everyone — see
+/// docs/deployment.md.
+fn cacheable(
+    state: &AppState,
+    resolved_host: &crate::config::ResolvedHost,
+    mut response: Response,
+    valid_for: Option<i64>,
+    token_header: Option<&str>,
+) -> Response {
+    let cap = state.config.global.verify_cache_max_age.as_secs();
+    let max_age = match valid_for {
+        Some(secs) => cap.min(secs.max(0) as u64),
+        None => cap,
+    };
+    if max_age == 0 || !response.status().is_success() {
+        return response;
+    }
+
+    let mut vary = vec!["cookie", "x-forwarded-host"];
+    if !resolved_host.bypass_paths.is_empty() || !resolved_host.path_required_groups.is_empty() {
+        vary.extend(["x-forwarded-uri", "x-forwarded-method"]);
+    }
+    vary.extend(token_header);
+    let (Ok(cache_control), Ok(vary)) = (
+        HeaderValue::from_str(&format!("max-age={max_age}")),
+        HeaderValue::from_str(&vary.join(", ")),
+    ) else {
+        return response;
+    };
+    let headers = response.headers_mut();
+    headers.insert(axum::http::header::CACHE_CONTROL, cache_control);
+    headers.insert(axum::http::header::VARY, vary);
+    response
 }
 
 /// Resource-scoped bearer-token bypass (Phase 5) for non-browser clients.
@@ -848,7 +910,20 @@ async fn bearer_auth(
                 .get("email")
                 .and_then(|v| v.as_str())
                 .filter(|_| claims.get("email_verified").and_then(|v| v.as_bool()) == Some(true));
-            ok_response(resolved_host, subject, email, &claims)
+            let valid_for = claims
+                .get("exp")
+                .and_then(|v| v.as_i64())
+                .map(|exp| exp - Utc::now().timestamp());
+            let response = ok_response(resolved_host, subject, email, &claims);
+            cacheable(
+                state,
+                resolved_host,
+                response,
+                // `validate` already rejects a token without `exp`; zero
+                // here just means "don't cache" if that ever changes.
+                Some(valid_for.unwrap_or(0)),
+                Some(&resolved_host.token_header),
+            )
         }
         Err(err) => {
             tracing::info!(%err, host = ?resolved_host.host, "bearer token rejected");

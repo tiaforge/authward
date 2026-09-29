@@ -69,6 +69,9 @@ pub struct Global {
     pub sqlite_path: PathBuf,
     pub session_ttl_fallback: Duration,
     pub session_max_age: Duration,
+    /// Cap on how long a caller may cache a successful `/verify` answer;
+    /// zero disables caching. See `routes::auth::cacheable`.
+    pub verify_cache_max_age: Duration,
     pub otel_endpoint: Option<String>,
     pub listen_addr: SocketAddr,
 }
@@ -357,6 +360,7 @@ fn resolve_global(raw: &RawConfig, path: &Path, errors: &mut Vec<ConfigError>) -
         sqlite_path: raw.global.sqlite_path.clone(),
         session_ttl_fallback: Duration::from_secs(raw.global.session_ttl_fallback_seconds),
         session_max_age: Duration::from_secs(raw.global.session_max_age_seconds),
+        verify_cache_max_age: Duration::from_secs(raw.global.verify_cache_max_age_seconds),
         otel_endpoint: raw.global.otel_endpoint.clone(),
         listen_addr: listen_addr.unwrap(),
     })
