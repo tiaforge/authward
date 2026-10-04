@@ -56,3 +56,10 @@ the same flow through a real `caddy` binary if one is available on
 never cross users, apps, API tokens or paths behind a real caching nginx,
 run via rootless `podman` (or a native binary via `NGINX_BIN`); it skips
 itself when neither is available.
+
+## License
+
+authward is free for personal use, hobby projects, research and
+noncommercial organizations under the
+[PolyForm Noncommercial License 1.0.0](LICENSE.md). It is source-available
+rather than open source: commercial use needs a separate license.
