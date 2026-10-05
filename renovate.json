@@ -1,3 +1,15 @@
 {
-  "$schema": "https://docs.renovatebot.com/renovate-schema.json"
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "lockFileMaintenance": {
+    "enabled": true
+  },
+  "packageRules": [
+    {
+      "description": "The opentelemetry crates are released in lockstep and must match",
+      "matchManagers": ["cargo"],
+      "matchPackageNames": ["opentelemetry", "opentelemetry-*", "opentelemetry_*"],
+      "groupName": "opentelemetry"
+    }
+  ]
 }
