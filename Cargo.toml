@@ -41,7 +41,7 @@ tracing-subscriber = { version = "0.3.23", features = ["json", "env-filter"] }
 url = "2.5.8"
 
 [dev-dependencies]
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls"] }
 tempfile = "3.27.0"
 
 [target."cfg(unix)".dependencies]
